@@ -25,7 +25,9 @@ int settings_ios(void) { return TARGET_OS_IPHONE ? 1 : 0; }
    window's drawable and the screen's native pixels (settings_display_size), which "Match the window", "Display native"
    and "Fill the screen" follow. Returns -1 when the game cannot take a size now. */
 static unsigned disp_w, disp_h, native_w;
-static const float aspect_ratios[] = {-1, 0, 16.0f / 10, 21.0f / 9, 32.0f / 9};   /* display.aspect's choices, as runtime_aspect_set takes them */
+static const float aspect_ratios[] = {-1, 0, 16.0f / 10, 21.0f / 9, 32.0f / 9, 16.0f / 10};   /* display.aspect's choices, as runtime_aspect_set takes them (5: Native 16:10's camera) */
+/* Native 16:10 is decided at start (settings_native_env): its canvas is 16:10, and switching into or out of it waits for the next start. */
+static int native_running(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_NATIVE_ASPECT"); v = e && *e; } return v; }
 static char display_status[160];
 static unsigned display_cw = 1920, display_ch = 1080;   /* the display resolution last asked for */
 extern void runtime_render_reserve(unsigned *w, unsigned *h);
@@ -36,7 +38,7 @@ static int render_size(unsigned cw, unsigned ch, int scale, unsigned *sw, unsign
     unsigned rw, rh; runtime_render_reserve(&rw, &rh);
     int own_fits = !rw || cw <= 1920 || (uint64_t)(1600 * cw / 1920) * (900 * cw / 1920) <= (uint64_t)rw * rh, capped = 0;
     *own = !scale && own_fits;
-    if (*own) { *sw = 1600 * cw / 1920 & ~7u; *sh = 900 * cw / 1920 & ~7u; return 0; }
+    if (*own) { *sw = 1600 * cw / 1920 & ~7u; *sh = (native_running() ? 1600 * ch / 1920 : 900 * cw / 1920) & ~7u; return 0; }   /* native: the game's 5/6 share, 16:10 */
     unsigned pct = scale ? (unsigned)scale : 83;
     *sw = cw * pct / 100; *sh = ch * pct / 100;
     if (rw && (uint64_t)*sw * *sh > (uint64_t)rw * rh) { capped = 1; double f = sqrt((double)rw * rh / ((double)*sw * *sh)); *sw = (unsigned)(*sw * f); *sh = (unsigned)(*sh * f); }
@@ -67,7 +69,7 @@ static int display_apply(const char *changed) {
         if (!want) want = 1920;   /* the window is not up yet */
         if (want > mw) want = mw;
         want &= ~15u; if (want < 640) want = 640;
-        cw = want; ch = want * 9 / 16;
+        cw = want; ch = native_running() ? want * 10 / 16 : want * 9 / 16;   /* Native 16:10: the canvas keeps its shape */
         if (runtime_output_request(cw, ch)) r = -1;
     }
     unsigned sw, sh; int own, capped = render_size(cw, ch, scale, &sw, &sh, &own);
@@ -77,7 +79,8 @@ static int display_apply(const char *changed) {
         /* The shape is key 4's engine (aspect_patch.h): "Fill the screen" is its fit step, which follows the window
            (frontend.m runtime_aspect_view); a fixed shape is its wide step, 16:9 the game's own. Vert+ (a screen taller
            than 16:9 keeps the sides and sees more above and below) comes with it. */
-        runtime_aspect_set(aspect_ratios[aspect >= 0 && aspect < 5 ? aspect : 1]);
+        if ((aspect == SET_ASPECT_NATIVE) != native_running()) r = -1;   /* into or out of Native 16:10: at the next start */
+        else runtime_aspect_set(aspect_ratios[aspect >= 0 && aspect < 6 ? aspect : 1]);
     }
     pthread_mutex_lock(&lock);
     /* What the two settings make together: the picture (text and icons drawn at it) and the 3D world stretched to it. */

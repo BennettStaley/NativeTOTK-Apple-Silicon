@@ -13526,6 +13526,7 @@ frz_plain:;
         PD("L %llu a draw in the layered pass cannot write the layer index: split here", g_stat_pass); RP_WHY("layer-refuse"); rp_end(); g_lay.refuse = 1; g_lay.refused++; }
     if (g_pp_sharpen || g_pp_aa >= 2) pp_ui_hook(pr);   // sharpen / AA without a game FXAA draw: the canvas before the UI (totk_post.h)
     if (g_mfx.ui_cleared && !g_uil.done) uil_hook();   // the UI-layer composite, before the canvas is copied to the window
+    if (g_uild.on && !g_mfx.scene_done && g_mfx.canvas && R.rt.n > 0 && R.rt.color[0] && R.rt.color[0]->serial == g_mfx.canvas) uil_diag_note(pr, dw, di);   // TOTK_UIL_DIAG
     if (!g_mfx.scene_done && g_mfx.canvas && R.rt.n > 0 && R.rt.color[0] && R.rt.color[0]->serial == g_mfx.canvas && pr && pr->sh[0] &&
         (uil_on() ? uw_ui_vs(pr->sh[0]->key) : MFX_UI_DRAW(pr) && mfx_enabled()))
         mfx_snapshot_scene();   // TOTK_MFX / the UI-layer composite: first UI draw into the canvas: copy the finished scene first

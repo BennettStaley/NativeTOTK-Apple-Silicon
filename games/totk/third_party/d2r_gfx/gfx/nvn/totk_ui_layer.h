@@ -76,6 +76,35 @@ static void uil_hook(void) {
     uint64_t ser = R.rt.color[0]->serial;
     for (int i = 0; i < g_mfx.nswap; i++) if (g_mfx.swap[i] == ser) { uil_compose(); return; }
 }
+/* TOTK_UIL_DIAG=1 (diagnostic, 2026-10-26: the inventory and quick select flash at the stretched scale): the draws into
+   the canvas before the UI layer began, per frame; a frame that ends without a UI layer while composing is on logs
+   them (vertex / fragment shader, index or vertex count), the first 60 distinct sequences. */
+static struct { int on, n; char seq[48][24]; uint32_t hash; uint32_t seen[64]; int nseen, logged; } g_uild = {-1};
+static void uil_diag_note(__unsafe_unretained NvProg *pr, const p_draw *dw, const p_draw_idx *di) {
+    if (g_uild.on < 0) { const char *e = getenv("TOTK_UIL_DIAG"); g_uild.on = e && atoi(e) > 0; }
+    if (!g_uild.on || g_uild.n >= 48 || !pr) return;
+    snprintf(g_uild.seq[g_uild.n++], 24, "%.8s/%.8s/%u", pr->sh[0] ? pr->sh[0]->key : "-", pr->sh[1] ? pr->sh[1]->key : "-", dw ? dw->count : di ? di->count : 0);
+}
+static void uil_diag_frame_end(int composed) {
+    /* Composed frames: only the draws after the scene's last full-screen finish (the upscale ac58fc18 / a3a570eb or the
+       tone map 0ac9a549) and before the UI layer began: UI the layer missed (it went out with the scene, stretched). */
+    int from = 0;
+    if (composed) { from = g_uild.n; for (int i = 0; i < g_uild.n; i++) { const char *f = strchr(g_uild.seq[i], '/') + 1;
+                    if (!strncmp(f, "ac58fc18", 8) || !strncmp(f, "a3a570eb", 8) || !strncmp(f, "0ac9a549", 8)) from = i + 1; }
+                    from = from < g_uild.n - 1 ? from : g_uild.n - 1; }   // the last entry is the draw that began the layer
+    if (g_uild.on > 0 && g_uild.n - from > (composed ? 1 : 0) && uil_on() && g_uild.logged < 60) {
+        uint32_t h = composed ? 7u : 2166136261u; for (int i = from; i < g_uild.n; i++) for (const char *c = g_uild.seq[i]; *c; c++) h = (h ^ (uint8_t)*c) * 16777619u;
+        int dup = 0; for (int i = 0; i < g_uild.nseen; i++) dup |= g_uild.seen[i] == h;
+        if (!dup) {
+            if (g_uild.nseen < 64) g_uild.seen[g_uild.nseen++] = h;
+            g_uild.logged++;
+            char b[48 * 26 + 1]; size_t o = 0; for (int i = from; i < g_uild.n && o < sizeof b - 26; i++) o += (size_t)snprintf(b + o, sizeof b - o, "%s ", g_uild.seq[i]);
+            MLOG("[ui-layer] diag F%llu: %s (vs/fs/count): %s", (unsigned long long)atomic_load(&g_cur_frame),
+                 composed ? "draws after the scene's finish, before the UI layer began, the last one began it" : "no UI layer this frame; canvas draws", b);
+        }
+    }
+    g_uild.n = 0;
+}
 /* At the game's present, before interpolation takes the frame: count a frame whose UI was never composed, and start the
    next frame (interpolation resets the scene / UI state itself while on). */
 static void uil_frame_end(void) {
@@ -83,6 +112,7 @@ static void uil_frame_end(void) {
         g_uil.missed++;
         static int n; if (n++ < 5) MLOG("[red] [ui-layer] frame %llu: UI drawn but the canvas was not copied to a presented texture after it; not composed", (unsigned long long)atomic_load(&g_cur_frame));
     }
+    uil_diag_frame_end(g_uil.done);
     if (!mfx_enabled()) g_mfx.scene_done = g_mfx.ui_cleared = 0;
     g_uil.done = 0; g_uil.canvas = nil; g_uil.scene_cur = nil;
     if (++g_uil.frames % 3600 == 0 && (g_uil.composed || g_uil.missed))

@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 enum { SET_MAC = 1, SET_IPAD = 2, SET_IPHONE = 4, SET_IOS = SET_IPAD | SET_IPHONE, SET_ALL = SET_MAC | SET_IOS };
 enum { SET_BOOL, SET_RANGE, SET_CHOICE };
@@ -79,7 +80,9 @@ static const SettingChoice SET_SCALE[] = {{"The game's own", "game", NULL, 0}, {
                                           {"100%", "100", NULL, 100}, {"125%", "125", NULL, 125}, {"150%", "150", NULL, 150},
                                           {"175%", "175", NULL, 175}, {"200%", "200", NULL, 200}};
 static const SettingChoice SET_ASPECT[] = {{"Fill the screen", "auto", NULL, 0}, {"16:9 (game's own)", "16:9", NULL, 1},
-                                           {"16:10", "16:10", NULL, 2}, {"21:9", "21:9", NULL, 3}, {"32:9", "32:9", NULL, 4}};
+                                           {"16:10", "16:10", NULL, 2}, {"21:9", "21:9", NULL, 3}, {"32:9", "32:9", NULL, 4},
+                                           {"Native 16:10 (restart)", "native-16:10", NULL, 5}};
+enum { SET_ASPECT_NATIVE = 5 };   /* settings_native_env: the game itself lays out for a 2560x1600 canvas */
 static const SettingChoice SET_HEADROOM[] = {{"Auto (4K on 16 GB)", "auto", NULL, 0}, {"1440p", "1440", "2560x1440", 1440},
                                              {"4K", "2160", "3840x2160", 2160}};
 /* The biggest 3D world (runtime_render_reserve, TOTK_RENDER_RESERVE): above 1440p the texture heap passes 1 GiB, so the
@@ -120,7 +123,7 @@ static const SettingDef SETTINGS[] = {
      NULL, SET_RANGE, SET_LIVE, SET_MAC, 2560, 2560, 640, 3840, 64, " px", NULL, 0, "iPhone and iPad show 720p.", "display.output", SET_OUT_CUSTOM},
     {"display.scale", "Display", "Render resolution", "The size the 3D world is drawn at, as a share of the display resolution: lower is faster but softer, higher is sharper and slower. Text and icons stay at the display resolution. The 3D world goes up to the Maximum render resolution (1440p unless raised); each choice shows the size it gives now.",
      NULL, SET_CHOICE, SET_LIVE, SET_ALL, 0, 0, 0, 0, 0, NULL, SET_SCALE, SET_N(SET_SCALE), NULL, NULL, 0},
-    {"display.aspect", "Display", "Aspect ratio", "Fill the screen shows more of the world on a wider or taller screen; text and icons keep their shape. Key 4 also cycles it.",
+    {"display.aspect", "Display", "Aspect ratio", "Fill the screen shows more of the world on a wider or taller screen; text and icons keep their shape. Key 4 also cycles it. Native 16:10 (a MacBook screen; restart) has the game itself draw a 16:10 picture and lay its menus out for it: the HUD at the real top and bottom, menus, fades and backdrops filling the screen. Pre-rendered cutscenes play stretched and in-game photos come out squished, as with the community's ultrawide mods.",
      NULL, SET_CHOICE, SET_LIVE, SET_MAC, 1, 1, 0, 0, 0, NULL, SET_ASPECT, SET_N(SET_ASPECT), "Not on iPhone and iPad yet.", NULL, 0},
     {"display.headroom", "Display", "Maximum output", "The biggest output resolution you can switch to while playing. Higher sets more memory aside; takes effect after a restart.",
      "TOTK_OUTPUT_RES", SET_CHOICE, SET_RESTART, SET_MAC, 0, 0, 0, 0, 0, NULL, SET_HEADROOM, SET_N(SET_HEADROOM), "Fixed on iPhone and iPad.", NULL, 0},
@@ -337,8 +340,27 @@ static inline void settings_take_env(int *values) {
     }
 }
 /* Hands every setting the game reads at start to it as its environment variable, unless the variable is already set. */
+/* Native 16:10 (display.aspect, 2026-10-26): the game draws a 2560x1600 canvas with its UI layouts edited for it
+   (scripts/tall_layout.py, built into extracted/v143/romfs-patches-2560x1600 by build_app.py) and heaps for that canvas and
+   a 2560x1600 scene (romfs-patches-out/2560x1600-scene-2560x1600). Nothing is squeezed (TOTK_UI_SQUEEZE=0 turns off the
+   per-draw squeeze and the UI-layer composite); the camera takes 16:10 (TOTK_ASPECT). Variables already set win. Only
+   when the build made those files (an older app keeps Fill the screen); cwd is the game folder (launcher / loader). */
+static inline int settings_native_env(const int *values) {
+    int a = settings_index("display.aspect");
+    if (a < 0 || values[a] != SET_ASPECT_NATIVE) return 0;
+    if (access("extracted/v143/romfs-patches-2560x1600/manifest.tsv", R_OK) || access("extracted/v143/romfs-patches-out/2560x1600-scene-2560x1600/manifest.tsv", R_OK)) {
+        fprintf(stderr, "[settings] Native 16:10: this app was built without its layouts (rebuild it); Fill the screen instead\n");
+        return 0;
+    }
+    setenv("TOTK_NATIVE_ASPECT", "16:10", 0);
+    setenv("TOTK_OUTPUT_RES", "2560x1600", 0); setenv("TOTK_RENDER_RESERVE", "2560x1600", 0);
+    setenv("TOTK_ROMFS_PATCHES", "extracted/v143/romfs-patches-2560x1600", 0);
+    setenv("TOTK_UI_SQUEEZE", "0", 0); setenv("TOTK_ASPECT", "16:10", 0);
+    return 1;
+}
 static inline void settings_export_env(const int *values) {
     char buf[16];
+    settings_native_env(values);   /* before the loop: its output size and reserve take the place of the headroom's */
     for (int i = 0; i < SETTINGS_COUNT; i++) {
         const SettingDef *d = &SETTINGS[i];
         if (!d->env || getenv(d->env)) continue;
