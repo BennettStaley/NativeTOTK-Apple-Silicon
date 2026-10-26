@@ -14,6 +14,9 @@ Categories (the spawn tab's menus): creatures (enemies, animals), npcs, items (m
 weapons (weapons, bows, shields), armor, zonai (Zonai devices and physics objects), objects (other world objects) and
 system (locators, sound, camera, player parts: hidden by the tab). spawn: "pickup" for an actor the inventory takes (it
 appears on the ground and is picked up), "world" for everything else; the game creates both with the same call.
+dishes: the cooked meals (Item_Cook_*, PouchActorInfo Food), which have no actor pack: "pouch", given into the inventory
+(runtime/dish_give.h). After the actors, one "@effect<TAB>name<TAB>min level<TAB>max level<TAB>base seconds" line per
+meal effect of the game's cooking table (Cooking/CookingTable SystemData EffectList; LifeRecover is the hearts field).
 
 Output build/<version>/actor_list.tsv: '#' comment lines (counts), then name<TAB>category<TAB>spawn<TAB>display<TAB>source,
 sorted by category then display name.
@@ -24,7 +27,7 @@ from pathlib import Path
 import compression.zstd as zstd
 
 ROOT = Path(__file__).resolve().parents[1]
-CATEGORIES = ('creatures', 'npcs', 'items', 'weapons', 'armor', 'zonai', 'objects', 'system')
+CATEGORIES = ('creatures', 'npcs', 'items', 'dishes', 'weapons', 'armor', 'zonai', 'objects', 'system')
 SOURCES = ('game', 'lookup', 'deciphered', 'internal')
 
 
@@ -336,8 +339,28 @@ def build(romfs, lookup):
             source = 'deciphered' if display else 'internal'
             if not display: display = readable(name)[0]
         rows.append((name, cat, spawn, display.replace('\t', ' ').replace('\n', ' '), source))
+    have = set(actors)
+    for name, row in sorted(pouch.items()):   # dishes: inventory only, no actor pack
+        if not name or name in have or not name.startswith('Item_Cook_') or row.get('PouchCategory') != 'Food': continue
+        if name in game: display, source = game[name], 'game'
+        elif name in lookup: display, source = lookup[name], 'lookup'
+        else: display, source = readable(name)[0], 'internal'
+        rows.append((name, 'dishes', 'pouch', display.replace('\t', ' ').replace('\n', ' '), source))
     rows.sort(key=lambda r: (CATEGORIES.index(r[1]), r[3].lower(), r[0]))
     return rows
+
+
+def meal_effects(romfs):
+    """(name, min level, max level, base seconds) of the cooking table's meal effects, LifeRecover left out."""
+    path = romfs.first(r'Cooking/CookingTable\.game__cooking__Table\.bgyml(\.zs)?')
+    if not path: return []
+    table = byml(romfs.read(path))
+    out = []
+    for e in (table.get('SystemData') or {}).get('EffectList') or []:
+        name = e.get('Name')
+        if isinstance(name, str) and name != 'LifeRecover' and re.fullmatch(r'[A-Za-z0-9_]+', name):
+            out.append((name, int(e.get('MinLv', 1)), int(e.get('MaxLv', 1)), int(e.get('BaseTime', 0))))
+    return out
 
 
 def summary(rows):
@@ -347,7 +370,7 @@ def summary(rows):
     for cat in CATEGORIES:
         total = sum(counts[cat, s] for s in SOURCES)
         lines.append(f'{cat}: {total} (' + ', '.join(f'{s} {counts[cat, s]}' for s in SOURCES) +
-                     f'; pickup {spawn[cat, "pickup"]}, world {spawn[cat, "world"]})')
+                     f'; pickup {spawn[cat, "pickup"]}, world {spawn[cat, "world"]}, pouch {spawn[cat, "pouch"]})')
     lines.append(f'total: {len(rows)} (' + ', '.join(f'{s} {sum(counts[c, s] for c in CATEGORIES)}' for s in SOURCES) + ')')
     return lines
 
@@ -365,6 +388,7 @@ def main():
     lines = summary(rows)
     text = ''.join(f'# {line}\n' for line in [f'actor list for the spawner ({args.version}), scripts/prepare_actor_list.py'] + lines)
     text += ''.join('\t'.join(r) + '\n' for r in rows)
+    text += ''.join(f'@effect\t{n}\t{lo}\t{hi}\t{t}\n' for n, lo, hi, t in meal_effects(romfs))
     tmp = out.with_name(out.name + '.tmp'); tmp.write_text(text); tmp.replace(out)
     print('\n'.join(lines))
     return 0

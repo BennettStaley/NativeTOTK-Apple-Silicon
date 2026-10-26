@@ -50,6 +50,21 @@
    ActorMgr::sInstance (1.0.0 0x46479e0). Named, not GAME_ADDR: only 1.0.0 and 1.4.3 have them. */
 #define GAME_SPAWN_REQUEST_CREATE 0x599670
 #define GAME_SPAWN_ACTOR_MGR 0x3ad7450
+/* Give a dish only (actor_spawn.c, how they were found and checked): the game's own "put a cooked dish into the
+   inventory" routine (1.0.0 0x1a14800, called from PouchMgr::addToPouch in both versions) and the GameData calls it
+   makes, in its order. 1.4.3 only. */
+#define GAME_DISH_COOK 0x20a0144             /* not called: its call sites are checked against the targets below */
+#define GAME_DISH_POUCH_MGR 0x3a81678        /* the PouchMgr instance pointer (GOT 0x39601e8 points here) */
+#define GAME_DISH_GAMEDATA_MGR 0x3ad66b0     /* gmd::GameDataMgr::sInstance (GOT 0x395dff0 points here) */
+#define GAME_DISH_POUCH_COUNT 0xd61d6c       /* PouchMgr: the Content array length of a category */
+#define GAME_DISH_STRUCT_BY_INDEX 0x282ed8   /* GameDataMgr::getStructStructByIndex */
+#define GAME_DISH_GET_STRING64 0x6e76d0      /* GameDataMgr::getStructString64 */
+#define GAME_DISH_GET_STRUCT 0x16fac0        /* GameDataMgr::getStructStruct */
+#define GAME_DISH_SET_ENUM 0x170210          /* GameDataMgr::setStructEnum */
+#define GAME_DISH_SET_INT 0x16fdcc           /* GameDataMgr::setStructInt */
+#define GAME_DISH_SET_STRING64 0x282280      /* GameDataMgr::setStructString64 */
+#define GAME_DISH_GET_BOOL 0x1b02f8          /* GameDataMgr::getStructBool */
+#define GAME_DISH_SET_BOOL 0x923d20          /* GameDataMgr::setStructBool */
 #define GAME_ADDR_0x69a18c 0x45ce70
 #define GAME_ADDR_0x4663f08 0x3add238
 #define GAME_ADDR_0x15ecb0c 0x1bd01c4

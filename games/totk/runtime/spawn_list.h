@@ -9,29 +9,37 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* The category column, in order. System (locators, sound, camera, player parts) is never shown. */
-enum { SPAWN_CAT_FAVORITES, SPAWN_CAT_RECENTS, SPAWN_CAT_CREATURES, SPAWN_CAT_NPCS, SPAWN_CAT_ITEMS, SPAWN_CAT_WEAPONS,
-       SPAWN_CAT_ARMOR, SPAWN_CAT_ZONAI, SPAWN_CAT_OBJECTS, SPAWN_CAT_SYSTEM, SPAWN_NCATS };
+/* The category column, in order. System (locators, sound, camera, player parts) is never shown. Dishes (cooked meals,
+   Item_Cook_*) have no actor pack: they are given into the inventory instead of spawned (runtime/dish_give.h). */
+enum { SPAWN_CAT_FAVORITES, SPAWN_CAT_RECENTS, SPAWN_CAT_CREATURES, SPAWN_CAT_NPCS, SPAWN_CAT_ITEMS, SPAWN_CAT_DISHES,
+       SPAWN_CAT_WEAPONS, SPAWN_CAT_ARMOR, SPAWN_CAT_ZONAI, SPAWN_CAT_OBJECTS, SPAWN_CAT_SYSTEM, SPAWN_NCATS };
 enum { SPAWN_SHOWN_CATS = SPAWN_CAT_SYSTEM };   /* the column: Favorites .. Objects */
-static const char *const SPAWN_CAT_NAMES[SPAWN_NCATS] = {"Favorites", "Recents", "Creatures", "NPCs", "Items", "Weapons",
-                                                         "Armor", "Zonai", "Objects", "System"};
-static const char *const SPAWN_CAT_TOKENS[SPAWN_NCATS] = {NULL, NULL, "creatures", "npcs", "items", "weapons", "armor",
-                                                          "zonai", "objects", "system"};
+static const char *const SPAWN_CAT_NAMES[SPAWN_NCATS] = {"Favorites", "Recents", "Creatures", "NPCs", "Items", "Dishes",
+                                                         "Weapons", "Armor", "Zonai", "Objects", "System"};
+static const char *const SPAWN_CAT_TOKENS[SPAWN_NCATS] = {NULL, NULL, "creatures", "npcs", "items", "dishes", "weapons",
+                                                          "armor", "zonai", "objects", "system"};
 /* Where the display name comes from (the list's last column). Internal: no name was found, the internal one made
    readable; hidden unless Show unnamed is on. */
 enum { SPAWN_SRC_GAME, SPAWN_SRC_LOOKUP, SPAWN_SRC_DECIPHERED, SPAWN_SRC_INTERNAL };
 static const char *const SPAWN_SRC_TOKENS[] = {"game", "lookup", "deciphered", "internal"};
 
 typedef struct { const char *name, *display; unsigned char category, source, pickup; } SpawnActor;
-typedef struct { char *text; SpawnActor *actor; int count; } SpawnList;
+/* A meal effect of the game's cooking table: the level range and the base duration in seconds (0: the effect has no
+   duration, e.g. extra hearts). LifeRecover is the hearts field itself: its max is the most hearts a dish restores. */
+typedef struct { const char *name; int min_level, max_level, base_time; } SpawnEffect;
+enum { SPAWN_EFFECT_MAX = 32 };
+typedef struct { char *text; SpawnActor *actor; int count; SpawnEffect effect[SPAWN_EFFECT_MAX]; int neffect; } SpawnList;
+static inline int spawn_actor_is_dish(const SpawnActor *a) { return a && a->category == SPAWN_CAT_DISHES; }
 
 static inline int spawn_token_index(const char *const *tokens, int n, const char *word) {
     for (int i = 0; i < n; i++) if (tokens[i] && !strcmp(tokens[i], word)) return i;
     return -1;
 }
 
-/* actor_list.tsv: '#' comments, then name<TAB>category<TAB>pickup|world<TAB>display<TAB>source. Lines with a bad name, an
-   unknown category or source, or missing columns are skipped. Returns the number of actors (the list owns a copy). */
+/* actor_list.tsv: '#' comments, then name<TAB>category<TAB>pickup|world|pouch<TAB>display<TAB>source ("pouch": a dish,
+   inventory only), and "@effect<TAB>name<TAB>min level<TAB>max level<TAB>base seconds" lines for the cooking table's
+   meal effects (an older parser skips them: '@' is not a name). Lines with a bad name, an unknown category or source,
+   or missing columns are skipped. Returns the number of actors (the list owns a copy). */
 static inline int spawn_list_parse(SpawnList *l, const char *text, size_t len) {
     memset(l, 0, sizeof *l);
     if (!text) return 0;
@@ -51,10 +59,19 @@ static inline int spawn_list_parse(SpawnList *l, const char *text, size_t len) {
             col[n++] = p;
             for (char *q = p; *q && n < 5; q++) if (*q == '\t') { *q = 0; col[n++] = q + 1; }
         }
-        if (n == 5 && spawn_name_valid(col[0]) && *col[3]) {
+        if (n == 5 && !strcmp(col[0], "@effect") && spawn_name_valid(col[1]) && l->neffect < SPAWN_EFFECT_MAX) {
+            char *end1, *end2, *end3;
+            long lo = strtol(col[2], &end1, 10), hi = strtol(col[3], &end2, 10), t = strtol(col[4], &end3, 10);
+            if (*col[2] && *col[3] && *col[4] && !*end1 && !*end2 && !*end3 && lo >= 0 && hi >= lo && hi <= 10000 && t >= 0 && t <= 100000) {
+                SpawnEffect *e = &l->effect[l->neffect++];
+                e->name = col[1]; e->min_level = (int)lo; e->max_level = (int)hi; e->base_time = (int)t;
+            }
+        } else if (n == 5 && spawn_name_valid(col[0]) && *col[3]) {
             int cat = spawn_token_index(SPAWN_CAT_TOKENS, SPAWN_NCATS, col[1]);
             int src = spawn_token_index(SPAWN_SRC_TOKENS, 4, col[4]);
-            if (cat >= SPAWN_CAT_CREATURES && src >= 0 && (!strcmp(col[2], "pickup") || !strcmp(col[2], "world"))) {
+            int pouch = !strcmp(col[2], "pouch");   /* only dishes, and dishes only so */
+            if (cat >= SPAWN_CAT_CREATURES && src >= 0 && pouch == (cat == SPAWN_CAT_DISHES) &&
+                (pouch || !strcmp(col[2], "pickup") || !strcmp(col[2], "world"))) {
                 SpawnActor *a = &l->actor[l->count++];
                 a->name = col[0]; a->display = col[3]; a->category = (unsigned char)cat; a->source = (unsigned char)src;
                 a->pickup = !strcmp(col[2], "pickup");
@@ -68,6 +85,14 @@ static inline void spawn_list_free(SpawnList *l) { free(l->text); free(l->actor)
 static inline int spawn_list_find(const SpawnList *l, const char *name) {
     for (int i = 0; i < l->count; i++) if (!strcmp(l->actor[i].name, name)) return i;
     return -1;
+}
+static inline const SpawnEffect *spawn_list_effect(const SpawnList *l, const char *name) {
+    for (int i = 0; name && i < l->neffect; i++) if (!strcmp(l->effect[i].name, name)) return &l->effect[i];
+    return NULL;
+}
+static inline int spawn_list_has_dishes(const SpawnList *l) {
+    for (int i = 0; i < l->count; i++) if (spawn_actor_is_dish(&l->actor[i])) return 1;
+    return 0;
 }
 
 /* ---- favorites and recents ---- */
@@ -178,30 +203,38 @@ static inline int spawn_query_empty(const char *q) {
 /* The indices to show, at most max; returns how many. A query searches every category (System left out), best matches
    first and the list's order within a rank; no query shows the category: Favorites in the list's order, Recents
    newest first, the others without the unnamed (internal) entries unless show_unnamed. Favorites and recents show
-   whatever their name. */
-static inline int spawn_list_filter(const SpawnList *l, const SpawnPicks *p, int category, const char *query, int show_unnamed,
-                                    int *out, int max) {
+   whatever their name. Without dishes (a menu that cannot give them) they are left out everywhere. */
+static inline int spawn_list_filter_dishes(const SpawnList *l, const SpawnPicks *p, int category, const char *query, int show_unnamed,
+                                           int dishes, int *out, int max) {
     int n = 0;
     if (!spawn_query_empty(query)) {
         for (int rank = 1; rank <= 3; rank++)
             for (int i = 0; i < l->count && n < max; i++) {
                 const SpawnActor *a = &l->actor[i];
-                if (a->category == SPAWN_CAT_SYSTEM || (!show_unnamed && a->source == SPAWN_SRC_INTERNAL)) continue;
+                if (a->category == SPAWN_CAT_SYSTEM || (!show_unnamed && a->source == SPAWN_SRC_INTERNAL) || (!dishes && spawn_actor_is_dish(a))) continue;
                 if (spawn_match(a, query) == rank) out[n++] = i;
             }
         return n;
     }
     if (category == SPAWN_CAT_RECENTS) {
-        for (int r = 0; p && r < p->nrecent && n < max; r++) { int i = spawn_list_find(l, p->recent[r]); if (i >= 0) out[n++] = i; }
+        for (int r = 0; p && r < p->nrecent && n < max; r++) {
+            int i = spawn_list_find(l, p->recent[r]);
+            if (i >= 0 && (dishes || !spawn_actor_is_dish(&l->actor[i]))) out[n++] = i;
+        }
         return n;
     }
     for (int i = 0; i < l->count && n < max; i++) {
         const SpawnActor *a = &l->actor[i];
+        if (!dishes && spawn_actor_is_dish(a)) continue;
         if (category == SPAWN_CAT_FAVORITES ? (p && spawn_picks_is_favorite(p, a->name))
                                             : a->category == category && category != SPAWN_CAT_SYSTEM && (show_unnamed || a->source != SPAWN_SRC_INTERNAL))
             out[n++] = i;
     }
     return n;
+}
+static inline int spawn_list_filter(const SpawnList *l, const SpawnPicks *p, int category, const char *query, int show_unnamed,
+                                    int *out, int max) {
+    return spawn_list_filter_dishes(l, p, category, query, show_unnamed, 1, out, max);
 }
 
 /* ---- files (the menus; tests use the parts above) ---- */
