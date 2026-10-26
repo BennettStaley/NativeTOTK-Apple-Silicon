@@ -13327,6 +13327,29 @@ static int mfxup_draw(NvProg *pr) {
 }
 #include "totk_post.h"
 #include "totk_ui_layer.h"   // the UI-layer composite (key 4 on a window that is not 16:9)
+/* Native 16:10 (settings, TOTK_NATIVE_ASPECT): the game lays its UI out for the canvas, so its full-screen video pane is
+   stretched to 16:10 too. While a video decodes (runtime/movie_host.c runtime_movie_playing), a draw into a canvas that is
+   not 16:9 whose fragment shader samples a texture of the video's frame size (its luma plane, or a picture made from it)
+   is drawn at 16:9 about the canvas centre instead, with the canvas's own black around it. In-engine cutscenes are the
+   3D world and fill the screen. TOTK_MOVIE_LETTERBOX=0: stretched as the layout puts it. */
+extern int runtime_movie_playing(unsigned *w, unsigned *h) __attribute__((weak_import));
+static void movie_letterbox(__unsafe_unretained NvProg *pr, NSUInteger tw, NSUInteger th, double *ux, double *uy) {
+    static int on = -1; if (on < 0) { const char *e = getenv("TOTK_MOVIE_LETTERBOX"), *n = getenv("TOTK_NATIVE_ASPECT"); on = n && *n && !(e && !strcmp(e, "0")); }
+    unsigned mw, mh;
+    if (!on || !tw || !th || !pr || !pr->sh[1] || !runtime_movie_playing || !uw_on_canvas() || !runtime_movie_playing(&mw, &mh)) return;
+    double a = (double)tw / th; if (fabs(a / (16.0 / 9.0) - 1) < 0.01) return;
+    NvShader *f = pr->sh[1]; int hit = 0;
+    for (int i = 0; i < f->rf.nb && !hit; i++) {
+        if (f->rf.b[i].kind != NVN_RB_TEX && f->rf.b[i].kind != NVN_RB_SAMP) continue;
+        int reg = f->rf.b[i].reg; if (reg < 0 || reg >= 128 || !S.tex[1][reg]) continue;
+        int tid = (int)(S.tex[1][reg] & 0xfffff); if (tid <= 0 || tid >= g_ntreg) continue;
+        const tex_t *t = &g_treg[tid].t;
+        hit = t->d.width >= mw && t->d.width <= mw + 64 && t->d.height >= mh && t->d.height <= mh + 64;   // padded planes too
+    }
+    if (!hit) return;
+    if (a < 16.0 / 9.0) *uy = (16.0 / 9.0) / a; else *ux = a / (16.0 / 9.0);
+    static int n; if (n++ < 3) MLOG("[movie] video %ux%u drawn at 16:9 in the %lux%lu canvas (fragment shader %.8s)", mw, mh, (unsigned long)tw, (unsigned long)th, f->key);
+}
 #include "nvn_cube_group.h"
 #include "nvn_lazy_clear.h"
 #include "nvn_par_encode.h"   // TOTK_PAR_ENCODE: parallel encoding of the G-buffer pass, step 1
@@ -13591,6 +13614,7 @@ frz_plain:;
     if (moff != g_ui_moff) { g_ui_moff = moff; args_dirty_stage(0); }
     double ux, uy, cx = tw / 2.0, cy = th / 2.0;   // key 4: UI squeezed by 1 / ux across, 1 / uy down, about the canvas centre
     uw_ui_squeeze(pr && pr->sh[0] ? pr->sh[0]->key : NULL, dw, di, tw, th, &ux, &uy);
+    if (ux == 1 && uy == 1) movie_letterbox(pr, tw, th, &ux, &uy);   // Native 16:10: a pre-rendered video keeps 16:9
     double vx = S.has_vp ? S.vp[0][0] : 0, vw = S.has_vp ? S.vp[0][2] : tw, vy = S.has_vp ? S.vp[0][1] + vo : vo, vh = S.has_vp ? S.vp[0][3] * vs : th * vs;
     if (ux != 1) { vx = cx + (vx - cx) / ux; vw /= ux; }
     if (uy != 1) { vy = cy + (vy - cy) / uy; vh /= uy; }

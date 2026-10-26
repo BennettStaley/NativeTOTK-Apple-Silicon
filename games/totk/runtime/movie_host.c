@@ -39,7 +39,9 @@ void *runtime_movie_override(const char *name) {
     return NULL;
 }
 void movie_host_tick(void) {}
+int runtime_movie_playing(unsigned *w, unsigned *h) { (void)w; (void)h; return 0; }
 #else
+#include <stdatomic.h>
 #include <vpx/vp8dx.h>
 #include <vpx/vpx_decoder.h>
 
@@ -153,8 +155,17 @@ static void to_nv12(const vpx_image_t *img, uint8_t *dst, int w, int h) {
     }
 }
 static int free_out(const Movie *m) { for (int i = 0; i < OUT_BUFS; i++) if (!m->out_held[i]) return i; return -1; }
+/* A video is playing (runtime_movie_playing, for the renderer's Native 16:10 letterbox): the size of the last decoded frame
+   and when it came, both from any thread. */
+static _Atomic uint64_t g_movie_last_ns, g_movie_wh;
+int runtime_movie_playing(unsigned *w, unsigned *h) {
+    uint64_t t = atomic_load(&g_movie_last_ns), wh = atomic_load(&g_movie_wh);
+    if (!t || g_clock() - t > 500000000ull) return 0;   /* nothing decoded in the last 0.5 s */
+    *w = (unsigned)(wh >> 32); *h = (unsigned)wh; return 1;
+}
 static void push_ready(Movie *m, Signals *s, int slot, unsigned flags, int64_t time, int bytes) {
     m->out_held[slot] = 1; m->out_bytes[slot] = bytes;
+    if (bytes > 0 && m->w > 0 && m->h > 0) { atomic_store(&g_movie_wh, (uint64_t)m->w << 32 | (uint32_t)m->h); atomic_store(&g_movie_last_ns, g_clock()); }
     if (pace_on()) { m->decoded[m->ndecoded++] = (Ready){slot, flags, time}; return; }
     m->ready[m->nready++] = (Ready){slot, flags, time};
     note(m, s, EV_OUTPUT);
