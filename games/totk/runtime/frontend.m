@@ -83,8 +83,8 @@ void runtime_warm_progress(uint64_t done,uint64_t total,uint64_t shaders,uint64_
   if(!bootOverlay||bootOverlay.hidden)return;
   double percent=total ? fmin(100.0,(double)done/(double)total*100.0) : 100.0;
   bootStage.stringValue=[NSString stringWithFormat:@"Warming shaders and pipelines %.0f%%",floor(percent)];
-  bootDetail.stringValue=[NSString stringWithFormat:@"%llu/%llu items · shaders %llu/%llu · pipelines %llu/%llu",
-      (unsigned long long)done,(unsigned long long)total,(unsigned long long)shaders,(unsigned long long)shader_total,
+  bootDetail.stringValue=[NSString stringWithFormat:@"shaders %llu/%llu · pipelines %llu/%llu",   /* only the shader and pipeline progress (upstream b03cc91) */
+      (unsigned long long)shaders,(unsigned long long)shader_total,
       (unsigned long long)pipelines,(unsigned long long)pipeline_total];
   bootProgress.indeterminate=NO;
   bootProgress.doubleValue=percent;
@@ -213,6 +213,10 @@ static NSString *shortcut_text(void){
  else if(a.length){NSMutableParagraphStyle *gap=[NSMutableParagraphStyle new];gap.paragraphSpacingBefore=4;
   [a appendAttributedString:[[NSAttributedString alloc] initWithString:shortcut_text() attributes:@{NSFontAttributeName:small,NSForegroundColorAttributeName:[NSColor colorWithCalibratedWhite:0.75 alpha:1],NSParagraphStyleAttributeName:gap}]];}
  else [a appendAttributedString:[[NSAttributedString alloc] initWithString:shortcut_text() attributes:@{NSFontAttributeName:small,NSForegroundColorAttributeName:[NSColor colorWithCalibratedWhite:0.75 alpha:1]}]];
+ /* The commit the app was built from (upstream, 2026-10-25), last and grey: TOTK_SOURCE_COMMIT from the launcher. */
+ {const char *commit=getenv("TOTK_SOURCE_COMMIT");
+  if(full&&commit&&*commit)[a appendAttributedString:[[NSAttributedString alloc] initWithString:[NSString stringWithFormat:@"\nbuild %s",commit]
+   attributes:@{NSFontAttributeName:mono,NSForegroundColorAttributeName:[NSColor colorWithCalibratedWhite:0.6 alpha:1]}]];}
  if([a isEqualToAttributedString:self.label.attributedStringValue])return;
  self.label.attributedStringValue=a;NSSize z=[self.label sizeThatFits:NSMakeSize(CGFLOAT_MAX,CGFLOAT_MAX)];self.textSize=NSMakeSize(ceil(z.width),ceil(z.height));[self position];}
 -(NSView *)hitTest:(NSPoint)p{(void)p;return nil;}
@@ -236,6 +240,8 @@ static void front_menubar_fps_add(NSMenu *bar){   // from front_install_menu
  fpsMenu=[[NSMenu alloc] initWithTitle:@"FPS --"];
  NSMenuItem *about=[[NSMenuItem alloc] initWithTitle:@"Live frame rate (TOTK_MENUBAR_FPS=0 hides it)" action:nil keyEquivalent:@""];
  about.enabled=NO;[fpsMenu addItem:about];fpsMenu.autoenablesItems=NO;
+ const char *commit=getenv("TOTK_SOURCE_COMMIT");   /* the commit the app was built from (build_app.py, the launcher) */
+ if(commit&&*commit){NSMenuItem *build=[[NSMenuItem alloc] initWithTitle:[NSString stringWithFormat:@"Build %s",commit] action:nil keyEquivalent:@""];build.enabled=NO;[fpsMenu addItem:build];}
  fpsMenuItem=[[NSMenuItem alloc] initWithTitle:@"FPS --" action:nil keyEquivalent:@""];fpsMenuItem.submenu=fpsMenu;[bar addItem:fpsMenuItem];
 }
 /* TOTK_TITLE_FPS=1: the window title also ends in the frame rate ("Tears of the Kingdom  Mac — Ver. 1.4.3 — 60 FPS"),
@@ -430,6 +436,7 @@ static void *guest_main(void *callback){@autoreleasepool{((void(*)(void))callbac
 void runtime_front_run(void(*callback)(void)){
  @autoreleasepool{
   bootStartNS=runtime_now_ns();
+  {const char *commit=getenv("TOTK_SOURCE_COMMIT");fprintf(stderr,"[totk] built from commit %s\n",commit&&*commit?commit:"(not recorded)");}
   [NSApplication sharedApplication];[NSApp setActivationPolicy:background_run()?NSApplicationActivationPolicyAccessory:NSApplicationActivationPolicyRegular];
   appDelegate=[TOTKAppDelegate new];NSApp.delegate=appDelegate;
   [NSApplication sharedApplication];[NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];

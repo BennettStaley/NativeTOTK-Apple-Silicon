@@ -31,6 +31,31 @@ class Discard(unittest.TestCase):
             build_ipa.discard(Path(d)/'none')
 
 
+class SeedBeside(unittest.TestCase):
+    """--ios-game-data documents leaves the startup shaders beside the output; the README installs the .ipa, and the
+    seed was pushed only for an .app folder, so the game said 'No shaders' after a successful install."""
+    def layout(self, root, output):
+        (root/'Tears of the Kingdom-shader-seed').mkdir()
+        (root/'Tears of the Kingdom-shader-seed/fingerprint.txt').write_text('f' * 64)
+        app = root/'signed/Payload/TOTK.app'; (app/'GameData').mkdir(parents=True)
+        return root/output, app
+
+    def test_an_ipa_gets_its_seed(self):
+        with tempfile.TemporaryDirectory() as d:
+            ipa, app = self.layout(Path(d), 'Tears of the Kingdom.ipa'); ipa.write_bytes(b'PK')
+            self.assertEqual(install_device.seed_beside(ipa, app), Path(d)/'Tears of the Kingdom-shader-seed')
+
+    def test_an_app_folder_gets_its_seed(self):
+        with tempfile.TemporaryDirectory() as d:
+            out, app = self.layout(Path(d), 'Tears of the Kingdom.app'); out.mkdir()
+            self.assertEqual(install_device.seed_beside(out, out), Path(d)/'Tears of the Kingdom-shader-seed')
+
+    def test_an_app_that_carries_its_seed_gets_none(self):
+        with tempfile.TemporaryDirectory() as d:
+            ipa, app = self.layout(Path(d), 'Tears of the Kingdom.ipa'); (app/'GameData/shader-seed').mkdir()
+            self.assertIsNone(install_device.seed_beside(ipa, app))
+
+
 def read_pack(parts):
     """ios/Sources/main.m seed_unpack, in Python: the files of a pack stream cut into parts."""
     data = b''.join(p.read_bytes() for p in parts); assert data[:9] == b'TOTKPACK1'; at, out = 9, {}
@@ -55,6 +80,27 @@ class ShaderPack(unittest.TestCase):
             got, exact = read_pack(parts)
             self.assertEqual(got, files)
             self.assertTrue(exact)   # nothing after the end mark
+
+
+
+class FullHD(unittest.TestCase):
+    """Settings › Full HD (docked): off by default, Tears of the Kingdom only, with the 1600x900 scene (1.4.3 renders
+    960x540 on the phone otherwise), and no switch in Breath of the Wild's Settings pane (build_ipa.py)."""
+    def test_switch_off_by_default_and_docked_at_1600x900(self):
+        import plistlib, re
+        ios = TOOLS.parent
+        specs = plistlib.loads((ios/'Settings.bundle/Root.plist').read_bytes())['PreferenceSpecifiers']
+        switch = [s for s in specs if s.get('Key') == 'TOTK_DOCKED']
+        self.assertEqual(len(switch), 1)
+        self.assertIs(switch[0]['DefaultValue'], False)
+        main = (ios/'Sources/main.m').read_text()
+        branch = re.search(r'#ifndef GAME_BOTW\n(.*?)#endif', main[main.index('TOTK_DOCKED') - 200:], re.S)
+        self.assertTrue(branch and 'TOTK_DOCKED' in branch.group(1))
+        for line in ('"TOTK_OPERATION_MODE","docked"', '"TOTK_IOS_DRAWABLE_H","1080"', '"TOTK_RENDER_RES","1600x900"'):
+            self.assertIn(line, branch.group(1))
+        build = (TOOLS/'build_ipa.py').read_text()
+        self.assertIn("s.get('Key')=='TOTK_DOCKED'", build)
+        self.assertIn("'      - path: Gen/Settings.bundle'", build)
 
 
 if __name__ == '__main__':

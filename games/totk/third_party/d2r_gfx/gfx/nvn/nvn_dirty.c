@@ -27,6 +27,20 @@ enum { BUSY_WAIT_MS = 2000 };
 enum { CHUNK_SHIFT = 6 };
 typedef struct { uintptr_t base, end; _Atomic uint8_t *state; _Atomic uint64_t *gen; _Atomic uint64_t *cgen; size_t cap; _Atomic int live; _Atomic uint64_t latest;
     _Atomic uint64_t fence, gstamp; uintptr_t owner; size_t osize; } range_t;   // owner / osize: the pool (storage, size) that registered the range (nvn_dirty_remove_range)   // fence / gstamp (TOTK frames in flight): newest submission fence that reads this range, "now" when its pages were last all made read-only   // latest (TOTK): highest page generation in the range
+/* TOTK_DIRTY_FAST (default on; =0 off), 2026-10-23. Two lookups the replay makes for every CPU-mirrored texture at its
+   check in each submission (tex_mtl: about 2.5% of the translate thread in the Korok Forest profile):
+   - nvn_dirty_since walked every page of the texture whenever anything else in its pool had been written since the stamp
+     (the big material pools are written by streaming all the time; a 42 MB texture is 2,600 pages). The range's cgen[]
+     (above: the highest page generation per chunk of 64 pages, raised by unprotect_page after the page's own generation
+     and before the range's latest) answers it: a chunk whose maximum is not above the stamp holds no page that is, so it
+     is skipped (pages_since), and the answer is the page walk's. Upstream kept the same maxima in a blk[] array of its
+     own; this tree's cgen[] (also used by the frames-in-flight guard) serves both.
+   - find() scanned the ~4,000 live ranges whenever the address was not in one of the thread's last 8 ranges. A per-thread
+     table by page of the address answers first; an entry counts only if its range is live and holds the address, as for
+     the recent list, and live ranges never share a page, so it is the range the scan would find. */
+enum { BLK_SHIFT = CHUNK_SHIFT, BLK_PAGES = 1 << BLK_SHIFT, FIND_HASH = 1024 };
+static int g_dirty_fast = 1;   // set once, before the first range exists (nvn_dirty_add_range)
+static _Atomic uint64_t g_blk_skips, g_find_hash_hits, g_find_scans;
 #if defined(GAME_BOTW)
 /* BOTW: a pool that shares host pages with live ranges gets ranges for its other pages (the gaps), so ranges never share
    a page and the fault handler still finds at most one range per page. Before, such a pool got no range: its textures
@@ -78,13 +92,37 @@ static range_t *find(uintptr_t a) {
        first (a slot reused for another pool fails the bounds or live test and falls through to the scan), so the scan over
        the ~4,000 live pools of the world mostly runs for the first touch of a pool. */
     static __thread range_t *recent[8]; static __thread unsigned next;
+    static __thread range_t *hashed[FIND_HASH];   // TOTK_DIRTY_FAST: by page of the address
     for (int k = 0; k < 8; k++) {
         range_t *l = recent[k];
         if (l && atomic_load_explicit(&l->live, memory_order_acquire) && a >= l->base && a < l->end) return l;
     }
+    unsigned h = 0;
+    if (g_dirty_fast) {
+        uintptr_t pg = a >> g_shift; h = (unsigned)(pg ^ (pg >> 10) ^ (pg >> 20)) & (FIND_HASH - 1);
+        range_t *l = hashed[h];
+        if (l && atomic_load_explicit(&l->live, memory_order_acquire) && a >= l->base && a < l->end) { recent[next++ & 7] = l; atomic_fetch_add_explicit(&g_find_hash_hits, 1, memory_order_relaxed); return l; }
+        atomic_fetch_add_explicit(&g_find_scans, 1, memory_order_relaxed);
+    }
     int n = atomic_load(&g_nr);
-    for (int i = 0; i < n; i++) if (atomic_load_explicit(&g_r[i].live, memory_order_acquire) && a >= g_r[i].base && a < g_r[i].end) { recent[next++ & 7] = &g_r[i]; return &g_r[i]; }
+    for (int i = 0; i < n; i++) if (atomic_load_explicit(&g_r[i].live, memory_order_acquire) && a >= g_r[i].base && a < g_r[i].end) { recent[next++ & 7] = &g_r[i]; if (g_dirty_fast) hashed[h] = &g_r[i]; return &g_r[i]; }
     return NULL;
+}
+static void dirty_fast_init(void) { const char *e = getenv("TOTK_DIRTY_FAST"); g_dirty_fast = !(e && !atoi(e)); if (!g_dirty_fast) LOG("TOTK_DIRTY_FAST=0: dirty checks walk every page, range lookups scan the list"); }
+/* Pages [p, q] of r: one written after stamp? (TOTK_DIRTY_FAST: blocks whose maximum is not above the stamp are skipped.) */
+static int pages_since(range_t *r, uintptr_t p, uintptr_t q, uint64_t stamp) {
+    if (!g_dirty_fast) { for (uintptr_t i = p; i <= q; i++) if (atomic_load(&r->gen[i]) > stamp) return 1; return 0; }
+    uint64_t skipped = 0;
+    for (uintptr_t i = p; i <= q;) {
+        uintptr_t last = ((i >> BLK_SHIFT) << BLK_SHIFT) + BLK_PAGES - 1; if (last > q) last = q;
+        if (atomic_load(&r->cgen[i >> BLK_SHIFT]) <= stamp) { i = last + 1; skipped++; continue; }
+        for (; i <= last; i++) if (atomic_load(&r->gen[i]) > stamp) { if (skipped) atomic_fetch_add_explicit(&g_blk_skips, skipped, memory_order_relaxed); return 1; }
+    }
+    if (skipped) atomic_fetch_add_explicit(&g_blk_skips, skipped, memory_order_relaxed);
+    return 0;
+}
+void nvn_dirty_fast_stats(int *on, uint64_t *blk_skips, uint64_t *hash_hits, uint64_t *scans) {
+    *on = g_dirty_fast; *blk_skips = atomic_load(&g_blk_skips); *hash_hits = atomic_load(&g_find_hash_hits); *scans = atomic_load(&g_find_scans);
 }
 /* TOTK diagnostic (on with DM_NVN_TILELOG): a ring of the latest page unprotections with the writer, read by
    nvn_dirty_recent: game writes (fault: pc / lr of the faulting code) and host writes (dm_guest_write_prepare caller). */
@@ -243,7 +281,7 @@ void nvn_dirty_gpu_write_end(void *tok) {
 #if !defined(GAME_BOTW)
 void nvn_dirty_add_range(const void *mem, size_t size) {
     static int inited;
-    if (!inited) { inited = 1; g_pg = (uintptr_t)getpagesize(); g_shift = __builtin_ctzl(g_pg); mach_timebase_info(&g_tb); dm_fault_hook_register(on_fault); dm_guest_write_prep_register(prep_write); g_drec_on = getenv("DM_NVN_TILELOG") != NULL; }
+    if (!inited) { inited = 1; g_pg = (uintptr_t)getpagesize(); g_shift = __builtin_ctzl(g_pg); mach_timebase_info(&g_tb); dirty_fast_init(); dm_fault_hook_register(on_fault); dm_guest_write_prep_register(prep_write); g_drec_on = getenv("DM_NVN_TILELOG") != NULL; }
     atomic_fetch_add(&g_adds_total, 1);
     pthread_mutex_lock(&g_slot_mu);
     int n = atomic_load(&g_nr);
@@ -346,8 +384,7 @@ int nvn_dirty_since(const void *addr, size_t len, uint64_t stamp) {
     range_t *r = find((uintptr_t)addr);
     if (atomic_load(&r->latest) <= stamp) return 0;   // TOTK: nothing in the whole pool was written since the stamp (no per-page scan)
     uintptr_t a = (uintptr_t)addr, p = (a - r->base) >> g_shift, q = (a + len - 1 - r->base) >> g_shift;
-    for (uintptr_t i = p; i <= q; i++) if (atomic_load(&r->gen[i]) > stamp) return 1;   // The generation of the last write before upload is <= the stamp; any later write must be > the stamp
-    return 0;
+    return pages_since(r, p, q, stamp);   // The generation of the last write before upload is <= the stamp; any later write must be > the stamp
 }
 /* TOTK: nvn_dirty_tracked and nvn_dirty_since in one range lookup (they looked the range up twice), and the page scan
    skips each 64-page chunk whose highest generation is at or below the stamp. Returns -1 when untracked (nvn_dirty_tracked
@@ -359,12 +396,7 @@ int nvn_dirty_check(const void *addr, size_t len, uint64_t stamp) {
     if (!r || (uintptr_t)addr + len > r->end) return -1;
     if (atomic_load(&r->latest) <= stamp) return 0;
     uintptr_t a = (uintptr_t)addr, p = (a - r->base) >> g_shift, q = (a + len - 1 - r->base) >> g_shift;
-    for (uintptr_t i = p; i <= q; ) {
-        uintptr_t c = i >> CHUNK_SHIFT, ce = ((c + 1) << CHUNK_SHIFT) - 1; if (ce > q) ce = q;
-        if (atomic_load(&r->cgen[c]) > stamp) for (uintptr_t k = i; k <= ce; k++) if (atomic_load(&r->gen[k]) > stamp) return 1;
-        i = ce + 1;
-    }
-    return 0;
+    return pages_since(r, p, q, stamp);
 }
 #endif
 #if defined(GAME_BOTW)
@@ -396,7 +428,7 @@ static void ov_log(const char *what, _Atomic uint64_t *c, const void *mem, size_
 }
 void nvn_dirty_add_range(const void *mem, size_t size) {
     static int inited;
-    if (!inited) { inited = 1; g_pg = (uintptr_t)getpagesize(); g_shift = __builtin_ctzl(g_pg); mach_timebase_info(&g_tb); dm_fault_hook_register(on_fault); dm_guest_write_prep_register(prep_write); g_drec_on = getenv("DM_NVN_TILELOG") != NULL; }
+    if (!inited) { inited = 1; g_pg = (uintptr_t)getpagesize(); g_shift = __builtin_ctzl(g_pg); mach_timebase_info(&g_tb); dirty_fast_init(); dm_fault_hook_register(on_fault); dm_guest_write_prep_register(prep_write); g_drec_on = getenv("DM_NVN_TILELOG") != NULL; }
     atomic_fetch_add(&g_adds_total, 1);
     pthread_mutex_lock(&g_slot_mu);
     int n = atomic_load(&g_nr);
@@ -485,8 +517,7 @@ int nvn_dirty_since(const void *addr, size_t len, uint64_t stamp) {
     while (a < e) {
         range_t *r = find(a); if (!r) return 1;   // untracked: dirty
         uintptr_t stop = e < r->end ? e : r->end;
-        if (atomic_load(&r->latest) > stamp)
-            for (uintptr_t i = (a - r->base) >> g_shift, q = (stop - 1 - r->base) >> g_shift; i <= q; i++) if (atomic_load(&r->gen[i]) > stamp) return 1;
+        if (atomic_load(&r->latest) > stamp && pages_since(r, (a - r->base) >> g_shift, (stop - 1 - r->base) >> g_shift, stamp)) return 1;
         a = stop;
     }
     return 0;

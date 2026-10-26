@@ -37,7 +37,7 @@ static const Glyph FONT[] = {
 };
 
 /* Key 1 cycles all -> minimal (FPS only) -> off -> all. TOTK_HINTS=0 starts off; the settings menu's "Performance
-   readout" switches between all and off (fps_overlay_set_hints). */
+   readout" switches between all and off (fps_overlay_set_hints); fps_overlay_set_hud_mode sets one mode directly. */
 static _Atomic int g_hud_mode = -1;
 static int hud_mode_now(void) {
     int v = atomic_load_explicit(&g_hud_mode, memory_order_relaxed);
@@ -49,6 +49,9 @@ int fps_overlay_hud_mode(void) { return hud_mode_now(); }
 int fps_overlay_hints_enabled(void) { return fps_overlay_hud_mode() != HUD_MODE_OFF; }
 int fps_overlay_full_hud(void) { return fps_overlay_hud_mode() == HUD_MODE_ALL; }
 void fps_overlay_set_hints(int visible) { (void)hud_mode_now(); atomic_store(&g_hud_mode, visible ? HUD_MODE_ALL : HUD_MODE_OFF); }
+void fps_overlay_set_hud_mode(int mode) {
+    if (mode == HUD_MODE_OFF || mode == HUD_MODE_ALL || mode == HUD_MODE_MINIMAL) { (void)hud_mode_now(); atomic_store_explicit(&g_hud_mode, mode, memory_order_relaxed); }
+}
 int fps_overlay_toggle_hints(void) {
     int mode = hud_mode_now(), next;
     do next = mode == HUD_MODE_ALL ? HUD_MODE_MINIMAL : mode == HUD_MODE_MINIMAL ? HUD_MODE_OFF : HUD_MODE_ALL;

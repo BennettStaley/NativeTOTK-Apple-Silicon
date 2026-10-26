@@ -27,3 +27,4 @@ int nvn_dirty_span_fence(const void *addr, size_t len, uint64_t *fence);  // new
 void nvn_dirty_add_stats(uint64_t v[3]);                           // cumulative pool registrations: clipped (shares a host page), covered by other ranges, untracked
 void nvn_dirty_guard_stats(uint64_t v[6]);                         // cumulative: waits, ns waited, waits timed out, guard calls, calls with nothing to protect, untracked ranges
 void nvn_dirty_guard_audit(uint64_t *n, uint64_t sample[8]);      // audit mode: writes that would have waited, last pages written
+void nvn_dirty_fast_stats(int *on, uint64_t *blk_skips, uint64_t *hash_hits, uint64_t *scans);   // TOTK_DIRTY_FAST: chunks skipped by nvn_dirty_since / nvn_dirty_check, range lookups answered by the page table / by the scan

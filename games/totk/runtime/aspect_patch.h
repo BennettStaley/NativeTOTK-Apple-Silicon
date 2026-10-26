@@ -113,6 +113,21 @@ float runtime_aspect_choice(void) {
     return step == ASPECT_STEP_FIT ? -1 : step == ASPECT_STEP_WIDE ? g_aspect_wide : 0;
 }
 
+/* Upstream's setters (its key-1 panel; ours is settings_panel_mac.h with runtime_aspect_set above): the ratio picked
+   (16:9 for the game's own, the window's shape while fitting; 0 where the shape cannot be changed), TOTK_ASPECT's ratio,
+   and a ratio to pick (0.5..8; within 1% of 16:9 the game's own; 0 where unavailable or out of range). */
+float runtime_aspect_ratio(void) {
+    if (!g_aspect_slot) return 0;
+    int step = atomic_load(&g_aspect_step);
+    return step == ASPECT_STEP_WIDE ? g_aspect_wide : step == ASPECT_STEP_FIT ? aspect_bits_float(atomic_load(&g_aspect_view)) : (float)ASPECT_GAME;
+}
+float runtime_aspect_start(void) { return g_aspect_named ? g_aspect_wide : 0; }
+int runtime_aspect_set_ratio(float r) {
+    if (!g_aspect_slot || !(r >= 0.5f && r <= 8)) return 0;
+    aspect_choose(aspect_near(r, ASPECT_GAME) ? 0 : r);
+    return 1;
+}
+
 /* Key 4 (runtime/input.c). Returns 0 where it is not available (iPhone / iPad, other game versions). */
 int runtime_aspect_toggle(void) {
     if (!g_aspect_slot) return 0;

@@ -5,6 +5,8 @@
 #include "world_survey.h"
 #include "actor_spawn.h"
 #include "settings.h"
+#include "gamepad_layout.h"
+#include <dispatch/dispatch.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -34,17 +36,23 @@ static void user_input(const char *what){
    Key 1 toggles the shortcut reminder in frontend.m. Key 2 (Mac key code 19) cycles MetalFX frame interpolation:
    off -> 30+30 -> half the refresh rate -> uncapped (totk_mfx.m). Key 3 (key code 20) cycles 2K modes:
    MetalFX 2K -> native 2K -> off (runtime_output_mode_cycle). Key 6 (key code 22) cycles the controller type: auto -> Xbox ->
-   PlayStation -> Switch (runtime_gamepad_type_cycle, gamepad.m). Key 7 (key code 26) turns mouse mode on / off
-   (runtime_mouse_toggle, gamepad.m; the window holds the pointer: frontend.m). Held-key repeats do not cycle. */
+   PlayStation -> Switch (runtime_gamepad_type_set, gamepad.m). Key 7 (key code 26) turns mouse mode on / off
+   (runtime_mouse_set, gamepad.m; the window holds the pointer: frontend.m). Held-key repeats do not cycle. The settings
+   menu (F1 / Command-comma, settings_panel_mac.h) holds the same choices; upstream's key-1 panel is not used here. */
 enum { KEY_INTERP_TOGGLE = 19, KEY_OUTPUT_MODE_CYCLE = 20, KEY_ASPECT_TOGGLE = 21, KEY_PAD_TYPE_CYCLE = 22, KEY_TAA_TOGGLE = 23, KEY_MOUSE_TOGGLE = 26 };   /* 21: key 4, 16:9 -> fit to the window -> 21:9 (aspect_patch.h); 22: key 6; 23: key 5, MetalFX temporal anti-aliasing (totk_taa.m) */
+/* Keys 5-7 on upstream's setters (its panel replaced the cycles). */
+static void key_taa_cycle(void){extern int taa_enabled(void);extern void taa_set(int on);taa_set(!taa_enabled());}
+static void key_pad_type_cycle(void){dispatch_async(dispatch_get_main_queue(),^{int detected;int t=runtime_gamepad_type(&detected);   /* main thread */
+ int next=t>=0&&t<GAMEPAD_TYPE_COUNT-1?t+1:GAMEPAD_TYPE_AUTO;runtime_gamepad_type_set(next);});}   /* logs the new type */
+static void key_mouse_toggle(void){runtime_mouse_set(!runtime_mouse_enabled());}
 void runtime_input_key_synthetic(unsigned code,int down){if(code>=128)return;pthread_mutex_lock(&inputLock);int press=down&&!keys[code];if(down&&!keys[code])pending|=button(code);keys[code]=(unsigned char)!!down;pthread_mutex_unlock(&inputLock);
  if(press&&code==18){extern void runtime_shortcut_help_toggle(void);runtime_shortcut_help_toggle();}
  if(press&&code==KEY_INTERP_TOGGLE){extern void dm_gfx_set_flag(const char *name,int v);dm_gfx_set_flag("mfx_interp",-1);}
  if(press&&code==KEY_OUTPUT_MODE_CYCLE)runtime_output_mode_cycle();
  if(press&&code==KEY_ASPECT_TOGGLE&&runtime_aspect_toggle())settings_aspect_follow(runtime_aspect_choice());   /* the menu shows the shape key 4 picked */
- if(press&&code==KEY_TAA_TOGGLE){extern void taa_toggle(void);taa_toggle();}
- if(press&&code==KEY_PAD_TYPE_CYCLE)runtime_gamepad_type_cycle();
- if(press&&code==KEY_MOUSE_TOGGLE)runtime_mouse_toggle();}
+ if(press&&code==KEY_TAA_TOGGLE)key_taa_cycle();
+ if(press&&code==KEY_PAD_TYPE_CYCLE)key_pad_type_cycle();
+ if(press&&code==KEY_MOUSE_TOGGLE)key_mouse_toggle();}
 void runtime_input_key(unsigned code,int down){if(down&&code<128)user_input("keyboard");runtime_input_key_synthetic(code,down);}
 /* While the settings menu is open the game reads no buttons and no keyboard: nothing the player presses there reaches it.
    The controller's two sticks still do (the menu navigates with the d-pad), so the camera and Link can move while a

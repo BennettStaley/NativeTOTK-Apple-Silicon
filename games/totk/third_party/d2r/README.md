@@ -27,6 +27,14 @@ Local changes:
    the callee's entry state. The other criteria are unchanged; exclusive accesses still use the existing
    deexcl test model.
 
+6. Spin waits (`patch_nso.py` "Spin waits"): the loop search and copy ported from nxnative
+   (https://github.com/seedds/nxnative, MIT, commits 066f2af and 6d34984; licence in
+   `games/totk/third_party/licenses/nxnative.txt`). Only the build IDs registered in `SPIN_BUILDS` are rewritten (currently
+   Breath of the Wild 1.9.0 main); there is no in-code data table, so the loop must lie within one eh_frame function; words
+   already rewritten are recognised by their difference from the decoded image (`IMG0`); the gate is this project's
+   `runtime_gate`, and the host side is `runtime_spin_wait` in `threads.c`. Structure check ⑫ verifies the back-edges,
+   trampolines, copies and gate blocks.
+
 main/sdk/subsdk0 have all been regenerated with the local version and passed full structure checks and
 per-site equivalence checks. The new call form also has recursion, exception-target, negative-control and
 M4 native multithreaded tests; the fixed exclusive window also has tests of the unsimplified LDXR/STXR

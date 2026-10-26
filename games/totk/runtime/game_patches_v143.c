@@ -68,7 +68,10 @@ void runtime_frame_step_update(uint64_t now_ns){
     if(!last_present_ns){last_present_ns=now_ns;return;}
     double dt=(double)(now_ns-last_present_ns)*1e-9;last_present_ns=now_ns;
     if(dt>0.25||dt<0.001){frame_sample_count=frame_sample_next=0;return;}
-    if(dt<1.0/120.0)dt=1.0/120.0;if(dt>1.0/15.0)dt=1.0/15.0;
+    /* No 1/120 s floor, as in TOTK 1.0-1.2.1 (game_patches.c) and BotW since 2338bb0: a present shorter than 1/120 s
+       counted as 1/120 s made the game run fast above 120 fps (1.2x at 144, 2x at 240) and with jitter at the 120 cap
+       (each short interval raised, each long one kept). A hitch is still cut at 1/15 s per interval, as before (upstream ce7f0b3). */
+    if(dt>1.0/15.0)dt=1.0/15.0;
     frame_samples[frame_sample_next++%5]=dt;if(frame_sample_count<5)frame_sample_count++;
     double sum=0;for(unsigned i=0;i<frame_sample_count;i++)sum+=frame_samples[i];
     frame_step_store((float)(sum/frame_sample_count));
@@ -423,14 +426,14 @@ uint64_t runtime_output_res_extra_bytes(void){
     uint64_t kib=(uint64_t)ceil(113664.0*(1+grow)/1024.0)*1024-113664;return kib<<10;
 }
 /* Key 3's picture mode is kept between runs in the file TOTK_PICTURE_MODE names (the launcher: <data>/picture-mode.txt;
-   unset: nothing is kept, as before). It holds one word: off, metalfx, native-2k or native-4k. The next start with
+   unset: nothing is kept, as before). It holds one word: off, metalfx, native-2k, native-2k-metalfx, native-4k or 720p. The next start with
    automatic output sizes begins in that mode; a size larger than this app's swapchain falls back to the largest one it
    has (native-4k on a 2K app starts at native 2K). An explicit TOTK_OUTPUT_RES=<w>x<h> starts as it says. */
 static void picture_mode_save(uint64_t size){
     const char *path=getenv("TOTK_PICTURE_MODE");if(!path||!*path)return;
     extern int mfxup_output_enabled(void);
-    const char *mode=mfxup_output_enabled()?"metalfx":size==pack_size(2560,1440)?"native-2k":
-                     size==pack_size(3840,2160)?"native-4k":"off";
+    const char *mode=mfxup_output_enabled()?(size==pack_size(2560,1440)?"native-2k-metalfx":"metalfx"):size==pack_size(2560,1440)?"native-2k":
+                     size==pack_size(3840,2160)?"native-4k":size==pack_size(1280,720)?"720p":"off";
     FILE *f=fopen(path,"w");
     if(!f||fprintf(f,"%s\n",mode)<0||fclose(f)){fprintf(stderr,"[totk] picture mode: cannot write %s\n",path);return;}
     fprintf(stderr,"[totk] picture mode %s kept for the next start\n",mode);
@@ -443,8 +446,11 @@ static void picture_mode_restore(uint8_t *page){
     unsigned w=1920,h=1080;
     if(!strcmp(mode,"native-4k")&&output_w>=3840&&output_h>=2160){w=3840;h=2160;}
     else if((!strcmp(mode,"native-4k")||!strcmp(mode,"native-2k"))&&output_w>=2560&&output_h>=1440){w=2560;h=1440;}
+    else if(!strcmp(mode,"native-2k-metalfx")&&output_w>=2560&&output_h>=1440){extern void dm_gfx_set_flag(const char *,int);
+        w=2560;h=1440;dm_gfx_set_flag("mfx_output",1);dm_gfx_set_flag("mfx_upscale",1);}
     else if(!strcmp(mode,"metalfx")){extern void dm_gfx_set_flag(const char *,int);dm_gfx_set_flag("mfx_output",1);dm_gfx_set_flag("mfx_upscale",1);}
-    else if(strcmp(mode,"off")){fprintf(stderr,"[totk] picture mode: %s holds \"%s\", not off, metalfx, native-2k or native-4k; starting off\n",path,mode);return;}
+    else if(!strcmp(mode,"720p")){w=1280;h=720;}
+    else if(strcmp(mode,"off")){fprintf(stderr,"[totk] picture mode: %s holds \"%s\", not off, metalfx, native-2k, native-2k-metalfx, native-4k or 720p; starting off\n",path,mode);return;}
     atomic_store((_Atomic uint64_t *)(void *)(page+32),pack_size(w,h));
     fprintf(stderr,"[totk] picture mode: starts in %s (kept from the last run, %s)\n",mode,path);
 }
@@ -729,6 +735,46 @@ int runtime_output_res_toggle(void){
     uint64_t config=atomic_load((_Atomic uint64_t *)(void *)(output_page+40));
     if(config){__atomic_fetch_or((uint32_t *)(uintptr_t)(config+8),1u<<21,__ATOMIC_SEQ_CST);runtime_oe_push_message(30);}
     fprintf(stderr,"[totk] 1.4.3 output requested %ux%u (display config %s)\n",(unsigned)now,(unsigned)(now>>32),config?"ready":"not published yet");
+    return 1;
+}
+/* Upstream's resolution setters (runtime.h OUTPUT_MODE_*; its key-1 panel uses them, ours can): any of 720p, 1080p, 1080p
+   with the MetalFX output scaler, the native canvas (the swapchain's size), the same with MetalFX up to the window.
+   The size goes through the same display-config rebuild as key 3; the scene follows at the next present (render_latch). */
+static void output_size_set(uint64_t want){
+    _Atomic uint64_t *size=(_Atomic uint64_t *)(void *)(output_page+32);
+    if(atomic_load(size)==want)return;
+    atomic_store(size,want);
+    uint64_t config=atomic_load((_Atomic uint64_t *)(void *)(output_page+40));
+    if(config){__atomic_fetch_or((uint32_t *)(uintptr_t)(config+8),1u<<21,__ATOMIC_SEQ_CST);runtime_oe_push_message(30);}
+    fprintf(stderr,"[totk] 1.4.3 output requested %ux%u (display config %s)\n",(unsigned)want,(unsigned)(want>>32),config?"ready":"not published yet");
+}
+int runtime_output_native(int mode,unsigned *w,unsigned *h){
+    if(!output_page||(mode!=OUTPUT_MODE_NATIVE&&mode!=OUTPUT_MODE_NATIVE_METALFX))return 0;
+    *w=output_w;*h=output_h;return 1;
+}
+int runtime_output_modes(void){
+    if(!output_page)return 0;
+    return 1<<OUTPUT_MODE_OFF|1<<OUTPUT_MODE_METALFX|1<<OUTPUT_MODE_720P|1<<OUTPUT_MODE_NATIVE|1<<OUTPUT_MODE_NATIVE_METALFX;
+}
+int runtime_output_mode(void){
+    extern int mfxup_output_enabled(void);
+    if(!output_page)return OUTPUT_MODE_OFF;
+    uint64_t now=atomic_load((_Atomic uint64_t *)(void *)(output_page+32));
+    if(now==pack_size(1280,720))return OUTPUT_MODE_720P;
+    if((unsigned)now>1920)return mfxup_output_enabled()?OUTPUT_MODE_NATIVE_METALFX:OUTPUT_MODE_NATIVE;
+    return mfxup_output_enabled()?OUTPUT_MODE_METALFX:OUTPUT_MODE_OFF;
+}
+int runtime_output_mode_set(int mode){
+    extern void dm_gfx_set_flag(const char *,int);
+    if(!output_page||mode<OUTPUT_MODE_OFF||mode>OUTPUT_MODE_720P||!(runtime_output_modes()&1<<mode))return 0;
+    unsigned w=1920,h=1080;
+    if(mode==OUTPUT_MODE_720P){w=1280;h=720;}else if(mode==OUTPUT_MODE_NATIVE||mode==OUTPUT_MODE_NATIVE_METALFX)runtime_output_native(mode,&w,&h);
+    output_size_set(pack_size(w,h));
+    int mfx=mode==OUTPUT_MODE_METALFX||mode==OUTPUT_MODE_NATIVE_METALFX;
+    dm_gfx_set_flag("mfx_output",mfx);dm_gfx_set_flag("mfx_upscale",mfx);
+    fprintf(stderr,"[totk] picture: %s\n",mode==OUTPUT_MODE_720P?"720p":mode==OUTPUT_MODE_NATIVE_METALFX?"native 2K, MetalFX to the window":
+            mode==OUTPUT_MODE_NATIVE?"native":mode==OUTPUT_MODE_METALFX?"MetalFX 2K":"off (1080p)");
+    picture_mode_save(atomic_load((_Atomic uint64_t *)(void *)(output_page+32)));
     return 1;
 }
 int runtime_output_mode_cycle(void){

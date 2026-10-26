@@ -1,6 +1,6 @@
 /* Read-only game RomFS, backed by the player's fully IVFC-verified image. */
 #include "runtime.h"
-#include "romfs_config.h"
+#include "game_data.h"
 #include "game_version.h"
 #include "fs_host.h"
 #include "romfs_path.h"
@@ -21,6 +21,12 @@
 #define UNSUPPORTED 0x6402u
 #define INVALID 0xe402u
 #define NH 65536
+/* The image's size and SHA-256 and the index's SHA-256 from the player's verified extraction: romfs-config.txt in the game
+   data folder (game_data.h, scripts/prepare_romfs_backend.py), read when the RomFS is opened. */
+static uint64_t romfs_image_size;static const char *romfs_image_sha256,*romfs_index_sha256;
+#define ROMFS_IMAGE_SIZE romfs_image_size
+#define ROMFS_IMAGE_SHA256 romfs_image_sha256
+#define ROMFS_INDEX_SHA256 romfs_index_sha256
 static uint8_t *index_bytes;
 static size_t index_size;
 static uint64_t file_count,strings_offset;
@@ -473,7 +479,7 @@ static void rstb_serve(size_t from) {
  for(size_t k=0;k<from;k++)if(overlays[k].index==ri){fprintf(stderr,"[totk] mods: the build replaces %s; not adjusted for mods\n",rname);return;}
  uint64_t t0=runtime_now_ns();
  /* The key: what the table depends on. */
- CC_SHA256_CTX c;CC_SHA256_Init(&c);const char *tag="totk-mods-rstb-1\n" ROMFS_IMAGE_SHA256 "\n";CC_SHA256_Update(&c,tag,(CC_LONG)strlen(tag));
+ CC_SHA256_CTX c;CC_SHA256_Init(&c);char tag[128];snprintf(tag,sizeof tag,"totk-mods-rstb-1\n%s\n",ROMFS_IMAGE_SHA256);CC_SHA256_Update(&c,tag,(CC_LONG)strlen(tag));   /* the hash is read at start now (game_data.h) */
  for(size_t k=from;k<noverlay;k++){const Overlay *o=&overlays[k];int64_t id[5]={(int64_t)o->size,(int64_t)o->dev,(int64_t)o->ino,(int64_t)o->mtime.tv_sec,(int64_t)o->mtime.tv_nsec};
   CC_SHA256_Update(&c,o->name,(CC_LONG)strlen(o->name)+1);CC_SHA256_Update(&c,id,sizeof id);}
  uint8_t digest[32];char key[65];CC_SHA256_Final(digest,&c);for(unsigned k=0;k<32;k++)snprintf(key+k*2,3,"%02x",digest[k]);
@@ -529,6 +535,8 @@ static void overlay_init(void) {
 }
 void runtime_fs_init(void) {
  if(image_fd>=0)return;
+ romfs_image_size=runtime_game_number("romfs-config.txt","ROMFS_IMAGE_SIZE");romfs_image_sha256=runtime_game_sha256("romfs-config.txt","ROMFS_IMAGE_SHA256");
+ romfs_index_sha256=runtime_game_sha256("romfs-config.txt","ROMFS_INDEX_SHA256");
  const char *dir=getenv("TOTK_ROMFS");if(!dir)dir="extracted/" TOTK_GAME_DIR "/romfs";char path[4096];
  need(snprintf(path,sizeof(path),"%s/runtime-index.bin",dir)<(int)sizeof(path),"RomFS path");int fd=open(path,O_RDONLY);need(fd>=0,"RomFS index missing");
  struct stat st;need(fstat(fd,&st)==0&&st.st_size>=24&&st.st_size<128*1024*1024,"RomFS index size");runtime_boot_progress("Reading the data index",0,0);sha_fd(fd,ROMFS_INDEX_SHA256,0,NULL);

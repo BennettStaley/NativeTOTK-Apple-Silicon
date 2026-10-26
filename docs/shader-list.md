@@ -28,6 +28,7 @@ The list holds identifiers only, never game data. Each build makes the shaders f
 | `C` | `<variant>_b`, flags | A compute pipeline the warm-up builds. |
 | `R` | pipeline key, flags | A render pipeline the warm-up builds. |
 | `B` | pipeline key, vertex border, fragment border, flags | That render pipeline with the sampler border colours Metal lacks, emulated in its shaders (`-` for a stage without). The warm-up builds the patched shaders and the pipeline. |
+| `T` | pipeline key, tile reads, flags | That render pipeline with the fragment variant that reads the draw's own colour attachments from the tile, `<argument id>:<attachment>;` per read (`nvn_mtl.m warm_tileread`). Before 2026-10-26 only `pso_user.tsv` had these, so every new install built them in play (all 58 a 5-minute route built in the world with the list). |
 
 - **Shader key:** the SHA-256 of the shader's NVN control section and code, computed the same way as the runtime.
 - **Deps:** the translator's `deps` as compact, sorted JSON. They record the texture, image, attribute and fragment
@@ -107,7 +108,9 @@ each shader's default variant ([shader-variants.md](shader-variants.md); `all_de
 states those variants do not serve are written, never a default variant (`totk_shader_rt.m contrib_wanted`): the list
 keeps non-default variants only (2026-10-22; Breath of the Wild too since 2026-10-23).
 Render pipelines are collected with them (2026-10-22): one the game builds in play that the app's warm-up lists lack
-becomes an `R` row (and a `B` row with its border recipe), written off the submit thread (`nvn_mtl.m pso_contribute`).
+becomes an `R` row (and a `B` row with its border recipe, a `T` row with its tile reads), written off the submit thread
+(`nvn_mtl.m pso_contribute`). A `B` or `T` row the lists lack goes in also when they have its plain `R` row (until
+2026-10-26 it went only with a new `R` row).
 Its shaders are named as a build names them: a default or depth-bound variant keeps its name, any other is named after
 its deps as `prepare_shader_seed.py` names a list row (`totk_contrib_listed_name`), so another player's build has it.
 
@@ -134,7 +137,7 @@ packages) and translates the boot and title packages' shaders for the default bi
 names (`games/botw/scripts/prepare_shader_seed.py`). Its players' contribution file is
 `~/Library/Application Support/MacNativeGames/BotW/shader-list-contribution.txt`, sent with the
 [Breath of the Wild issue form](https://github.com/ly05010419/MacNativeGames/issues/new?template=shader-list-botw.yml)
-(label `shader-list-botw`; `collect_shader_issues.py --game botw` merges them). The lists never mix: a key names a
+(label `shader-list-botw`; `collect_shader_issues.py` merges both games' issues). The lists never mix: a key names a
 shader of one game only.
 
 Its shader key hashes the control section's own length (the word at +0x20: 0x7d1 for the game's archives, 0x848 for
@@ -150,17 +153,23 @@ on the spot would): run the game with `DM_PSO_MANIFEST=off`, an empty `DM_NVN_SH
 ## Merging what players sent (maintainers)
 
 ```sh
-# what each open shader-list issue would add (changes nothing); --seed drops the rows a build makes by itself
-python3 games/totk/scripts/collect_shader_issues.py --seed <work>/totk/build/shader-seed/v143
-# write the list; --close also thanks each merged issue and closes it
-python3 games/totk/scripts/collect_shader_issues.py --seed <work>/totk/build/shader-seed/v143 --apply --close
+# what each open shader-list issue of either game would add (changes nothing). Each --seed gives a game version's
+# shader keys (its shader-keys.json) and drops the rows its built-in variants serve; --keys <game>=<file> adds a key list
+S=<work>/totk/build/shader-seed
+python3 games/totk/scripts/collect_shader_issues.py --seed $S/v143 --seed <botw work>/totk/build/shader-seed/botw160
+# write the lists; --close also thanks each merged issue and closes it
+python3 games/totk/scripts/collect_shader_issues.py --seed $S/v143 --seed <botw work>/totk/build/shader-seed/botw160 --apply --close
 # drop rows already in the list that the seed's default (or depth-bound) variants serve
 python3 games/totk/scripts/shader_list.py prune games/totk/assets/shader_list.tsv <work>/totk/build/shader-seed/v143
 ```
 
-It takes only `V` rows and render pipeline `R` / `B` rows from an attachment and drops everything else. Then check with `shader_list.py stats`, commit
-the list and push; every Mac app prepares the new variants within a day (below), and the next iPhone and iPad builds
-carry them.
+It takes only `V` rows and render pipeline `R` / `B` / `T` rows from an attachment (or from a comment's, when the upload
+failed) and drops everything else. One contribution file serves both games, so every row goes to the game its shader
+keys belong to, whatever the issue's title says. Rows of shaders neither game's keys hold are not merged and keep their
+issue open: a key list may lack a game version (give a seed of every version collected; a seed made before 2026-10-22
+has no shader-keys.json and is refused), or the file is another game's (#525, Super Mario Odyssey). Once checked,
+`--drop-unknown` leaves them out and closes the issue. Then check with `shader_list.py stats`, commit
+the list and push; the next builds carry the new variants.
 
 ## Adding what you played (with git)
 

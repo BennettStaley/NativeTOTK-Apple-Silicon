@@ -14,12 +14,15 @@
    the camera (right stick) on the right half. Bits are the Npad buttons. While a game controller is connected the layer
    is hidden; a touch shows it and works as usual, and it hides again 3 seconds after the last finger lifts.
    The settings menu (interface.touch_*) picks when it shows (always, hidden with a controller as above, until touched, or
-   off), its opacity and its size. */
+   off), its opacity and its size.
+   Between − and + a smaller button shows the frame rate the game is held to, 60 or 30; a tap switches it at once and
+   keeps the choice for the next start (TOTK_PHONE_FPS in the app's defaults, also in the Settings app). */
 typedef struct { CGPoint at; uint64_t bit; NSString *label; CGFloat size; } TouchButton;
 enum { kButtonCount = 16 };
 static const CGFloat kButtonSize = 46;
 static const NSTimeInterval kHideAfter = 3;   // seconds after the last finger lifts, with a controller connected
 enum { TOUCH_ALWAYS, TOUCH_CONTROLLER, TOUCH_UNTIL_TOUCHED, TOUCH_OFF };   // interface.touch_controls
+static const CGFloat kFpsButtonSize = 34;
 
 @implementation TOTKTouchPad {
     NSMapTable<UITouch *, NSValue *> *points;
@@ -125,6 +128,15 @@ enum { TOUCH_ALWAYS, TOUCH_CONTROLLER, TOUCH_UNTIL_TOUCHED, TOUCH_OFF };   // in
     for (int i = 0; i < kButtonCount; i++) b[i] = all[i];
 }
 
+- (CGPoint)fpsButton { CGRect a = self.area; return CGPointMake(CGRectGetMidX(a), CGRectGetMinY(a) + a.size.height * .12); }
+- (BOOL)fpsButtonAt:(CGPoint)p { CGPoint f = self.fpsButton; return hypot(p.x - f.x, p.y - f.y) < kFpsButtonSize * .75; }
+- (void)switchFrameRate {
+    int fps = runtime_phone_fps() == 30 ? 60 : 30;
+    runtime_phone_fps_set(fps);
+    [NSUserDefaults.standardUserDefaults setObject:fps == 30 ? @"30" : @"60" forKey:@"TOTK_PHONE_FPS"];
+    [self setNeedsDisplay];
+}
+
 - (uint64_t)buttonAt:(CGPoint)p {
     TouchButton b[kButtonCount]; [self buttons:b]; CGFloat hit = self.hitRadius; uint64_t bits = 0;
     for (int i = 0; i < kButtonCount; i++) if (hypot(p.x - b[i].at.x, p.y - b[i].at.y) < MIN(hit, b[i].size * .75)) bits |= b[i].bit;
@@ -152,6 +164,7 @@ static void stick_axes(CGPoint from, CGPoint to, CGFloat radius, int32_t *x, int
     (void)event; concealed = NO; [hideTimer invalidate]; hideTimer = nil;
     for (UITouch *t in touches) {
         CGPoint p = [t locationInView:self]; NSValue *v = [NSValue valueWithCGPoint:p]; [points setObject:v forKey:t];
+        if ([self fpsButtonAt:p]) { [self switchFrameRate]; continue; }   // pressed no Npad button and moves no stick
         if ([self buttonAt:p]) continue;
         [(p.x < CGRectGetMidX(self.bounds) ? leftOrigins : rightOrigins) setObject:v forKey:t];
     }
@@ -196,5 +209,12 @@ static void draw_stick(CGContextRef c, CGPoint o, CGPoint p, CGFloat r, CGFloat 
         CGContextSetFillColorWithColor(c, fill); CGContextFillEllipseInRect(c, box); CGContextStrokeEllipseInRect(c, box);
         CGSize z = [b[i].label sizeWithAttributes:attrs]; [b[i].label drawAtPoint:CGPointMake(b[i].at.x - z.width / 2, b[i].at.y - z.height / 2) withAttributes:attrs];
     }
+    // The frame rate button: a smaller rounded square, its label the rate the game is held to now.
+    CGPoint f = self.fpsButton; CGRect box = CGRectMake(f.x - kFpsButtonSize / 2, f.y - kFpsButtonSize / 2, kFpsButtonSize, kFpsButtonSize);
+    UIBezierPath *key = [UIBezierPath bezierPathWithRoundedRect:box cornerRadius:8];
+    CGContextSetFillColorWithColor(c, fill); [key fill]; [key stroke];
+    NSString *rate = runtime_phone_fps() == 30 ? @"30" : @"60";
+    NSDictionary *small = @{NSFontAttributeName: [UIFont monospacedDigitSystemFontOfSize:13 weight:UIFontWeightSemibold], NSForegroundColorAttributeName: ink};
+    CGSize z = [rate sizeWithAttributes:small]; [rate drawAtPoint:CGPointMake(f.x - z.width / 2, f.y - z.height / 2) withAttributes:small];
 }
 @end

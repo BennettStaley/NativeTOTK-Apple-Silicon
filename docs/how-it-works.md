@@ -177,14 +177,19 @@ control, reaches 1.0 in none. A sample one texel to the side, or at the own pixe
    reads dictionary-compressed startup packages from the selected, verified RomFS, parses supported NVN BNSH programs
    and translates default-binding variants. The version, translation chain, translator/preparer hashes and every
    output file are checked before cache reuse and packaging. No prior user shader cache is read.
-4. The game binary built against your extracted files (it checks their hashes at every start) and the app bundle: the
-   code and small files inside it, the large game data in the game-data folders next to it (see below); the app's
-   launcher points the game at your profile, cache, log and game-data folders. The builder seals and strictly verifies
-   the bundle before replacing the previous app, then refreshes its LaunchServices record.
+4. The game binary built from this repository alone, and the game data folder (`build/game-data/<version>`: the
+   modules' symbols, relocations and gates, the RomFS / add-on content / shared-font sizes and SHA-256, and the map of
+   rewritten code the cheat engine avoids) made from your extracted files; the game binary reads that folder at every
+   start and checks your files against it (`games/totk/runtime/game_data.h`), so nothing of the game is compiled into it.
+   Both go into an app bundle, with the large game data (the RomFS image and the prepared startup shaders) in the
+   game-data folders next to it (see below); the app's launcher points the game at your profile, cache, log and game-data
+   folders. The builder seals and strictly verifies the complete bundle before replacing the previous app, then
+   refreshes its LaunchServices record.
 
 ## Where the game data lives
 
-The RomFS image (17 GB) and the prepared startup shaders (about 52,000 seed files and 17,000 compiled Metal libraries,
+(The small per-version tables of `build/game-data/<version>` travel inside the app; this section is about the large
+data.) The RomFS image (17 GB) and the prepared startup shaders (about 52,000 seed files and 17,000 compiled Metal libraries,
 1 GB) change only when the game files, the shared shader list or the Metal compiler change. Inside the app they made up
 nearly all of what every rebuild cloned file by file, sealed with `codesign` (which reads all 17 GB) and had macOS scan
 again on the first run, so a one-line code change took 10 to 15 minutes. They now live outside the app, in
@@ -257,7 +262,7 @@ Container tests use generated encrypted fixtures with no game data or real keys:
 
 The pinned hactool commit `1d64a83450e025622f3468c28fc4164dad2c5ef6` merges the base and update Program NCAs. The build adds a small explicit title-key-file hook (`MNG_TITLE_KEYS`): temporary common tickets for both inputs stay in a 0600 file under a private temporary directory, and are removed on success or failure. It does not edit the player's key store or pass keys in process arguments. A bounded-input hook (`MNG_BASE_RANGE_OFFSET` / `MNG_BASE_RANGE_SIZE`) reads the original container's base NCA in place, preventing a second temporary 17 GB base copy; only the update NCA is extracted. All six IVFC levels must verify, then the final image must match the selected version's SHA-256. The hactool output uses `--sectionN`, because `--romfs` does not export this BKTR section.
 
-Runtime addresses, resource overlays, generated headers and modules are selected together. The app contains one executable and one selected data set; its launcher is compiled for that same version and `--check` verifies the bundle's version metadata. The normal window title reports the version. Saves keep their existing location, with an atomic full pre-upgrade backup before the first 1.1.2 or 1.4.3 launch.
+Runtime addresses, resource overlays, the game data folder and modules are selected together. The app contains one executable and one selected data set; its launcher is compiled for that same version and `--check` verifies the bundle's version metadata. The normal window title reports the version. Saves keep their existing location, with an atomic full pre-upgrade backup before the first 1.1.2 or 1.4.3 launch.
 
 The exact 1.1.2 visibility-counter vertex shader needs a targeted lowering: each passing vertex atomically adds one instead of using a subgroup ballot/reduction. The original atomic side effect is retained, and the code SHA-256 limits this transformation to the analysed shader. This is not a general subgroup fallback. The native prebuilt translator is rebuilt from the checked-in source and has an updated SHA-256.
 
