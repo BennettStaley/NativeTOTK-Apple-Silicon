@@ -175,6 +175,7 @@ const char *runtime_cheats_name(int i);
 int runtime_cheats_state(int i);   /* CHEAT_ON | CHEAT_AT_LAUNCH | CHEAT_APPLIED | CHEAT_REFUSED */
 const char *runtime_cheats_problem(int i);
 int runtime_cheats_set(int i,int on);   /* returns the new state; saved, and the profile backed up before the first cheat */
+int runtime_cheats_live_code(void);   /* code patches are written and put back while the game runs (else at the next launch) */
 enum { CHEAT_ON = 1, CHEAT_AT_LAUNCH = 2, CHEAT_APPLIED = 4, CHEAT_REFUSED = 8 };
 /* The Cheats tab (Mac): every section of every cheat file read, k in file order; role (cheat_files.h): 0 cheat, 1 master
    code (always on), 2 heading (a group's or a file's title), 3 hidden (a group's end); source: runtime_cheats_source_*. */

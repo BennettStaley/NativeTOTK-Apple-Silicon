@@ -381,7 +381,7 @@ static NSString *saves_profile(void) { const char *d = getenv("TOTK_PROFILE_DIR"
 
 /* ---- the Cheats tab (runtime/cheats.c) ---- */
 
-/* Code cheats switched since this launch: they apply (or turn off) only when the game starts again. */
+/* Code cheats switched since this launch that wait for the game to start again (a conflict, or no live code patches). */
 static int cheats_pending(void) {
     int n = 0;
     for (int i = 0; i < runtime_cheats_count(); i++) {
@@ -399,6 +399,10 @@ static NSString *cheat_detail(const RuntimeCheatInfo *c, NSColor **color) {
     if (st & CHEAT_AT_LAUNCH) {
         if ((st & CHEAT_ON) && !(st & CHEAT_APPLIED)) { *color = NSColor.systemOrangeColor; return @"Applies after restart"; }
         if (!(st & CHEAT_ON) && (st & CHEAT_APPLIED)) { *color = NSColor.systemOrangeColor; return @"Turns off after restart"; }
+        if (runtime_cheats_live_code()) {
+            if (st & CHEAT_ON) { *color = NSColor.systemGreenColor; return @"Code patch: running now"; }
+            return @"Code patch: takes effect at once";
+        }
         return st & CHEAT_ON ? @"Code patch: applied at launch" : @"Code patch: applies at the next start";
     }
     if (st & CHEAT_ON) { *color = NSColor.systemGreenColor; return @"Live: running now"; }
@@ -548,8 +552,9 @@ static int cheat_choice_members(int leader, int *all, int *usable, int max, int 
     NSString *where = hasFolder ? [@(folder) stringByAbbreviatingWithTildeInPath] : @"(off: TOTK_CHEATS_DIR=0)";
     if (runtime_cheats_count()) {
         NSButton *off = [self cheatsButton:@"Turn off" action:@selector(cheatsAllOff)]; off.enabled = cheats_any_on();
-        [self addCheatsRow:[self cheatsRow:@"Turn off all cheats" detail:@"Live cheats stop at once; code patches after a restart. "
-                            "The first cheat you turn on backs up your saves (profile-before-cheats)." color:nil control:off] id:CHEATS_OFF_ROW];
+        NSString *how = runtime_cheats_live_code() ? @"All of them stop at once. " : @"Live cheats stop at once; code patches after a restart. ";
+        [self addCheatsRow:[self cheatsRow:@"Turn off all cheats" detail:[how stringByAppendingString:
+                            @"The first cheat you turn on backs up your saves (profile-before-cheats)."] color:nil control:off] id:CHEATS_OFF_ROW];
     }
     int pending = cheats_pending(), changed = runtime_cheats_files_changed();
     if (pending || changed) {
