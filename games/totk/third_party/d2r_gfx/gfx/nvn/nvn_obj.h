@@ -190,6 +190,7 @@ void botw_mfx_scene_ready(void);   /* the upscale draw happened (or MetalFX repl
 int botw_mfx_ui_draw(void *prog);   /* a draw into the canvas after the upscale draw is UI; the canvas is also drawn into before the scene (cleared and used early in the frame), those draws are not */
 void botw_mfx_frame_reset(void);
 #define MFX_UI_DRAW(pr) botw_mfx_ui_draw((__bridge void *)(pr))
+#define UIL_GAME 0   /* the UI-layer composite (totk_ui_layer.h) is TOTK only; Breath of the Wild keeps the per-draw squeeze */
 #define BOTW_MFX_FRAME_RESET() botw_mfx_frame_reset();
 /* A frame that draws no UI into the canvas has no scene copy; the first draw into a presented texture after the upscale
    takes the whole canvas as the scene and clears the UI layer (end of nvn_mtl.m). */
@@ -232,6 +233,7 @@ void botw_tiny_commit(void);
 #else
 #define MFX_CANVAS_FMT_OK(f) pf_is_float(f)
 #define MFX_UI_DRAW(pr) mfx_ui_vs(pr->sh[0]->key)
+#define UIL_GAME 1   /* the UI-layer composite (totk_ui_layer.h) */
 #define UW_UI_BEGINS(pr) mfx_ui_vs(pr->sh[0]->key)
 #define UW_NOT_UI_DRAW(vs, dw, di) !uw_ui_vs(vs) || (dw ? dw->count : di ? di->count : 0) != 6
 #define BOTW_MFX_FRAME_RESET()

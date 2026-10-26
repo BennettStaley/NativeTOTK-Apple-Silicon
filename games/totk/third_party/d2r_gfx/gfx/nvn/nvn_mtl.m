@@ -4487,6 +4487,16 @@ static struct { uint32_t cfmt[8], dfmt, sfmt, samples; int hd, hs; NSUInteger tw
 #define MFX_ROLE_UI 2
 #define MFX_ROLE_UI_OPAQUE 3
 static struct { uint64_t canvas, last_c0, swap[4]; uint32_t swap_w, swap_h; int nswap, scene_done, ui_cleared, depth_done, want_cam, role; uint64_t frames; } g_mfx;
+/* The UI-layer composite (totk_ui_layer.h): its textures while interpolation is off, this frame's canvas and scene copy. */
+static struct {
+    id<MTLTexture> scene, ui, ui2;   // ours while interpolation is off (pp_tex); TOTK_MFX's own while it is on
+    id<MTLTexture> canvas, scene_cur;   // this frame's canvas and its scene copy
+    int done;   // composed this frame
+    uint64_t composed, missed, frames;
+} g_uil;
+static int uil_on(void);
+static id<MTLTexture> uil_scene_target(NSUInteger w, NSUInteger h, MTLPixelFormat pf);
+static id<MTLTexture> uil_ui_target(NSUInteger w, NSUInteger h);
 // TOTK_OBJ_MOTION (totk_objmv.h, included after the readable-tile merge state)
 static void om_note_depth(id<MTLTexture> dt);
 static void om_pass_setup(MTL4RenderPassDescriptor *pd);
@@ -5223,20 +5233,23 @@ static void mfx_queue_residency(void) {
 }
 /* ui 0: the debug view with interpolation off (mfx_debug_only): only the G-buffer depth, the camera and the per-object
    motion are taken; no canvas search, no UI layer. */
-static void mfx_pass_setup(MTL4RenderPassDescriptor *pd, int ui) {
+static void mfx_pass_setup(MTL4RenderPassDescriptor *pd, int ui) {   // ui 2: the UI layer only (totk_ui_layer.h, interpolation off)
     if (ui) canvas_learn(pd);
     const tex_t *t0 = R.rt.n > 0 ? R.rt.color[0] : NULL;
     id<MTLTexture> c0 = t0 ? pd.colorAttachments[0].texture : nil;
     id<MTLTexture> dt = pd.depthAttachment.texture;
+    if (ui != 2) {
     if (!g_mfx.depth_done && dt && c0 && dt.pixelFormat == MTLPixelFormatDepth32Float && dt.width == c0.width && dt.height == c0.height && dt.width >= 320) {
         int nc = 0; for (int i = 0; i < R.rt.n && i < 8; i++) nc += pd.colorAttachments[i].texture != nil;
         if (nc >= 3) { mfx_note_depth(dt); om_note_depth(dt); g_mfx.depth_done = 1; g_mfx.want_cam = 1; }
     }
     om_pass_setup(pd);   // TOTK_OBJ_MOTION: the motion attachment of passes into the G-buffer depth
     if (g_pass.objmv) mfx_queue_residency();
+    }
     if (ui && t0 && c0 && g_mfx.scene_done && g_mfx.canvas == t0->serial && R.rt.n <= 7 && pd.colorAttachments[0].level == 0 && !pd.colorAttachments[7].texture) {
         MTLRenderPassColorAttachmentDescriptor *a7 = pd.colorAttachments[7];
-        a7.texture = mfx_ui_target(g_dev, c0.width, c0.height);
+        a7.texture = uil_ui_target(c0.width, c0.height);
+        if (uil_on()) g_uil.canvas = c0;
         a7.loadAction = g_mfx.ui_cleared ? MTLLoadActionLoad : MTLLoadActionClear; a7.clearColor = MTLClearColorMake(0, 0, 0, 0); a7.storeAction = MTLStoreActionStore;
         g_mfx.ui_cleared = 1;
         g_pass.cfmt[7] = (uint32_t)MTLPixelFormatRGBA16Float; g_pass.mfx = 1;
@@ -5270,9 +5283,11 @@ static void uw_note_present(const tex_t *t) {
     g_mfx.swap_w = t->d.width; g_mfx.swap_h = t->d.height;
 }
 static int uw_on_canvas(void) { return g_mfx.canvas && R.rt.n > 0 && R.rt.color[0] && R.rt.color[0]->serial == g_mfx.canvas; }
-/* The TOTK_MFX UI vertex shaders and four more that draw UI quads (inventory tab labels, map icons). */
+/* The TOTK_MFX UI vertex shaders and more that draw UI quads (inventory tab labels, map icons; e9c27008: the boss health
+   bar's fill, drawn right after its track 1469983f; unsqueezed it sat 56 canvas pixels above the track on a 16:10 window,
+   a line through the boss name, 2026-10-24). */
 static int uw_ui_vs(const char *vs) {
-    static const char *const more[] = {"1a40e5f5", "2117f58b", "8d4e36d0", "1469983f"};
+    static const char *const more[] = {"1a40e5f5", "2117f58b", "8d4e36d0", "1469983f", "e9c27008"};
     if (mfx_ui_vs(vs)) return 1;
     for (size_t i = 0; i < sizeof more / sizeof *more; i++) if (!strncmp(vs, more[i], 8)) return 1;
     return 0;
@@ -5293,6 +5308,7 @@ static void uw_ui_squeeze(const char *vs, const p_draw *dw, const p_draw_idx *di
     /* TOTK_REPLAY_FAST: both cases below need a 6-index draw with a vertex shader and the squeeze on; most draws fail that,
        so they leave before the 13 shader-name compares (~115 samples / 15 s on the replay thread, 2026-10-22). */
     if (replay_fast() && (off || !vs || (dw ? dw->count : di ? di->count : 0) != 6)) return;
+    if (uil_on()) return;   // the UI is composed as one layer instead (totk_ui_layer.h)
     if (!off && !g_uw_ui && vs && uw_ui_vs(vs) && (dw ? dw->count : di ? di->count : 0) == 6 && uw_on_canvas() && tw && th && uw_ratio() > 0) {
         static int n; if (n < 40) { n++; MLOG("[uw] F%llu: UI quad (vs %.8s) before the UI began: %s", (unsigned long long)atomic_load(&g_cur_frame), vs, early ? "squeezed (TOTK_UI_SQUEEZE_EARLY=1)" : "not squeezed"); }
         if (early) { totk_ui_squeeze(uw_ratio(), ux, uy); return; }
@@ -5311,8 +5327,9 @@ static void mfx_snapshot_scene(void) {
     if (g_enc) rp_end();
     id<MTLTexture> c = tex_mtl(R.rt.color[0]);
     if (!c || c.textureType != MTLTextureType2D || c.mipmapLevelCount < 1) { g_mfx.scene_done = 1; return; }
-    id<MTLTexture> sc = mfx_scene_target(g_dev, c.width, c.height, c.pixelFormat);
-    mfx_queue_residency();
+    id<MTLTexture> sc = uil_scene_target(c.width, c.height, c.pixelFormat);
+    if (mfx_enabled()) mfx_queue_residency();
+    g_uil.scene_cur = sc;
     id<MTL4ComputeCommandEncoder> b = blit();
     enc_b_copy_texture(b, c, 0, 0, MTLOriginMake(0, 0, 0), MTLSizeMake(c.width, c.height, 1), sc, 0, 0, MTLOriginMake(0, 0, 0));
     enc_b_end(g_blit); g_blit = nil;
@@ -5536,7 +5553,8 @@ static id<MTL4RenderCommandEncoder> rp_begin_ex(int clear_only) {
     if (mfx_enabled()) mfx_pass_setup(pd, 1);   // TOTK: MetalFX scene / UI attachments, G-buffer depth
     else {
         if (mfx_debug_only()) mfx_pass_setup(pd, 0);   // the motion / depth debug view without interpolation: G-buffer depth, camera, per-object motion
-        if (uw_ratio() || g_pp_sharpen || g_pp_aa >= 2 || g_fx_hud) canvas_learn(pd);
+        if (uil_on()) mfx_pass_setup(pd, 2);   // the UI-layer composite: canvas, UI attachment (totk_ui_layer.h)
+        else if (uw_ratio() || g_pp_sharpen || g_pp_aa >= 2 || g_fx_hud) canvas_learn(pd);
     }   // key 4: the canvas the UI is squeezed in; picture settings: the canvas they process; hide the HUD: the canvas its draws go to
     g_enc = enc_r_begin(pd);
     args_dirty_all();
@@ -12592,6 +12610,7 @@ static int mfxup_draw(NvProg *pr) {
     return 0;
 }
 #include "totk_post.h"
+#include "totk_ui_layer.h"   // the UI-layer composite (key 4 on a window that is not 16:9)
 #include "nvn_cube_group.h"
 #include "nvn_lazy_clear.h"
 #include "nvn_par_encode.h"   // TOTK_PAR_ENCODE: parallel encoding of the G-buffer pass, step 1
@@ -12790,8 +12809,10 @@ frz_plain:;
     if (g_enc && g_lay.active && !lay_draw_ok(pr, dw, di)) {   // TOTK: this draw cannot write its layer: end the layered pass, draw in a plain one
         PD("L %llu a draw in the layered pass cannot write the layer index: split here", g_stat_pass); RP_WHY("layer-refuse"); rp_end(); g_lay.refuse = 1; g_lay.refused++; }
     if (g_pp_sharpen || g_pp_aa >= 2) pp_ui_hook(pr);   // sharpen / AA without a game FXAA draw: the canvas before the UI (totk_post.h)
-    if (!g_mfx.scene_done && g_mfx.canvas && R.rt.n > 0 && R.rt.color[0] && R.rt.color[0]->serial == g_mfx.canvas && pr && pr->sh[0] && MFX_UI_DRAW(pr) && mfx_enabled())
-        mfx_snapshot_scene();   // TOTK_MFX: first UI draw into the canvas: copy the finished scene first
+    if (g_mfx.ui_cleared && !g_uil.done) uil_hook();   // the UI-layer composite, before the canvas is copied to the window
+    if (!g_mfx.scene_done && g_mfx.canvas && R.rt.n > 0 && R.rt.color[0] && R.rt.color[0]->serial == g_mfx.canvas && pr && pr->sh[0] &&
+        (uil_on() ? uw_ui_vs(pr->sh[0]->key) : MFX_UI_DRAW(pr) && mfx_enabled()))
+        mfx_snapshot_scene();   // TOTK_MFX / the UI-layer composite: first UI draw into the canvas: copy the finished scene first
     if (!g_uw_ui && uw_on_canvas() && pr && pr->sh[0] && UW_UI_BEGINS(pr)) g_uw_ui = 1; BOTW_MFX_NO_UI_SCENE()   // key 4: the UI begins | BOTW key 2 (every draw, not part of the if): a frame without UI takes the canvas as its scene
     id<MTLRenderCommandEncoder> en = rp_begin_ex(mode);
     /* TOTK_ULD: the check above only sees passes already open; the draw that opens one meets its prediction here. If it
@@ -15586,6 +15607,7 @@ static void mfx_debug_present(const tex_t *t, int discard, const int crop[4]) {
     }
 }
 uint64_t mtl_present(const tex_t *t, double period, const int crop[4]) {
+    uil_frame_end();   // the UI-layer composite: next frame (before interpolation takes this one)
     taa_frame_end();   // TOTK_TAA: next frame's jitter, this frame's depth and camera forgotten (also while off: key 5)
     int discard = atomic_load(&g_present_discard), islot = mfx_enabled() && t ? mfx_present_frame(t, period, discard, crop) : -1;
     if (!mfx_enabled()) {   // the motion / depth debug view without interpolation; its textures and arenas go once it is off

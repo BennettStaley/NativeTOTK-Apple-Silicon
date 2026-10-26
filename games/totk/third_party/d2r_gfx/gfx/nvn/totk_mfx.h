@@ -19,6 +19,10 @@ int mfx_latch(void);     // at the game's present, after this frame's interpolat
 // the 2368-byte block at vertex uniform 1).
 id<MTLTexture> mfx_scene_target(id<MTLDevice> dev, NSUInteger w, NSUInteger h, MTLPixelFormat format);
 id<MTLTexture> mfx_ui_target(id<MTLDevice> dev, NSUInteger w, NSUInteger h);
+/* The UI-layer composite (totk_ui_layer.h): a second UI texture of the same size that the composite writes the squeezed UI
+   into, and the swap that makes it the UI the interpolator takes this frame (the other one is drawn into next frame). */
+id<MTLTexture> mfx_ui_alt(void);
+void mfx_ui_swap(void);
 void mfx_note_scene(void);
 void mfx_note_depth(id<MTLTexture> depth);
 void mfx_note_camera(const float *cam, int n);

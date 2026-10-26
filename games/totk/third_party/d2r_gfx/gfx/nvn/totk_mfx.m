@@ -43,6 +43,8 @@ void mfx_set_mv_dyn(int on) { (void)on; }
 int mfx_latch(void) { return 0; }
 id<MTLTexture> mfx_scene_target(id<MTLDevice> dev, NSUInteger w, NSUInteger h, MTLPixelFormat format) { (void)dev; (void)w; (void)h; (void)format; return nil; }
 id<MTLTexture> mfx_ui_target(id<MTLDevice> dev, NSUInteger w, NSUInteger h) { (void)dev; (void)w; (void)h; return nil; }
+id<MTLTexture> mfx_ui_alt(void) { return nil; }
+void mfx_ui_swap(void) {}
 void mfx_note_scene(void) {}
 void mfx_note_depth(id<MTLTexture> depth) { (void)depth; }
 void mfx_note_camera(const float *cam, int n) { (void)cam; (void)n; }
@@ -63,7 +65,7 @@ static struct {
     id<MTLDevice> dev;
     id<MTL4FXFrameInterpolator> fi;
     NSUInteger in_w, in_h, out_w, out_h; MTLPixelFormat scene_fmt;
-    id<MTLTexture> scene[2], ui, mv, out[MFX_OUT], outv[MFX_OUT];
+    id<MTLTexture> scene[2], ui, ui2, mv, out[MFX_OUT], outv[MFX_OUT];   // ui2: the UI-layer composite's squeezed UI (mfx_ui_swap)
     id<MTLTexture> pdepth; uint64_t pdepth_frame;   // the previous interpolated frame's depth (copied after its motion), and its g.frames
     id<MTLResidencySet> rs;
     id<MTLComputePipelineState> mv_ps;
@@ -283,7 +285,7 @@ static void ensure_out(id<MTLDevice> dev, NSUInteger w, NSUInteger h, MTLPixelFo
     if (!fmt) fmt = g.scene_fmt ? g.scene_fmt : MTLPixelFormatRG11B10Float;
     uint64_t old = 0; NSUInteger ow = g.out_w, oh = g.out_h; int had = g.scene[0] != nil;
     for (int i = 0; i < 2; i++) { old += obj_bytes(g.scene[i]); drop(&g.scene[i]); }
-    old += obj_bytes(g.ui); drop(&g.ui);
+    old += obj_bytes(g.ui) + obj_bytes(g.ui2); drop(&g.ui); drop(&g.ui2);
     for (int i = 0; i < MFX_OUT; i++) { old += obj_bytes(g.out[i]); drop(&g.out[i]); g.outv[i] = nil; }
     /* The interpolator and motion texture of the old size go too (the new ones are made at the next prepare), and the
        reference mfx_dump keeps to the old depth. The per-object motion target follows the depth size (mfx_obj_target). */
@@ -306,6 +308,12 @@ static void ensure_out(id<MTLDevice> dev, NSUInteger w, NSUInteger h, MTLPixelFo
 }
 id<MTLTexture> mfx_scene_target(id<MTLDevice> dev, NSUInteger w, NSUInteger h, MTLPixelFormat fmt) { ensure_out(dev, w, h, fmt); return g.scene[g.cur]; }
 id<MTLTexture> mfx_ui_target(id<MTLDevice> dev, NSUInteger w, NSUInteger h) { ensure_out(dev, w, h, 0); return g.ui; }
+id<MTLTexture> mfx_ui_alt(void) {
+    if (!g.ui) return nil;
+    if (!g.ui2) g.ui2 = mk(MTLPixelFormatRGBA16Float, g.out_w, g.out_h, MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead);
+    return g.ui2;
+}
+void mfx_ui_swap(void) { id<MTLTexture> t = g.ui; g.ui = g.ui2; g.ui2 = t; }
 id<MTLResidencySet> mfx_residency(void) { return g.rs; }
 void mfx_note_scene(void) { g.scene_ok = 1; }
 /* TOTK_OBJ_MOTION: the RGBA16Float target the G-buffer draws write their motion to (RG: NDC delta, previous minus
@@ -962,7 +970,7 @@ static double gpu_pct(double q) {
    number and output sizes are given. */
 void mfx_mem_report(char *out, size_t n) {
     uint64_t live = 0; for (int i = 0; i < 2; i++) live += obj_bytes(g.scene[i]);
-    live += obj_bytes(g.ui) + obj_bytes(g.mv) + obj_bytes(g.pdepth) + obj_bytes(g.obj) + obj_bytes(g.dz);
+    live += obj_bytes(g.ui) + obj_bytes(g.ui2) + obj_bytes(g.mv) + obj_bytes(g.pdepth) + obj_bytes(g.obj) + obj_bytes(g.dz);
     for (int i = 0; i < MFX_OUT; i++) live += obj_bytes(g.out[i]);
     uint64_t rb = 0; int rfi = 0; for (int i = 0; i < g_nret; i++) { rb += g_ret[i].bytes; rfi += [g_ret[i].obj conformsToProtocol:@protocol(MTL4FXFrameInterpolator)]; }
     char fis[256] = ""; size_t k = 0;
@@ -986,7 +994,7 @@ void mfx_stats(char *out, size_t n) {
 static void mfx_release(int all) {
     uint64_t b = 0;
     for (int i = 0; i < 2; i++) { b += obj_bytes(g.scene[i]); drop(&g.scene[i]); }
-    b += obj_bytes(g.ui); drop(&g.ui);
+    b += obj_bytes(g.ui) + obj_bytes(g.ui2); drop(&g.ui); drop(&g.ui2);
     for (int i = 0; i < MFX_OUT; i++) { b += obj_bytes(g.out[i]); drop(&g.out[i]); g.outv[i] = nil; }
     b += obj_bytes(g.mv); drop(&g.mv); b += obj_bytes(g.obj); drop(&g.obj); b += obj_bytes(g.pdepth); drop(&g.pdepth); g.pdepth_frame = 0; b += obj_bytes(g.dz); drop(&g.dz);
     if (g.fi && !is_cached(g.fi)) retire(g.fi);

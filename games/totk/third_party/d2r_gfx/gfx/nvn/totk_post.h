@@ -36,8 +36,8 @@
 #include "totk_post_msl.h"
 #include "smaa_tables.h"
 
-enum { PP_COPY, PP_FXAA, PP_CAS, PP_EDGE, PP_WEIGHT, PP_BLEND, PP_NFN };
-static const char *const k_pp_fn[PP_NFN] = {"pp_copy", "pp_fxaa", "pp_cas", "smaa_edge", "smaa_weight", "smaa_blend"};
+enum { PP_COPY, PP_FXAA, PP_CAS, PP_EDGE, PP_WEIGHT, PP_BLEND, PP_UI_SQUEEZE, PP_UI_OVER, PP_NFN };   // PP_UI_*: totk_ui_layer.h
+static const char *const k_pp_fn[PP_NFN] = {"pp_copy", "pp_fxaa", "pp_cas", "smaa_edge", "smaa_weight", "smaa_blend", "ui_squeeze", "ui_over"};
 static const char *const k_pp_aa_name[4] = {"game FXAA", "off", "FXAA", "SMAA 1x"};
 static struct {
     id<MTLLibrary> lib; int lib_failed;
@@ -277,7 +277,7 @@ static void pp_ui_hook(__unsafe_unretained NvProg *pr) {
     if (!(g_pp_sharpen || g_pp_aa >= 2) || g_postfx.ui_done || g_defer_replaying || !pr || !R.rt.n || !R.rt.color[0] || !g_mfx.canvas) return;
     uint64_t ser = R.rt.color[0]->serial;
     if (ser == g_mfx.canvas) {
-        if (pr->sh[0] && mfx_ui_vs(pr->sh[0]->key)) pp_canvas(tex_mtl(R.rt.color[0]));
+        if (pr->sh[0] && (mfx_ui_vs(pr->sh[0]->key) || (uil_on() && uw_ui_vs(pr->sh[0]->key)))) pp_canvas(tex_mtl(R.rt.color[0]));   // the UI-layer composite copies the scene at any UI shader
         else if (!g_postfx.canvas) g_postfx.canvas = tex_mtl(R.rt.color[0]);
         return;
     }
