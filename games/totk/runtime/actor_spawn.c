@@ -20,6 +20,7 @@
    SafeString here is one pointer (the function reads the name through [x1]). CreateArg is 0x98 bytes, below. */
 #include "actor_spawn.h"
 #include "actor_spawn_queue.h"
+#include "dish_give.h"
 #include "game_version.h"
 #include "world_survey.h"
 #include <math.h>
@@ -32,6 +33,12 @@
 #if defined(GAME_SPAWN_REQUEST_CREATE) && !defined(GAME_BOTW)
 #define SPAWN_SUPPORTED 1
 #endif
+#if defined(SPAWN_SUPPORTED) && defined(GAME_DISH_COOK) && defined(TOTK_GAME_V143)
+#define DISH_SUPPORTED 1   /* give a cooked dish: 1.4.3 only (the end of this file) */
+#endif
+static int dish_init(Module *m);
+static void dish_tick(uint64_t frame);
+static int dish_waiting(void);
 
 _Atomic int runtime_spawn_waiting;
 static _Atomic int spawn_commands;   /* the input file's "spawn" lines: test profiles only (world_survey.c) */
@@ -151,10 +158,11 @@ static const char *result_text(uint32_t r) {
 /* Every 1.0.0 and 1.4.3 session (the same entry check for both): the call is only made for requests the player (the Spawn tab) or a test queued. */
 int runtime_spawn_init(Module *m) {
     static const uint32_t entry[] = {0xa9ba7bfd, 0xa9016ffc, 0x910003fd, 0xa90267fa, 0xa9035ff8, 0xa90457f6, 0xa9054ff4};
+    int dishes = dish_init(m);   /* its own checks; it needs the same frame-end tick, so either one keeps the tick */
     if (strcmp(m->name, "main") || GAME_SPAWN_REQUEST_CREATE + sizeof entry > m->text_end || GAME_SPAWN_ACTOR_MGR + 8u > m->size ||
         memcmp(m->base + GAME_SPAWN_REQUEST_CREATE, entry, sizeof entry)) {
         fprintf(stderr, "[spawn] off: requestCreateActorAsync entry does not match " TOTK_GAME_VERSION "\n");
-        return 0;
+        return dishes;
     }
     request_create = (RequestCreate)(void *)(m->base + GAME_SPAWN_REQUEST_CREATE);
     actor_mgr_slot = (void **)(void *)(m->base + GAME_SPAWN_ACTOR_MGR);
@@ -204,10 +212,11 @@ static void spawn_one(const SpawnRequest *r, const float base[3], float fx, floa
 /* Frame-end thread (world_survey.c runtime_survey_tick). player: the Player actor, or 0 when there is none yet. */
 void runtime_spawn_tick(uintptr_t player, uint64_t frame) {
     if (!atomic_load_explicit(&runtime_spawn_waiting, memory_order_acquire)) return;
+    if (player) dish_tick(frame);   /* at most one dish a frame, from its own queue */
     pthread_mutex_lock(&spawn_lock);
     SpawnRequest batch[SPAWN_QUEUE_MAX]; unsigned n = 0;
     if (player) while (n < SPAWN_QUEUE_MAX && spawn_queue_pop(&spawn_queue, &batch[n])) n++;
-    atomic_store_explicit(&runtime_spawn_waiting, spawn_queue.len != 0, memory_order_release);
+    atomic_store_explicit(&runtime_spawn_waiting, spawn_queue.len != 0 || dish_waiting(), memory_order_release);
     pthread_mutex_unlock(&spawn_lock);
     if (!player) return;   /* loading or a menu: keep the requests for a frame with a player */
     float pos[3], rot[9];
@@ -217,5 +226,284 @@ void runtime_spawn_tick(uintptr_t player, uint64_t frame) {
     float fx = rot[2], fz = rot[8], len = sqrtf(fx * fx + fz * fz);
     if (!isfinite(len) || len < 1e-3f) { fx = 0; fz = 1; } else { fx /= len; fz /= len; }
     for (unsigned i = 0; i < n; ++i) spawn_one(&batch[i], pos, fx, fz, frame);
+}
+#endif
+
+/* ---- give a cooked dish (the Spawn tab's Dishes; dish_give.h) ----
+
+   A cooked dish (Item_Cook_*) has no actor pack, so requestCreateActorAsync cannot make one; it exists only as a slot of
+   the inventory's Food pouch in GameData. The game puts a dish there with one routine, 1.4.3 main+0x20a0144 (1.0.0
+   0x1a14800; called from PouchMgr::addToPouch in both versions, 1.4.3 +0x2098dc8, 1.0.0 +0xc9446c, and from two other
+   places): it takes the first Food Content slot whose Name is empty and writes Effect.{Type, Level, Time}, LifeRecover,
+   MaterialName[], Name, Price and StockNum = 1 through the GameData setters, then sets the Food pouch's "new" flag
+   (bool 0xe1754905) in both pouches. It never merges a dish into another slot. We make the same calls in the same
+   order with the player's values instead of a cooking result. Left out: the ingredient names (MaterialName) and the
+   routine's last call (+0x20a1210, the cooking records, which reads the whole cooking result), so a given dish lists no
+   ingredients and does not count as a discovered recipe. PouchMgr::addToPouch (1.4.3 0x20986b0, afiaka87/totk-mods
+   arrowbound GameProfiles.hpp, MIT; 1.0.0 0xc93dc0 per dt-12345/add-material-example, GPL-2.0, facts only) is not used:
+   for Food it fills the slot from the actor's own parameters, which these pack-less dishes do not have, and it may
+   stack onto a slot of the same name.
+
+   How the 1.4.3 addresses (game_version.h, GAME_DISH_*) were found. The routine's call sequence is the same in 1.0.0
+   and 1.4.3 (same 0xa0-byte frame, the same calls in the same order), and 1.0.0's calls are known by name:
+   setStructInt 0x8202b0, setStructEnum 0x820bfc, getStructStruct 0x81fed4 (aquacluck/totk-lotuskit
+   syms/exking/gmd/GameDataMgr.py, GPL-2.0, facts only), getStructStructByIndex 0x937298, getStructString64 0x9d722c and
+   the Food count 0xb91738 (arrowbound GameProfiles.hpp). scripts/map_version_sites.py's caller mapping (map_by_callers,
+   from 1.0.0) agrees on every one: the 1.0.0 callers that map land on 0x16fdcc (setStructInt), 0x170210 (setStructEnum,
+   40 callers agree), 0x16fac0 (getStructStruct), 0x282ed8 (getStructStructByIndex), 0x6e76d0 (getStructString64),
+   0xd61d6c (Food count), 0x282280 (setStructString64, 1.0.0 0xb0e210), 0x1b02f8 / 0x923d20 (get/setStructBool, 1.0.0
+   0xaf69b0 / 0x755f20), and none disagrees; the caller counts match too (setStructInt 313 / 317, setStructEnum 278 /
+   291, getStructStruct 439 / 430, getStructStructByIndex 447 / 452). arrowbound names 0x2ab6b34 as 1.4.3's
+   getStructStructByIndex: a near twin with 9 callers that the cooking routine does not use; we use the routine's own
+   0x282ed8. GameDataMgr: the routine loads it through GOT 0x395dff0, whose relocation is 0x3ad66b0 (arrowbound's slot;
+   1.0.0 GOT 0x4557b20 -> 0x4646c60 = lotuskit's GameDataMgr::sInstance). PouchMgr: read directly from 0x3a81678
+   (arrowbound's GOT 0x39601e8 relocates to it; 1.0.0 0x45f28a8). The pouch layout (PouchMgr +0x8: two pouches of 0xc0
+   bytes, a 16-byte struct handle per category, Food = 6 at +0x60, the pouch in use at +0x188, used only when below 2)
+   is read from the routine itself (+0x40..+0x70) and from 0xd61d6c.
+   Signatures (the routine's arguments; bivouac GameDataService.cpp in afiaka87/totk-mods, MIT, uses the same shapes for
+   1.2.1): bool getStructStructByIndex(mgr, Handle *out, const Handle *, u32 array hash, u32 index);
+   bool getStructString64(mgr, const char **out, const Handle *, u32 hash); bool getStructStruct(mgr, Handle *out,
+   const Handle *, u32 hash); setStructEnum(mgr, u32 value, const Handle *, u32 hash); setStructInt(mgr, s32, ...);
+   setStructString64(mgr, const char *const *value, ...) (the text is copied into the change queue);
+   bool getStructBool(mgr, u8 *out, ...); setStructBool(mgr, u32, ...); s32 count(PouchMgr *, u32 category).
+
+   At start-up every target's first words are compared with 1.4.3's, the routine's nine calls must still branch to
+   these targets and its two loads must still address these globals, and the setters' change-queue loads must still be
+   where they were; any difference turns giving off with a [red] line instead of calling a wrong address. The setters
+   push into fixed-size change queues and a full queue ends the game, so a dish is written only when every queue it
+   touches has room (else it waits a frame, as afiaka87's GameDataQueue.hpp does). The game applies the queues later, so
+   a slot just written still reads empty: one dish a frame, and a slot written in the last second is skipped. */
+#ifndef DISH_SUPPORTED
+__attribute__((unused)) static int dish_init(Module *m) { (void)m; return 0; }
+__attribute__((unused)) static void dish_tick(uint64_t frame) { (void)frame; }
+__attribute__((unused)) static int dish_waiting(void) { return 0; }
+int runtime_dish_available(void) { return SPAWN_ERR_UNSUPPORTED; }
+int runtime_dish_give(const char *name, int life, const char *effect, int level, int seconds, int price, int count) {
+    (void)name; (void)life; (void)effect; (void)level; (void)seconds; (void)price; (void)count;
+    return SPAWN_ERR_UNSUPPORTED;
+}
+#else
+typedef struct { uintptr_t ptr; uint32_t index; uint8_t flag, pad[3]; } GmdHandle;   /* the game zeroes all three first */
+_Static_assert(sizeof(GmdHandle) == 16, "GameData struct handle is 16 bytes");
+typedef int32_t (*PouchCountFn)(void *pouch, uint32_t category);
+typedef uint32_t (*ByIndexFn)(void *mgr, GmdHandle *out, const GmdHandle *handle, uint32_t hash, uint32_t index);
+typedef uint32_t (*GetString64Fn)(void *mgr, const char **out, const GmdHandle *handle, uint32_t hash);
+typedef uint32_t (*GetStructFn)(void *mgr, GmdHandle *out, const GmdHandle *handle, uint32_t hash);
+typedef void (*SetEnumFn)(void *mgr, uint32_t value, const GmdHandle *handle, uint32_t hash);
+typedef void (*SetIntFn)(void *mgr, int32_t value, const GmdHandle *handle, uint32_t hash);
+typedef void (*SetString64Fn)(void *mgr, const char *const *value, const GmdHandle *handle, uint32_t hash);
+typedef uint32_t (*GetBoolFn)(void *mgr, uint8_t *out, const GmdHandle *handle, uint32_t hash);
+typedef void (*SetBoolFn)(void *mgr, uint32_t value, const GmdHandle *handle, uint32_t hash);
+
+enum {
+    POUCH_FOOD = 6,   /* PouchCategory (dt-12345/add-material-example: Weapon, Bow, Arrow, Shield, Armor, Material, Food, ...) */
+    POUCH_INDEX = 0x188, POUCH_BASE = 0x8, POUCH_SIZE = 0xc0, POUCH_HANDLE = 0x10,
+    DISH_RECENT = 16, DISH_RECENT_FRAMES = 60, DISH_WAIT_FRAMES = 600,
+};
+/* GameData names (MurmurHash3 of Content, Name, StockNum, LifeRecover, Price, Effect, Type, Level, Time) */
+#define H_CONTENT 0x4290322eu
+#define H_NAME 0x25efa387u
+#define H_STOCK 0x22344481u
+#define H_LIFE 0x515632a9u
+#define H_PRICE 0x439cc54eu
+#define H_EFFECT 0xecff4f2au
+#define H_TYPE 0x746585e5u
+#define H_LEVEL 0x195a67f5u
+#define H_TIME 0xaa1f82b8u
+#define H_NEW 0xe1754905u   /* the Food pouch's flag the routine sets (its name is not known) */
+/* The GameData change queues the writes may go through (dish_give.h DishStoreView), as offsets into GameDataMgr, and
+   how many entries one dish pushes into each: int and int array element (LifeRecover, Level, Time, Price, StockNum),
+   enum (Effect.Type), string64 (Name), bool (the flag, both pouches). */
+static const struct { uint32_t offset; int pushes; } dish_stores[] = {
+    {0xc8, 5}, {0x128, 5}, {0x248, 1}, {0x2a8, 1}, {0x608, 1}, {0x668, 1}, {0x68, 2},
+};
+
+static DishQueue dish_queue;   /* spawn_lock */
+static _Atomic int dish_enabled;
+static PouchCountFn pouch_count; static ByIndexFn by_index; static GetString64Fn get_string64; static GetStructFn get_struct;
+static SetEnumFn set_enum; static SetIntFn set_int; static SetString64Fn set_string64; static GetBoolFn get_bool; static SetBoolFn set_bool;
+static void **pouch_slot, **gamedata_slot;
+static struct { int32_t index; uint64_t frame; } dish_recent[DISH_RECENT];   /* frame-end thread only, like the rest below */
+static unsigned dish_recent_next, dish_given, dish_tries;
+
+static uint32_t word_at(const Module *m, uint64_t at) { uint32_t w; memcpy(&w, m->base + at, 4); return w; }
+/* Where a BL at `site` branches to, or ~0 when the word there is not a BL. */
+static uint64_t bl_target(const Module *m, uint64_t site) {
+    uint32_t w = word_at(m, site);
+    if ((w & 0xfc000000u) != 0x94000000u) return ~(uint64_t)0;
+    int64_t imm = (int64_t)(w & 0x3ffffff); if (imm & 0x2000000) imm -= 0x4000000;
+    return site + (uint64_t)(imm * 4);
+}
+/* What an ADRP at `site` plus the 64-bit LDR (unsigned offset) at `ldr` on its register loads from, or ~0. */
+static uint64_t adrp_ldr_target(const Module *m, uint64_t site, uint64_t ldr) {
+    uint32_t a = word_at(m, site), l = word_at(m, ldr);
+    if ((a & 0x9f000000u) != 0x90000000u || (l & 0xffc00000u) != 0xf9400000u || ((l >> 5) & 31) != (a & 31)) return ~(uint64_t)0;
+    int64_t imm = (int64_t)(((a >> 29) & 3) | (((a >> 5) & 0x7ffff) << 2)); if (imm & 0x100000) imm -= 0x200000;
+    return (site & ~(uint64_t)0xfff) + (uint64_t)(imm * 4096) + ((l >> 10) & 0xfff) * 8;
+}
+
+static int dish_init(Module *m) {
+    /* 1.4.3: the first words of each target (several share a prologue, so the call sites below are what pins them) */
+    static const struct { uint64_t at; uint32_t w[4]; } entries[] = {
+        {GAME_DISH_COOK, {0xd10283ff, 0xa9047bfd, 0xa9056ffc, 0xa90667fa}},
+        {GAME_DISH_POUCH_COUNT, {0xd10103ff, 0xa9017bfd, 0xa90257f6, 0xa9034ff4}},
+        {GAME_DISH_STRUCT_BY_INDEX, {0x34000563, 0xf9400049, 0xb4000529, 0xf9400528}},
+        {GAME_DISH_GET_STRING64, {0xd10143ff, 0xa9017bfd, 0xf90013f7, 0xa90357f6}},
+        {GAME_DISH_GET_STRUCT, {0x340007e3, 0xf9400049, 0xb40007a9, 0xf9400528}},
+        {GAME_DISH_SET_ENUM, {0xa9bd7bfd, 0xa90157f6, 0xa9024ff4, 0x910003fd}},
+        {GAME_DISH_SET_INT, {0xd10103ff, 0xa9037bfd, 0x9100c3fd, 0x39403048}},
+        {GAME_DISH_SET_STRING64, {0xa9bd7bfd, 0xa90157f6, 0xa9024ff4, 0x910003fd}},
+        {GAME_DISH_GET_BOOL, {0xd10103ff, 0xa9037bfd, 0x9100c3fd, 0x39403048}},
+        {GAME_DISH_SET_BOOL, {0xd10103ff, 0xa9037bfd, 0x9100c3fd, 0x39403048}},
+    };
+    /* the cooking routine's calls, in its order (offsets into 1.4.3's routine) */
+    static const struct { uint32_t site; uint64_t target; } calls[] = {
+        {0x74, GAME_DISH_POUCH_COUNT}, {0xc8, GAME_DISH_STRUCT_BY_INDEX}, {0xe4, GAME_DISH_GET_STRING64},
+        {0x15c, GAME_DISH_GET_STRUCT}, {0x1a0, GAME_DISH_SET_ENUM}, {0x1f0, GAME_DISH_SET_INT},
+        {0x2ec, GAME_DISH_SET_STRING64}, {0x348, GAME_DISH_GET_BOOL}, {0x368, GAME_DISH_SET_BOOL},
+    };
+    /* the setters' change-queue loads (dish_stores): int ldr [x0,#0xf0] / array [x0,#0x150], enum [x0,#0x270] / array
+       store add x22,x0,#0x2a8, string64 [x0,#0x630] / array store add x22,x0,#0x668, bool [x0,#0x90] */
+    static const struct { uint64_t at; uint32_t w; } queue_loads[] = {
+        {GAME_DISH_SET_INT + 0xc8, 0xb940f009}, {GAME_DISH_SET_INT + 0x2b4, 0xb9415008},
+        {GAME_DISH_SET_ENUM + 0xf8, 0xb9427009}, {GAME_DISH_SET_ENUM + 0x184, 0x910aa016},
+        {GAME_DISH_SET_STRING64 + 0xc0, 0xb946300a}, {GAME_DISH_SET_STRING64 + 0x1bc, 0x9119a016},
+        {GAME_DISH_SET_BOOL + 0x17c, 0xb940900d},
+    };
+    const char *why = NULL;
+    if (strcmp(m->name, "main")) return 0;
+    if (GAME_DISH_GAMEDATA_MGR + 8u > m->size || GAME_DISH_POUCH_MGR + 8u > m->size || GAME_DISH_COOK + 0x400u > m->text_end ||
+        GAME_DISH_SET_INT + 0x2b8u > m->text_end || GAME_DISH_SET_STRING64 + 0x1c0u > m->text_end || GAME_DISH_SET_BOOL + 0x180u > m->text_end)
+        why = "addresses outside main";
+    for (size_t i = 0; !why && i < sizeof entries / sizeof *entries; i++)
+        if (entries[i].at + 16 > m->text_end || memcmp(m->base + entries[i].at, entries[i].w, 16)) why = "a target's entry differs";
+    for (size_t i = 0; !why && i < sizeof calls / sizeof *calls; i++)
+        if (bl_target(m, GAME_DISH_COOK + calls[i].site) != calls[i].target) why = "the cooking routine's calls differ";
+    for (size_t i = 0; !why && i < sizeof queue_loads / sizeof *queue_loads; i++)
+        if (word_at(m, queue_loads[i].at) != queue_loads[i].w) why = "a setter's change-queue load differs";
+    if (!why && adrp_ldr_target(m, GAME_DISH_COOK + 0x58, GAME_DISH_COOK + 0x5c) != GAME_DISH_POUCH_MGR) why = "the routine's PouchMgr load differs";
+    if (!why) {
+        uint64_t got = adrp_ldr_target(m, GAME_DISH_COOK + 0x40, GAME_DISH_COOK + 0x48);
+        uintptr_t slot = 0;
+        if (got + 8 <= m->size) memcpy(&slot, m->base + got, sizeof slot);
+        if (got + 8 > m->size || slot != (uintptr_t)(m->base + GAME_DISH_GAMEDATA_MGR)) why = "the routine's GameDataMgr load differs";
+    }
+    if (why) {
+        fprintf(stderr, "[dish] [red] off: %s from " TOTK_GAME_VERSION " (giving dishes refused)\n", why);
+        return 0;
+    }
+    pouch_count = (PouchCountFn)(void *)(m->base + GAME_DISH_POUCH_COUNT);
+    by_index = (ByIndexFn)(void *)(m->base + GAME_DISH_STRUCT_BY_INDEX);
+    get_string64 = (GetString64Fn)(void *)(m->base + GAME_DISH_GET_STRING64);
+    get_struct = (GetStructFn)(void *)(m->base + GAME_DISH_GET_STRUCT);
+    set_enum = (SetEnumFn)(void *)(m->base + GAME_DISH_SET_ENUM);
+    set_int = (SetIntFn)(void *)(m->base + GAME_DISH_SET_INT);
+    set_string64 = (SetString64Fn)(void *)(m->base + GAME_DISH_SET_STRING64);
+    get_bool = (GetBoolFn)(void *)(m->base + GAME_DISH_GET_BOOL);
+    set_bool = (SetBoolFn)(void *)(m->base + GAME_DISH_SET_BOOL);
+    pouch_slot = (void **)(void *)(m->base + GAME_DISH_POUCH_MGR);
+    gamedata_slot = (void **)(void *)(m->base + GAME_DISH_GAMEDATA_MGR);
+    atomic_store(&dish_enabled, 1);
+    fprintf(stderr, "[dish] enabled: the Spawn tab's Dishes go into the Food pouch on the game's frame-end thread\n");
+    return 1;
+}
+
+int runtime_dish_available(void) { return atomic_load(&dish_enabled) ? SPAWN_OK : SPAWN_ERR_DISABLED; }
+int runtime_dish_give(const char *name, int life, const char *effect, int level, int seconds, int price, int count) {
+    if (!atomic_load(&dish_enabled)) return SPAWN_ERR_DISABLED;
+    DishRequest r;
+    int e = dish_request_make(&r, name, life, effect, level, seconds, price, count);
+    if (e != SPAWN_OK) return e;
+    pthread_mutex_lock(&spawn_lock);
+    e = dish_queue_push(&dish_queue, &r);
+    pthread_mutex_unlock(&spawn_lock);
+    if (e == SPAWN_OK) {   /* waiting first, then the frame-end wake-up, as for spawns */
+        atomic_store(&runtime_spawn_waiting, 1);
+        atomic_store(&runtime_survey_pending, 1);
+        fprintf(stderr, "[dish] queued name=%s life=%d effect=%s level=%d time=%d price=%d count=%d\n", r.name, r.life,
+                DISH_EFFECTS[r.effect].name, r.level, r.time, r.price, r.count);
+    }
+    return e;
+}
+static int dish_waiting(void) { return dish_queue.len != 0; }   /* spawn_lock held */
+
+static int dish_slot_recent(int32_t index, uint64_t frame) {
+    for (unsigned i = 0; i < DISH_RECENT; i++)
+        if (dish_recent[i].frame && dish_recent[i].index == index && frame - dish_recent[i].frame < DISH_RECENT_FRAMES) return 1;
+    return 0;
+}
+static DishStoreView dish_store(void *mgr, uint32_t offset) {
+    const uint8_t *s = (const uint8_t *)mgr + offset;
+    DishStoreView v;
+    memcpy(&v.capacity, s + 40, 4); memcpy(&v.buffer, s + 48, 8); memcpy(&v.control, s + 56, 4);
+    return v;
+}
+/* Ends the front request: tells the menu how many of its count went in, and why it stopped (NULL: all did). */
+static void dish_finish(const DishRequest *r, const char *problem, uint64_t frame) {
+    if (problem) fprintf(stderr, "[dish] [red] name=%s given=%u of %d: %s frame=%llu\n", r->name, dish_given, r->count, problem, (unsigned long long)frame);
+    else fprintf(stderr, "[dish] name=%s given=%u frame=%llu\n", r->name, dish_given, (unsigned long long)frame);
+    RuntimeSpawnObserver observer = atomic_load(&spawn_observer);
+    if (observer) observer(r->name, r->count, (int)dish_given, problem);
+    pthread_mutex_lock(&spawn_lock);
+    dish_queue_drop(&dish_queue);
+    pthread_mutex_unlock(&spawn_lock);
+    dish_given = dish_tries = 0;
+}
+
+/* One dish of the front request, the way the game's cooking routine stores one (above). Frame-end thread. */
+static void dish_tick(uint64_t frame) {
+    DishRequest r;
+    pthread_mutex_lock(&spawn_lock);
+    const DishRequest *front = dish_queue_front(&dish_queue);
+    if (front) r = *front;
+    pthread_mutex_unlock(&spawn_lock);
+    if (!front) return;
+    void *mgr = *gamedata_slot, *pouch = *pouch_slot;
+    const char *wait = !mgr || !pouch ? "the inventory is not loaded" : NULL;
+    for (size_t i = 0; !wait && i < sizeof dish_stores / sizeof *dish_stores; i++)
+        if (!dish_store_has_room(dish_store(mgr, dish_stores[i].offset), dish_stores[i].pushes)) wait = "the game's GameData change queue stayed full";
+    if (wait) {   /* try again next frame, for a while */
+        if (++dish_tries >= DISH_WAIT_FRAMES) dish_finish(&r, wait, frame);
+        return;
+    }
+    uint32_t in_use; memcpy(&in_use, (const uint8_t *)pouch + POUCH_INDEX, 4);
+    const GmdHandle *food = (const GmdHandle *)(const void *)((const uint8_t *)pouch + POUCH_BASE +
+                                                             (in_use < 2 ? in_use * POUCH_SIZE : 0) + POUCH_FOOD * POUCH_HANDLE);
+    int32_t slots = pouch_count(pouch, POUCH_FOOD), slot = -1;
+    GmdHandle content;
+    for (int32_t i = 0; i < slots && slot < 0; i++) {
+        memset(&content, 0, sizeof content);
+        if (!(by_index(mgr, &content, food, H_CONTENT, (uint32_t)i) & 1)) continue;
+        const char *current = "";
+        if (!(get_string64(mgr, &current, &content, H_NAME) & 1)) continue;
+        if ((!current || !*current) && !dish_slot_recent(i, frame)) slot = i;
+    }
+    if (slot < 0) {
+        dish_finish(&r, slots > 0 ? "the Food pouch is full" : "the Food pouch was not found", frame);
+        return;
+    }
+    const DishEffect *effect = &DISH_EFFECTS[r.effect];
+    GmdHandle fx; memset(&fx, 0, sizeof fx);
+    if (get_struct(mgr, &fx, &content, H_EFFECT) & 1) {
+        set_enum(mgr, dish_murmur3(effect->name), &fx, H_TYPE);
+        if (r.effect) { set_int(mgr, r.level, &fx, H_LEVEL); set_int(mgr, r.time, &fx, H_TIME); }
+    }
+    set_int(mgr, r.life, &content, H_LIFE);
+    const char *name = r.name;   /* copied into the change queue */
+    set_string64(mgr, &name, &content, H_NAME);
+    set_int(mgr, r.price, &content, H_PRICE);
+    set_int(mgr, 1, &content, H_STOCK);
+    /* the Food pouch's flag, as the routine sets it: pouch 0's handle is asked, both pouches' are set */
+    const GmdHandle *flags[2] = {(const GmdHandle *)(const void *)((const uint8_t *)pouch + POUCH_BASE + POUCH_FOOD * POUCH_HANDLE),
+                                 (const GmdHandle *)(const void *)((const uint8_t *)pouch + POUCH_BASE + POUCH_SIZE + POUCH_FOOD * POUCH_HANDLE)};
+    uint8_t is_new = 1;
+    if (!flags[0]->flag && (get_bool(mgr, &is_new, flags[0], H_NEW) & 1) && !is_new)
+        for (int i = 0; i < 2; i++) if (!flags[i]->flag) set_bool(mgr, 1, flags[i], H_NEW);
+    dish_recent[dish_recent_next].index = slot; dish_recent[dish_recent_next].frame = frame ? frame : 1;
+    dish_recent_next = (dish_recent_next + 1) % DISH_RECENT;
+    dish_given++; dish_tries = 0;
+    fprintf(stderr, "[dish] wrote slot=%d of %d name=%s life=%d effect=%s level=%d time=%d price=%d (%u of %d) frame=%llu\n", slot, slots,
+            r.name, r.life, effect->name, r.level, r.time, r.price, dish_given, r.count, (unsigned long long)frame);
+    if ((int)dish_given >= r.count) dish_finish(&r, NULL, frame);
 }
 #endif

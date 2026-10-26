@@ -1,16 +1,20 @@
 /* Tools › Spawn in the Mac settings sidebar (included by runtime/settings_panel_mac.h only): a category column (Favorites,
-   Recents, Creatures, NPCs, Items, Weapons, Armor, Zonai, Objects), a search field over every category, and the actors
+   Recents, Creatures, NPCs, Items, Dishes, Weapons, Armor, Zonai, Objects), a search field over every category, and the actors
    of the app's actor list (runtime/spawn_list.h; about 10,000 Objects, so the list is a recycling NSTableView). Each row
    shows the display name and, dimmed, the internal name; ★ marks a favorite. Amount 1-20, and Place (In front, Above,
    Far, At Link's feet; P, or ← on the category column, cycles it). A, Return or a click spawns
    (runtime/actor_spawn.c, 1.4.3), Y or F marks a favorite, every spawn goes to Recents; both are kept in spawn-picks.txt
    beside the profile. A toast in the game window's corner says what was spawned or why not (TOTKSpawnToast).
    Levels inside the tab: the category column, then the list; B / Escape goes back one level. The iPhone / iPad version is
-   ios/Sources/spawn_menu.m. */
+   ios/Sources/spawn_menu.m.
+   Dishes (cooked meals) have no world actor: choosing one puts it straight into the inventory (runtime_dish_give), with
+   the hearts, effect, level and duration of the row of popups shown under the list while a dish is chosen; the effects
+   and their level ranges come from the game's cooking table (the actor list's @effect lines). */
 #pragma once
 #import <Cocoa/Cocoa.h>
 #include "actor_spawn.h"
 #include "spawn_list.h"
+#include "dish_give.h"
 
 enum { SPAWN_PANEL_WIDTH = 660, SPAWN_CATEGORY_WIDTH = 120, SPAWN_ROW_HEIGHT = 34 };
 static NSWindow *settings_window(void);   /* frontend.m: the game window (the toast's place) */
@@ -78,6 +82,8 @@ static NSString *const SPAWN_LIST_PATH = @"build/actor_list.tsv";   /* in the ga
     NSStepper *amountStepper; NSTextField *amountLabel, *status, *empty;
     NSButton *unnamedBox;
     NSPopUpButton *placePopup;
+    NSView *dishBar; NSLayoutConstraint *dishHeight;   /* hearts, effect, level, duration: shown while a dish is chosen */
+    NSPopUpButton *heartsPopup, *effectPopup, *levelPopup, *timePopup;
     SpawnList list; SpawnPicks picks; BOOL loaded, active;
     int category, level, amount;     /* level 0: the category column, 1: the list */
     int *shown, nshown;
@@ -117,7 +123,8 @@ static void spawn_observed(const char *name, int requested, int created, const c
     tableScroll = [self makeTable:@"actor"]; table = tableScroll.documentView; table.rowHeight = SPAWN_ROW_HEIGHT;
     table.usesAlternatingRowBackgroundColors = NO;
 
-    for (NSView *v in @[search, placePopup, amountName, amountStepper, amountLabel, categoryScroll, tableScroll, unnamedBox, status, empty]) {
+    [self makeDishBar];
+    for (NSView *v in @[search, placePopup, amountName, amountStepper, amountLabel, categoryScroll, tableScroll, unnamedBox, status, empty, dishBar]) {
         v.translatesAutoresizingMaskIntoConstraints = NO; [self addSubview:v];
     }
     [NSLayoutConstraint activateConstraints:@[
@@ -130,7 +137,9 @@ static void spawn_observed(const char *name, int requested, int created, const c
         [categoryScroll.topAnchor constraintEqualToAnchor:search.bottomAnchor constant:8], [categoryScroll.leadingAnchor constraintEqualToAnchor:self.leadingAnchor],
         [categoryScroll.widthAnchor constraintEqualToConstant:SPAWN_CATEGORY_WIDTH], [categoryScroll.bottomAnchor constraintEqualToAnchor:unnamedBox.topAnchor constant:-8],
         [tableScroll.topAnchor constraintEqualToAnchor:categoryScroll.topAnchor], [tableScroll.leadingAnchor constraintEqualToAnchor:categoryScroll.trailingAnchor constant:8],
-        [tableScroll.trailingAnchor constraintEqualToAnchor:self.trailingAnchor], [tableScroll.bottomAnchor constraintEqualToAnchor:categoryScroll.bottomAnchor],
+        [tableScroll.trailingAnchor constraintEqualToAnchor:self.trailingAnchor], [tableScroll.bottomAnchor constraintEqualToAnchor:dishBar.topAnchor constant:-6],
+        [dishBar.leadingAnchor constraintEqualToAnchor:tableScroll.leadingAnchor], [dishBar.trailingAnchor constraintLessThanOrEqualToAnchor:self.trailingAnchor],
+        [dishBar.bottomAnchor constraintEqualToAnchor:categoryScroll.bottomAnchor], dishHeight,
         [empty.centerYAnchor constraintEqualToAnchor:tableScroll.centerYAnchor], [empty.leadingAnchor constraintEqualToAnchor:tableScroll.leadingAnchor constant:20],
         [empty.trailingAnchor constraintEqualToAnchor:tableScroll.trailingAnchor constant:-20],
         [unnamedBox.leadingAnchor constraintEqualToAnchor:self.leadingAnchor], [unnamedBox.bottomAnchor constraintEqualToAnchor:self.bottomAnchor],
@@ -152,6 +161,65 @@ static void spawn_observed(const char *name, int requested, int created, const c
     return s;
 }
 
+/* ---- dishes: hearts, effect, level, duration ---- */
+
+static NSPopUpButton *dish_popup(id target, SEL action, NSString *tip) {
+    NSPopUpButton *b = [NSPopUpButton new]; b.refusesFirstResponder = YES; b.controlSize = NSControlSizeSmall;
+    b.font = [NSFont systemFontOfSize:11]; b.target = target; b.action = action; b.toolTip = tip;
+    return b;
+}
+- (void)makeDishBar {
+    heartsPopup = dish_popup(self, @selector(dishChanged:), @"Hearts the dish restores");
+    for (NSNumber *h in @[@1, @2, @3, @4, @5, @6, @8, @10, @12, @15, @20, @25, @30, @40]) {
+        [heartsPopup addItemWithTitle:[NSString stringWithFormat:@"%@ heart%s", h, h.intValue == 1 ? "" : "s"]];
+        heartsPopup.lastItem.tag = h.intValue * 4;   /* quarter hearts */
+    }
+    [heartsPopup selectItemWithTag:20];
+    effectPopup = dish_popup(self, @selector(effectChanged:), @"The dish's effect");
+    levelPopup = dish_popup(self, @selector(dishChanged:), @"How strong the effect is");
+    timePopup = dish_popup(self, @selector(dishChanged:), @"How long the effect lasts");
+    for (NSNumber *t in @[@60, @180, @300, @600, @900, @1200, @1800]) {
+        [timePopup addItemWithTitle:[NSString stringWithFormat:@"%d:00", t.intValue / 60]]; timePopup.lastItem.tag = t.intValue;
+    }
+    [timePopup selectItemWithTag:300];
+    NSStackView *bar = [NSStackView stackViewWithViews:@[heartsPopup, effectPopup, levelPopup, timePopup]];
+    bar.orientation = NSUserInterfaceLayoutOrientationHorizontal; bar.spacing = 8; bar.detachesHiddenViews = YES;
+    dishBar = bar; dishBar.hidden = YES;
+    dishHeight = [dishBar.heightAnchor constraintEqualToConstant:0];
+}
+/* The effect popup from the game's cooking table (the list's @effect lines; every effect we know when it has none). */
+- (void)fillEffects {
+    [effectPopup removeAllItems];
+    for (int i = 0; i < DISH_EFFECT_COUNT; i++) {
+        if (i && list.neffect && !spawn_list_effect(&list, DISH_EFFECTS[i].name)) continue;
+        [effectPopup addItemWithTitle:@(DISH_EFFECTS[i].label)]; effectPopup.lastItem.tag = i;
+    }
+    [self effectChanged:nil];
+}
+- (const char *)dishEffectName { return DISH_EFFECTS[MAX(0, (int)effectPopup.selectedTag)].name; }
+- (void)effectChanged:(NSPopUpButton *)b {
+    const char *name = self.dishEffectName;
+    const SpawnEffect *e = spawn_list_effect(&list, name);
+    int lo = e ? e->min_level : 1, hi = e ? e->max_level : 3, hearts = dish_effect_in_hearts(name);
+    [levelPopup removeAllItems];
+    for (int v = lo; v <= hi; v += hearts ? 4 : 1) {   /* extra hearts and gloom recovery: whole hearts */
+        [levelPopup addItemWithTitle:hearts ? [NSString stringWithFormat:@"+%d heart%s", v / 4, v / 4 == 1 ? "" : "s"]
+                                            : [NSString stringWithFormat:@"Level %d", v]];
+        levelPopup.lastItem.tag = v;
+    }
+    if (levelPopup.numberOfItems) [levelPopup selectItemAtIndex:levelPopup.numberOfItems - 1];   /* the strongest */
+    levelPopup.hidden = !effectPopup.selectedTag;
+    timePopup.hidden = !effectPopup.selectedTag || !(e ? e->base_time : 0);
+    if (b) [self.window makeFirstResponder:menu];
+}
+- (void)dishChanged:(NSPopUpButton *)b { (void)b; [self.window makeFirstResponder:menu]; }
+- (void)showDishBar {
+    const SpawnActor *a = self.focusedActor;
+    BOOL on = (a && spawn_actor_is_dish(a)) || (category == SPAWN_CAT_DISHES && !query.length);
+    dishBar.hidden = !on; dishHeight.constant = on ? 24 : 0;
+}
+- (void)tableViewSelectionDidChange:(NSNotification *)n { if (n.object == table) [self showDishBar]; }
+
 /* ---- data ---- */
 
 - (int)availability { return runtime_spawn_available(); }
@@ -163,6 +231,7 @@ static void spawn_observed(const char *name, int requested, int created, const c
         spawn_picks_load(&picks);
         [self setPlace:picks.place save:NO];
         free(shown); shown = malloc(sizeof *shown * (size_t)(list.count ? list.count : 1));
+        [self fillEffects];
     }
     [self filter];
     [categories reloadData];
@@ -180,7 +249,11 @@ static void spawn_observed(const char *name, int requested, int created, const c
                   : category == SPAWN_CAT_FAVORITES ? @"No favorites yet: Y (or F) on an actor marks it."
                   : category == SPAWN_CAT_RECENTS ? @"Nothing spawned yet."
                   : @"Nothing here.";
+    if (!why && category == SPAWN_CAT_DISHES && !query.length && runtime_dish_available() != SPAWN_OK)
+        why = runtime_dish_available() == SPAWN_ERR_UNSUPPORTED ? @"Giving dishes needs game version 1.4.3."
+                                                                : @"Giving dishes is off: this game's inventory calls did not match the ones it was made for (the log says more).";
     empty.stringValue = why ?: @""; empty.hidden = !why; tableScroll.hidden = why != nil && (a != SPAWN_OK || !list.count);
+    [self showDishBar];
     if (!status.stringValue.length || ![status.stringValue hasPrefix:@"Spawn"])
         status.stringValue = query.length ? [NSString stringWithFormat:@"%d found in every category", nshown]
                                           : [NSString stringWithFormat:@"%d in %s", nshown, SPAWN_CAT_NAMES[category]];
@@ -328,6 +401,7 @@ static void spawn_observed(const char *name, int requested, int created, const c
     [self selectRow:row];
     const SpawnActor *a = &list.actor[shown[row]];
     NSString *display = @(a->display);
+    if (spawn_actor_is_dish(a)) { [self giveDish:a]; return; }
     int r = runtime_spawn_actor(a->name, amount);
     if (r != SPAWN_OK) {
         NSString *why = r == SPAWN_ERR_UNSUPPORTED ? @"spawning needs game version 1.0.0 or 1.4.3" : @(runtime_spawn_error(r));
@@ -341,10 +415,28 @@ static void spawn_observed(const char *name, int requested, int created, const c
     status.stringValue = [NSString stringWithFormat:@"Spawning %@ ×%d…", display, amount];
     if (category == SPAWN_CAT_RECENTS && !query.length) { [self filter]; [self selectRow:0]; }
 }
+- (void)giveDish:(const SpawnActor *)a {
+    NSString *display = @(a->display);
+    int life = (int)heartsPopup.selectedTag, fx = MAX(0, (int)effectPopup.selectedTag);
+    int strength = fx ? (int)levelPopup.selectedTag : 0, seconds = fx && !timePopup.hidden ? (int)timePopup.selectedTag : 0;
+    int r = runtime_dish_give(a->name, life, self.dishEffectName, strength, seconds, dish_default_price(life, strength, fx != 0), amount);
+    if (r != SPAWN_OK) {
+        NSString *why = r == SPAWN_ERR_UNSUPPORTED ? @"giving dishes needs game version 1.4.3" : @(dish_error_text(r));
+        status.stringValue = [NSString stringWithFormat:@"Spawn failed: %@", why];
+        [TOTKSpawnToast show:[NSString stringWithFormat:@"Could not add %@: %@", display, why] failed:YES in:settings_window().contentView];
+        return;
+    }
+    fprintf(stderr, "[spawn] menu: dish %s x%d\n", a->name, amount);
+    spawn_picks_add_recent(&picks, a->name);
+    if (spawn_picks_save(&picks)) fprintf(stderr, "[spawn] could not save spawn-picks.txt\n");
+    status.stringValue = [NSString stringWithFormat:@"Spawning %@ ×%d into the inventory…", display, amount];
+    if (category == SPAWN_CAT_RECENTS && !query.length) { [self filter]; [self selectRow:0]; }
+}
 /* The frame-end thread's answer (actor_spawn.c), on the main thread. */
 - (void)spawned:(NSString *)name requested:(int)requested created:(int)created problem:(NSString *)problem {
     NSString *display = [self displayOf:name], *text;
-    if (created == requested) text = [NSString stringWithFormat:@"Spawned %@ ×%d", display, created];
+    if ([name hasPrefix:@"Item_Cook_"] && created == requested) text = [NSString stringWithFormat:@"Added %@ ×%d to the inventory", display, created];
+    else if (created == requested) text = [NSString stringWithFormat:@"Spawned %@ ×%d", display, created];
     else if (created) text = [NSString stringWithFormat:@"Spawned %@ ×%d of %d: %@", display, created, requested, problem ?: @"?"];
     else text = [NSString stringWithFormat:@"Could not spawn %@: %@", display, problem ?: @"?"];
     status.stringValue = text;

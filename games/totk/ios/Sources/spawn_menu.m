@@ -88,6 +88,7 @@ NSString *TOTKSpawnSummary(void) {
     __weak TOTKSpawnViewController *weak = self;
     NSMutableArray *cats = [NSMutableArray array];
     for (int c = 0; c < SPAWN_SHOWN_CATS; c++) {
+        if (c == SPAWN_CAT_DISHES) continue;   /* giving dishes is Mac-only for now */
         UIAction *a = [UIAction actionWithTitle:@(SPAWN_CAT_NAMES[c]) image:nil identifier:nil handler:^(UIAction *x) { (void)x; [weak choose:c]; }];
         a.state = c == category ? UIMenuElementStateOn : UIMenuElementStateOff; [cats addObject:a];
     }
@@ -120,7 +121,7 @@ NSString *TOTKSpawnSummary(void) {
 - (void)updateSearchResultsForSearchController:(UISearchController *)s { query = s.searchBar.text ?: @""; cursor = -1; [self filter]; }
 
 - (void)filter {
-    nshown = spawnList.count ? spawn_list_filter(&spawnList, &spawnPicks, category, query.UTF8String, unnamed, shown, spawnList.count) : 0;
+    nshown = spawnList.count ? spawn_list_filter_dishes(&spawnList, &spawnPicks, category, query.UTF8String, unnamed, 0, shown, spawnList.count) : 0;
     [self.tableView reloadData];
 }
 - (NSString *)emptyText {

@@ -26,6 +26,12 @@ int runtime_spawn_available(void);
    (NULL when all were). The menu shows it as a toast (settings_panel_mac.h). */
 typedef void (*RuntimeSpawnObserver)(const char *name, int requested, int created, const char *problem);
 void runtime_spawn_observe(RuntimeSpawnObserver fn);
+/* Give cooked dishes (the Spawn tab's Dishes; actor_spawn.c, dish_give.h): count dishes named name (Item_Cook_*), each
+   restoring life quarter hearts, with effect (DISH_EFFECTS name, "None" or NULL for none) at level for seconds, sold for
+   price. 0 queued, or a negative SPAWN_ERR_* / DISH_ERR_* (dish_error_text). 1.4.3 on the Mac only. Any thread. The
+   observer (runtime_spawn_observe) reports the result like a spawn. */
+int runtime_dish_give(const char *name, int life, const char *effect, int level, int seconds, int price, int count);
+int runtime_dish_available(void);   /* SPAWN_OK, SPAWN_ERR_UNSUPPORTED or SPAWN_ERR_DISABLED */
 /* Nonzero while requests wait for the frame-end thread. */
 extern _Atomic int runtime_spawn_waiting;
 void runtime_spawn_tick(uintptr_t player_actor, uint64_t frame);
