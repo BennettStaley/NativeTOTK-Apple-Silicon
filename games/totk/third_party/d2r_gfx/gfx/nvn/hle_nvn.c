@@ -3219,7 +3219,7 @@ static uint64_t present_period(const win_t *o) {
     unsigned itv = present_ticks(o); int m = mfx_enabled(), hz = g_uncapped && !uncapped_now() ? g_paced_hz : g_hz;
     { static int was = -1; if (was >= 0 && m != was)
         LOG("[nvn] present pacing switch: %s%s", mfx_hold_fps(m) ? (mfx_own_clock() ? "interpolation: game on its own clock at " : "interpolation: follows the display, game at ") : "",
-                                    mfx_hold_fps(m) ? (m == MFX_30 ? "30 fps (30+30)" : m == MFX_40 ? "40 fps (40+40)" : "50 fps (50+50)") :
+                                    mfx_hold_fps(m) ? (m == MFX_30 ? "30 fps (30+30)" : m == MFX_40 ? "40 fps (40+40)" : m == MFX_50 ? "50 fps (50+50)" : "60 fps (60+60)") :
                                     m == MFX_HALF ? "interpolation half refresh: follows the display, one frame every two refreshes" :
                                     m == MFX_MAX ? (g_uncapped ? "interpolation max: uncapped, one generated frame per frame" : "interpolation max: game present interval, one generated frame per frame") :
                                     g_uncapped ? "interpolation off: uncapped" : "interpolation off: game present interval"); was = m; }

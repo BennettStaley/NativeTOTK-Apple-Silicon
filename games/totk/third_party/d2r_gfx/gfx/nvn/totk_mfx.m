@@ -159,7 +159,7 @@ static int mfx_refuse(int mode);
 static pthread_once_t g_once = PTHREAD_ONCE_INIT;
 const char *mfx_mode_name(int m) {
     static const char *const names[MFX_NMODES] = {"off", "30+30 (the game at 30 fps)", "half the refresh rate (50+50 on a 100 Hz display)", "uncapped (every game frame interpolated)",
-                                                  "40+40 (the game at 40 fps)", "50+50 (the game at 50 fps)"};   // totk_mfx_mode.h order
+                                                  "40+40 (the game at 40 fps)", "50+50 (the game at 50 fps)", "60+60 (the game at 60 fps)"};   // totk_mfx_mode.h order
     return m >= 0 && m < MFX_NMODES ? names[m] : "?";
 }
 static void mfx_init(void) {
@@ -169,8 +169,9 @@ static void mfx_init(void) {
     else if (!strcmp(e, "interp")) v = MFX_HALF;
     else if (!strcmp(e, "interp40")) v = MFX_40;
     else if (!strcmp(e, "interp50")) v = MFX_50;
+    else if (!strcmp(e, "interp60")) v = MFX_60;
     else if (!strcmp(e, "interpmax")) v = MFX_MAX;
-    else MDIE("TOTK_MFX must be interp30, interp (half the refresh rate), interp40, interp50, interpmax or 0, got %s", e);
+    else MDIE("TOTK_MFX must be interp30, interp (half the refresh rate), interp40, interp50, interp60, interpmax or 0, got %s", e);
     atomic_store(&g_req, v); atomic_store(&g_on, v);
     if (v) MLOG("TOTK_MFX=%s: MetalFX frame interpolation, %s", e, mfx_mode_name(v));
 }

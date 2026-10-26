@@ -3,7 +3,7 @@
 #import <Metal/Metal.h>
 
 /* Frame interpolation modes (the settings panel; user 2026-10-25: 30+30, 40+40, 50+50, uncapped):
-   MFX_30 / MFX_40 / MFX_50  the game renders 30 / 40 / 50 frames a second, MetalFX makes the frame between ("30+30" ...),
+   MFX_30 / 40 / 50 / 60  the game renders 30 / 40 / 50 / 60 frames a second, MetalFX makes the frame between ("30+30" ...),
             each shown half a game period before the game's own (by display ticks, or our own clock where the display's
             rate is not a multiple: 40 and 30 at 100 Hz);
    MFX_MAX  the game is not paced (uncapped) and every frame gets one in between; the screen still shows one picture per

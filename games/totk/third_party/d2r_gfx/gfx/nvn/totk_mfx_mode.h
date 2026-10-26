@@ -2,10 +2,10 @@
 // The values are the settings menu's graphics.interpolation (runtime/settings_schema.h) and the "mfx_interp" flag, so the
 // first four keep their numbers: off, 30+30, On (half the refresh rate, or game 40 shown at 80 under variable refresh with
 // a limit of 80), every frame (uncapped). Upstream's settings panel (2026-10-25) added 40+40 and 50+50: the game held at
-// that rate (hle_nvn.c game_hold_fps), MetalFX makes the frame between; they come after, as 4 and 5.
+// that rate (hle_nvn.c game_hold_fps), MetalFX makes the frame between; they come after, as 4 and 5. 60+60 is 6.
 #pragma once
-enum { MFX_OFF, MFX_30, MFX_HALF, MFX_MAX, MFX_40, MFX_50, MFX_NMODES };
-static inline int mfx_hold_fps(int m) { return m == MFX_30 ? 30 : m == MFX_40 ? 40 : m == MFX_50 ? 50 : 0; }   // the game's rate, 0 = not held
+enum { MFX_OFF, MFX_30, MFX_HALF, MFX_MAX, MFX_40, MFX_50, MFX_60, MFX_NMODES };   // MFX_60: 60+60 (user, 2026-10-26: game 60 shown at 120)
+static inline int mfx_hold_fps(int m) { return m == MFX_30 ? 30 : m == MFX_40 ? 40 : m == MFX_50 ? 50 : m == MFX_60 ? 60 : 0; }   // the game's rate, 0 = not held
 int mfx_enabled(void);   // the mode of this game frame (0 = off)
 int mfx_requested(void);   // the mode the player picked (the settings panel), taken over at the next game frame
 /* GPU memory (totk_mfx.m mfx_present_tick): above MFX_BP_HIGH percent of the budget frame interpolation and per-object
