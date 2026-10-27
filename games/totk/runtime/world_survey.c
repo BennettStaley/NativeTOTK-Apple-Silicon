@@ -185,6 +185,7 @@ int runtime_noclip_available(void) { return 0; }
 void runtime_noclip_set(int on) { (void)on; }
 int runtime_noclip_on(void) { return 0; }
 void runtime_noclip_set_speed(float v) { (void)v; }
+int runtime_noclip_goto(const float xyz[3]) { (void)xyz; return 0; }
 float runtime_noclip_speed(void) { return 0; }
 #else
 enum { SCENE_SLOT = GAME_ADDR(0x4663f08), FORCE_MATRIX = GAME_ADDR(0x69a18c), ACTOR_POS = GAME_ACTOR_POS, ACTOR_ROT = GAME_ACTOR_ROT };
@@ -210,6 +211,15 @@ static void (*noclip_force)(void *, const float *, uint32_t);
 static _Atomic int noclip_wanted;
 static _Atomic uint32_t noclip_speed_bits = 0x41400000;   /* 12.0f m/s */
 static struct { int holding; float xyz[3]; uint64_t at_ns; } noclip;   /* frame-end thread only */
+static pthread_mutex_t noclip_goto_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct { int pending; float xyz[3]; } noclip_goto;   /* a teleport for the next tick (runtime_noclip_goto) */
+/* A teleport is a flight: a far place is not loaded, and a player held there is treated as fallen out of the world (the
+   game fades out and puts him back where he last stood, 1.4.3, 2026-10-26). Flying there at a speed the streaming keeps
+   up with loads the world on the way, as for a fast glide. Frame-end thread.
+   The way is up, across and down, never through the ground (inside the terrain the player is also put back): up to
+   NOCLIP_FLIGHT_CLEAR metres above the higher end, level to above the target, then straight down. */
+enum { NOCLIP_FLIGHT_SPEED = 120, NOCLIP_FLIGHT_CLEAR = 60 };   /* metres a second, metres */
+static struct { int on; float to[3], cruise; } noclip_flight;
 enum { NOCLIP_UP = 1 << 9, NOCLIP_DOWN = 1 << 8 };   /* npad ZR, ZL: the triggers, the same on every controller layout */
 void dm_gfx_camera_want(int on);   /* nvn_mtl.m: the game camera of each frame, for flying relative to it */
 int dm_gfx_camera(float pos[3], float right[3], uint64_t *frame);
@@ -346,6 +356,15 @@ void runtime_noclip_set_speed(float v) {
     if (!(v >= 1 && v <= 200)) return;
     uint32_t bits; memcpy(&bits, &v, 4); atomic_store(&noclip_speed_bits, bits);
 }
+int runtime_noclip_goto(const float xyz[3]) {
+    if (!noclip_force || !valid_xyz(xyz)) return 0;
+    pthread_mutex_lock(&noclip_goto_lock);
+    memcpy(noclip_goto.xyz, xyz, sizeof noclip_goto.xyz); noclip_goto.pending = 1;
+    pthread_mutex_unlock(&noclip_goto_lock);
+    fprintf(stderr, "[noclip] teleport to %.1f,%.1f,%.1f\n", xyz[0], xyz[1], xyz[2]);
+    runtime_noclip_set(1);   /* held there while the world streams in; switching noclip off lands */
+    return 1;
+}
 float runtime_noclip_speed(void) { uint32_t bits = atomic_load(&noclip_speed_bits); float v; memcpy(&v, &bits, 4); return v; }
 /* Frame-end thread: the first frame with a player takes his position; after that he is set to the held point, which the
    left stick moves relative to the camera (up: away from it, right: to the screen's right; level, whatever the camera's
@@ -355,6 +374,7 @@ static void noclip_tick(uintptr_t actor) {
     if (!atomic_load(&noclip_wanted) || !noclip_force || !actor) {
         if (noclip.holding) fprintf(stderr, "[noclip] released at %.1f,%.1f,%.1f\n", noclip.xyz[0], noclip.xyz[1], noclip.xyz[2]);
         noclip.holding = 0;
+        if (!atomic_load(&noclip_wanted)) noclip_flight.on = 0;
         return;
     }
     float rot[9], matrix[12];
@@ -366,6 +386,12 @@ static void noclip_tick(uintptr_t actor) {
         noclip.holding = 1; noclip.at_ns = now;
         fprintf(stderr, "[noclip] holding from %.1f,%.1f,%.1f\n", noclip.xyz[0], noclip.xyz[1], noclip.xyz[2]);
     }
+    pthread_mutex_lock(&noclip_goto_lock);
+    if (noclip_goto.pending) {
+        memcpy(noclip_flight.to, noclip_goto.xyz, sizeof noclip_flight.to); noclip_flight.on = 1; noclip_goto.pending = 0;
+        noclip_flight.cruise = fmaxf(noclip.xyz[1], noclip_flight.to[1]) + NOCLIP_FLIGHT_CLEAR;
+    }
+    pthread_mutex_unlock(&noclip_goto_lock);
     float dt = (float)(now - noclip.at_ns) * 1e-9f;
     noclip.at_ns = now;
     if (!(dt > 0)) dt = 0;
@@ -393,6 +419,21 @@ static void noclip_tick(uintptr_t actor) {
     uint64_t buttons = runtime_input_buttons();
     float up = (buttons & NOCLIP_UP ? 1.0f : 0.0f) - (buttons & NOCLIP_DOWN ? 1.0f : 0.0f);
     float next[3] = {noclip.xyz[0] + mx * speed * dt, noclip.xyz[1] + up * speed * dt, noclip.xyz[2] + mz * speed * dt};
+    if (noclip_flight.on) {   /* flying to a teleport target; the stick or the triggers end it */
+        float hx = noclip_flight.to[0] - noclip.xyz[0], hz = noclip_flight.to[2] - noclip.xyz[2], across = sqrtf(hx * hx + hz * hz);
+        float step = NOCLIP_FLIGHT_SPEED * dt, *at = noclip.xyz;
+        memcpy(next, at, sizeof next);
+        if (push > 0 || up != 0) { noclip_flight.on = 0; fprintf(stderr, "[noclip] flight stopped by the player, %.0f m short\n", across); }
+        else if (across > 0.5f && at[1] < noclip_flight.cruise - 0.5f) next[1] = fminf(at[1] + step, noclip_flight.cruise);   /* up */
+        else if (across > 0.5f) {   /* across */
+            float k = fminf(step, across) / across; next[0] = at[0] + hx * k; next[2] = at[2] + hz * k;
+        } else {   /* down */
+            next[0] = noclip_flight.to[0]; next[2] = noclip_flight.to[2];
+            float dy = noclip_flight.to[1] - at[1];
+            if (fabsf(dy) <= step) { next[1] = noclip_flight.to[1]; noclip_flight.on = 0; fprintf(stderr, "[noclip] arrived at %.1f,%.1f,%.1f\n", next[0], next[1], next[2]); }
+            else next[1] = at[1] + (dy > 0 ? step : -step);
+        }
+    }
     if (valid_xyz(next)) memcpy(noclip.xyz, next, sizeof next);   /* the map's edges stop it */
     for (unsigned row = 0; row < 3; row++) {
         for (unsigned col = 0; col < 3; col++) matrix[row * 4 + col] = rot[row * 3 + col];

@@ -3,6 +3,7 @@
    @effect lines (a menu that cannot give dishes leaves them out). Prints one JSON line; exit 1 on failure. */
 #include "dish_give.h"
 #include "spawn_list.h"
+#include "map_pins.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -58,6 +59,18 @@ int main(void) {
     CHECK(spawn_list_filter_dishes(&l, NULL, SPAWN_CAT_ITEMS, "skewer", 0, 0, out, 8) == 0, "search leaves dishes out without giving");
     CHECK(spawn_list_filter(&l, NULL, SPAWN_CAT_ITEMS, "skewer", 0, out, 8) == 1, "search finds the dish");
     spawn_list_free(&l);
+
+    /* a save with two pin slots, the first red, the second unused (Invalid) */
+    static uint8_t sav[0x200];
+    uint32_t w[] = {0x01020304}; memcpy(sav, w, 4);
+    uint32_t table[] = {0x5f93e70f, 0x100, 0x1b62aa42, 0x140, 0xa3db7114, 0};
+    memcpy(sav + 0x28, table, sizeof table);
+    uint32_t two = 2; float xyz[6] = {1.5f, 200.25f, -30.0f, 9, 9, 9};
+    memcpy(sav + 0x100, &two, 4); memcpy(sav + 0x104, xyz, sizeof xyz);
+    uint32_t types[3] = {2, dish_murmur3("Red"), dish_murmur3("Invalid")}; memcpy(sav + 0x140, types, sizeof types);
+    MapPin pins[4];
+    CHECK(map_pins_parse(sav, sizeof sav, pins, 4) == 1 && !strcmp(pins[0].colour, "Red") && pins[0].xyz[1] == 200.25f, "one red pin");
+    sav[0] = 0; CHECK(map_pins_parse(sav, sizeof sav, pins, 4) == 0, "not a save");
 
     printf("{\"status\":\"%s\",\"probe\":\"probe-dish\",\"checked\":%d,\"failures\":%d}\n", failures ? "fail" : "pass", checks, failures);
     return failures != 0;

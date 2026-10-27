@@ -31,6 +31,7 @@
 #include "mods_panel_mac.h"
 #include "spawn_panel_mac.h"
 #include "world_survey.h"
+#include "map_pins.h"
 
 @interface TOTKSettingsPanel : NSView
 + (void)toggle;
@@ -59,14 +60,15 @@ static NSWindow *settings_window(void);   /* frontend.m: the game window */
     BOOL onBar, confirmReset;             /* the focus is on the section bar (the top level); Reset everything… asks */
     NSTimer *pollTimer, *meterTimer;   /* meterTimer: the GPU memory line, once a second */
     uint64_t padPrev; double padRepeatAt; int padDir;
-    BOOL cheatsUnavailableShown, cheatDbAsked;   /* the Cheats tab: the folded list is open; the list was checked this run */
+    BOOL cheatsUnavailableShown, cheatDbAsked;
+    MapPin pins[MAP_PINS_MAX]; int npins;   /* the Cheats tab's Teleport rows (map_pins.h), read when the tab is built */   /* the Cheats tab: the folded list is open; the list was checked this run */
 }
 static TOTKSettingsPanel *settingsPanel;
 static const int NOCLIP_SPEEDS[] = {5, 12, 25, 50, 100};   /* the Cheats tab's noclip speeds, metres a second (12 by default) */
 enum { NOCLIP_NSPEEDS = (int)(sizeof NOCLIP_SPEEDS / sizeof *NOCLIP_SPEEDS) };
 enum { PANEL_WIDTH = 480, PANEL_MARGIN = 16, PAGE_STEP = 8 /* rows per LT / RT on a pane without row frames */,
        SAVES_ROW = -1, CHEATS_FOLDER_ROW = -2, CHEATS_OFF_ROW = -3, CHEATS_RESTART_ROW = -4, CHEATS_DB_ROW = -5, CHEATS_UNAVAILABLE_ROW = -6,
-       CHEATS_NOCLIP_ROW = -7, CHEATS_NOCLIP_SPEED_ROW = -8,
+       CHEATS_NOCLIP_ROW = -7, CHEATS_NOCLIP_SPEED_ROW = -8, CHEATS_PIN_ROW = -100 /* - k: map pin k */,
        CHEAT_ROW = -1000 /* - k: cheat k, or the choice whose first variant is k */ };
 static NSString *const BAR_HINT = @"←→ sections   ↓ open   Q E tabs   R reset tab   ⇧R reset all   Esc close\n"
                                    "Controller: D-pad, A open, LB RB tabs, X reset tab, Y reset all, B close";
@@ -566,6 +568,17 @@ static int cheat_choice_members(int leader, int *all, int *usable, int max, int 
         [speed selectItemWithTag:(NSInteger)lroundf(runtime_noclip_speed())];
         speed.target = self; speed.action = @selector(noclipSpeedChosen:);
         [self addCheatsRow:[self cheatsRow:@"Noclip speed" detail:@"How fast Link flies (← → change it)" color:nil control:speed] id:CHEATS_NOCLIP_SPEED_ROW];
+        const char *profile = getenv("TOTK_PROFILE_DIR");
+        npins = profile ? map_pins_read(profile, pins, MAP_PINS_MAX, NULL, 0) : -1;
+        for (int k = 0; k < npins; k++) {
+            NSButton *go = [self cheatsButton:@"Go" action:@selector(pinGo:)]; go.tag = k;
+            [self addCheatsRow:[self cheatsRow:[NSString stringWithFormat:@"Teleport to the %@ map pin", [@(pins[k].colour) isEqualToString:@"LightBlue"] ? @"light blue" : @(pins[k].colour).lowercaseString]
+                                        detail:[NSString stringWithFormat:@"%.0f, %.0f, %.0f · flies you there with noclip (120 m/s; the stick stops it), then holds you: switch noclip off to land", pins[k].xyz[0], pins[k].xyz[1], pins[k].xyz[2]]
+                                         color:nil control:go] id:CHEATS_PIN_ROW - k];
+        }
+        if (npins <= 0)
+            [self addCheatsRow:[self cheatsRow:@"Teleport to a map pin" detail:npins < 0 ? @"No save yet." :
+                                 @"No map pins in the last save: place a pin on the map, then save (or wait for an autosave)." color:nil control:nil] id:CHEATS_PIN_ROW - MAP_PINS_MAX];
     }
     if (runtime_cheats_count()) {
         NSButton *off = [self cheatsButton:@"Turn off" action:@selector(cheatsAllOff)]; off.enabled = cheats_any_on() || runtime_noclip_on();
@@ -654,6 +667,12 @@ static int cheat_choice_members(int leader, int *all, int *usable, int max, int 
 }
 - (void)updateCheatList { [TOTKCheatDb update:YES]; }
 - (void)toggleCheatsUnavailable { cheatsUnavailableShown = !cheatsUnavailableShown; [self rebuildKeepingPlace]; }
+- (void)goToPin:(int)k {
+    if (k < 0 || k >= npins) return;
+    float at[3] = {pins[k].xyz[0], pins[k].xyz[1] + 2, pins[k].xyz[2]};   /* a little above the pin: it sits on the ground */
+    if (runtime_noclip_goto(at)) [self hide];
+}
+- (void)pinGo:(NSButton *)b { [self goToPin:(int)b.tag]; }
 - (void)noclipSwitched:(NSSwitch *)s { runtime_noclip_set(s.state == NSControlStateValueOn); [self rebuildKeepingPlace]; }
 - (void)noclipSpeedChosen:(NSPopUpButton *)b { runtime_noclip_set_speed((float)b.selectedTag); [self.window makeFirstResponder:self]; }
 - (void)stepNoclipSpeed:(int)dir {
@@ -881,6 +900,7 @@ static NSTextField *settings_help_label(NSView *v) {   /* a setting row's help t
     if (i == CHEATS_OFF_ROW) { if (!dir) [self cheatsAllOff]; return; }
     if (i == CHEATS_NOCLIP_ROW) { runtime_noclip_set(dir ? dir > 0 : !runtime_noclip_on()); [self rebuildKeepingPlace]; return; }
     if (i == CHEATS_NOCLIP_SPEED_ROW) { if (dir) [self stepNoclipSpeed:dir]; return; }
+    if (i <= CHEATS_PIN_ROW && i > CHEATS_PIN_ROW - MAP_PINS_MAX - 1) { if (!dir) [self goToPin:CHEATS_PIN_ROW - i]; return; }
     if (i == CHEATS_RESTART_ROW) { if (!dir && runtime_front_can_restart()) [self restartGame]; return; }
     if (i == CHEATS_DB_ROW) { if (!dir) [self updateCheatList]; return; }
     if (i == CHEATS_UNAVAILABLE_ROW) { if (!dir) [self toggleCheatsUnavailable]; return; }
