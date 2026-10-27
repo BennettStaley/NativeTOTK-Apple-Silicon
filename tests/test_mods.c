@@ -233,6 +233,26 @@ int main(void) {
     expect(mods_capture_fix(other, 12, NULL, 0) == -1, "not a SARC");
     free(sc); free(ab); free(ab_odd); free(other); free(arc); free(before);
 
+    /* The port's own edits merged into a mod's copy (Native 16:10 layouts, mods_port_merge). Members: L the port edits two words
+       of, of which the mod changes one too (its icons); A the port edits and the mod resized; B the port leaves alone. */
+    {
+        float lg[4] = {1, 2, 3, 4}, lp[4] = {1, 0.9f, 3, 5}, lm[4] = {7, 2, 3, 6}, ag[2] = {1, 1}, ap[2] = {1, 0.5f}, am[3] = {1, 1, 9}, bg[2] = {8, 8};
+        const char *const nm[] = {"blyt/L.bflyt", "anim/A.bflan", "blyt/B.bflyt"};
+        uint8_t *gd[] = {(uint8_t *)lg, (uint8_t *)ag, (uint8_t *)bg}, *pd[] = {(uint8_t *)lp, (uint8_t *)ap, (uint8_t *)bg}, *md[] = {(uint8_t *)lm, (uint8_t *)am, (uint8_t *)bg};
+        size_t gl[] = {16, 8, 8}, ml[] = {16, 12, 8};
+        uint8_t *g = calloc(1, 4096), *p = calloc(1, 4096), *m = calloc(1, 4096);
+        size_t gn = make_sarc(g, nm, gd, gl, 3), pn = make_sarc(p, nm, pd, gl, 3), mn = make_sarc(m, nm, md, ml, 3);
+        ModsMerge ms; size_t n;
+        expect(mods_port_merge(m, mn, g, gn, p, pn, &ms, why, sizeof why) == 1 && ms.members == 2 && ms.skipped == 1 && ms.kept == 1, "merge: counts");
+        float *l = (float *)sarc_member(m, mn, "blyt/L.bflyt", &n);
+        expect(l && l[0] == 7 && l[1] == 0.9f && l[2] == 3 && l[3] == 6, "merge: the port's value where the mod kept the game's, the mod's where it changed it");
+        float *a = (float *)sarc_member(m, mn, "anim/A.bflan", &n);
+        expect(a && n == 12 && a[1] == 1, "merge: a member the mod resized stays the mod's");
+        expect(mods_port_merge(m, mn, g, gn, p, pn, &ms, why, sizeof why) == 0, "merge: already merged");
+        expect(mods_port_merge(m, mn, g, gn, (const uint8_t *)"not a SARC", 10, &ms, why, sizeof why) == -1 && strstr(why, "port"), "merge: the port's copy is no SARC");
+        free(g); free(p); free(m);
+    }
+
     char cmd[1200]; snprintf(cmd, sizeof cmd, "rm -rf '%s'", root); if (system(cmd)) {}
     if (failures) { fprintf(stderr, "%d failures\n", failures); return 1; }
     printf("mods: all checks passed\n");

@@ -730,3 +730,36 @@ int mods_capture_fix(uint8_t *sarc, size_t len, char *why, size_t cap) {
     const float zero = 0.0f; for (int k = 0; k < nmove; k++) memcpy(move[k], &zero, 4);
     return nmove;
 }
+int mods_port_merge(uint8_t *sarc, size_t len, const uint8_t *orig, size_t orig_len, const uint8_t *port, size_t port_len,
+                    ModsMerge *st, char *why, size_t cap) {
+    char scratch[8]; if (!why || !cap) { why = scratch; cap = sizeof scratch; }
+    *why = 0; memset(st, 0, sizeof *st);
+    if (!sarc || len < 0x20 || memcmp(sarc, "SARC", 4)) { snprintf(why, cap, "the mod's archive is not a SARC"); return -1; }
+    const uint8_t *d = port; size_t n = port_len;
+    if (n < 0x20 || memcmp(d, "SARC", 4) || d[6] != 0xFF || d[7] != 0xFE) { snprintf(why, cap, "the port's archive is not a SARC"); return -1; }
+    if (orig_len < 0x20 || memcmp(orig, "SARC", 4)) { snprintf(why, cap, "the game's archive is not a SARC"); return -1; }
+    size_t hdr = le16(d + 4), data = le32(d + 0x0C);
+    if (hdr + 12 > n || memcmp(d + hdr, "SFAT", 4)) { snprintf(why, cap, "the port's archive has no SFAT"); return -1; }
+    size_t count = le16(d + hdr + 6), sfnt = hdr + 12 + count * 16;
+    if (sfnt + 8 > n || memcmp(d + sfnt, "SFNT", 4)) { snprintf(why, cap, "the port's archive has no SFNT"); return -1; }
+    for (size_t k = 0; k < count; k++) {
+        const uint8_t *node = d + hdr + 12 + k * 16; uint32_t attr = le32(node + 4), start = le32(node + 8), end = le32(node + 12);
+        size_t at = sfnt + 8 + (size_t)(attr & 0xFFFFFF) * 4;
+        if (!(attr >> 24) || at >= n || !memchr(d + at, 0, n - at) || start > end || data + end > n) continue;
+        const char *name = (const char *)d + at; const uint8_t *p = d + data + start; size_t pl = end - start, ol = 0, ml = 0;
+        const uint8_t *o = sarc_member((uint8_t *)orig, orig_len, name, &ol);
+        if (!o || ol != pl || !memcmp(o, p, pl)) continue;   /* a member the port adds, resizes or leaves as the game ships it */
+        st->members++;
+        uint8_t *m = sarc_member(sarc, len, name, &ml);
+        if (!m || ml != ol) { st->skipped++; continue; }   /* the mod rebuilt or dropped that member: its own copy stays */
+        /* 4-byte words from the member's start (the port's edits are floats in place): a word the mod left as the game ships
+           it takes the port's value; one the mod changed too keeps the mod's. */
+        for (size_t w = 0; w < pl; w += 4) {
+            size_t wn = pl - w < 4 ? pl - w : 4;
+            if (!memcmp(o + w, p + w, wn) || !memcmp(m + w, p + w, wn)) continue;
+            if (memcmp(m + w, o + w, wn)) { st->kept++; continue; }
+            memcpy(m + w, p + w, wn); st->words++;
+        }
+    }
+    return (int)st->words;
+}

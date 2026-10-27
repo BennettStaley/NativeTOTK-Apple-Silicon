@@ -67,7 +67,7 @@ The port ships a few fixed game files of its own (`games/totk/scripts/make_romfs
 
 | File | What is used | Log line |
 |---|---|---|
-| `UI/LayoutArchive/Common.Product.140.Nin_NX_NVN.blarc.zs` (the HUD and menu layouts: button glyph mods such as Xbox UI or PlayStation UI replace it) | the mod's copy, with the port's quick-menu background fix applied to it again | `... the mod's copy is used, with the port's quick-menu background fix applied to it again`, then `... fix is applied to the mod's copy (4 visibility keys moved ...)` |
+| `UI/LayoutArchive/Common.Product.140.Nin_NX_NVN.blarc.zs` (the HUD and menu layouts: button glyph mods such as Xbox UI or PlayStation UI replace it) | the mod's copy, with the port's own edits of it applied again: the quick-menu background fix and, with Native 16:10, the layouts for the taller screen | `... the mod's copy is used, with the port's own edits applied to it again`, then `... the port's own edits are applied to the mod's copy (N values in M members ...)` |
 | `Event/EventFlow/DmF_SY_GameOver.bfevfl.zs` (a game over fix only 1.0.0 runs) | the mod's copy | `... the mod's copy is used and the port's patch is left out` |
 | `System/HeapSize/Product.Nin_NX_NVN.HeapDef.byml.zs` (only with 1440p / 4K output) | the port's copy: the game needs the bigger heaps for that output | `... which needs its own copy (the heap sizes for the output resolution); the mod's copy is left out` |
 
@@ -75,11 +75,16 @@ The quick-menu background fix: the weapon / shield / material quick menus (hold 
 screen show a capture of the game picture behind them. The game takes it when the capture panes become visible at
 animation frame 1.0; at 60 fps that comes after the world has stopped drawing, so the background is black. The fix moves
 those four visibility keys to frame 0.0 (in `anim/ShortCutBG_00_In.bflan` and `anim/AutoBuilder_00_In.bflan`). For a
-mod's archive the runtime decompresses it with the game's zstd dictionaries, moves the keys only where they are exactly
-the game's (hidden at 0.0, shown at 1.0) and serves the result uncompressed (zstd raw blocks), cached in
-`mods/.cache/capture-fix-*.blarc.zs` until the mod's file changes. If the mod changed those animations, its archive is
-used as it is and the log says `the port's quick-menu background fix was not applied (...)`: the quick menus can then
-show a black background at 60 fps.
+mod's archive the runtime decompresses it with the game's zstd dictionaries and carries over every edit the port made to
+its own copy: the quick-menu fix, and with Native 16:10 the layouts made for the taller screen (without them a 16:9 HUD
+mod is stretched up and down, the round minimap an oval). The port's edits are values changed in place, so each member
+of the port's copy is compared with the game's, 4 bytes at a time; a value the mod still has as the game ships it takes
+the port's value, a value the mod changed too keeps the mod's, and a member the mod rebuilt at another size stays the
+mod's. The result is served uncompressed (zstd raw blocks), cached in `mods/.cache/capture-fix-*.blarc.zs` until the
+mod's file or the port's copy changes. Without the port's copy only the quick-menu fix is applied, where those keys are
+exactly the game's (hidden at 0.0, shown at 1.0). If nothing applies, the archive is used as it is and the log says
+`the port's own edits were not applied (...)`: the quick menus can then show a black background at 60 fps and the
+layout keeps 16:9.
 
 Mod files are not hashed at start, so a start with mods is about as fast as one without. If a mod file changes or is
 deleted while the game runs, the game stops when it next opens that file instead of reading something unchecked.

@@ -266,11 +266,13 @@ static size_t build_owner(uint64_t i,const char *name) {
 /* A player's file at a path build slot owner-1 changes: MODS_BUILD_KEEP (0 here: the build's copy stays, the player's is
    left out) for what the port needs, else the build's slot is removed and the player's copy is used (MODS_BUILD_MOD_WINS,
    or MODS_BUILD_REFIX: with the build's fix applied to it again). */
+static char yielded[4096];   /* the build's copy of the file build_yield last gave up (capture_refix merges its edits) */
 static int build_yield(size_t owner,const char *who,const char *name) {
  size_t k=owner-1;int r=k>=npatch?MODS_BUILD_KEEP:mods_build_collision(name);
  if(r==MODS_BUILD_KEEP){fprintf(stderr,"[totk] mods: %s: %s is also changed by the port (%s), which needs its own copy (the heap sizes for the output resolution); the mod's copy is left out\n",who,name,overlays[k].path);return 0;}
  fprintf(stderr,"[totk] mods: %s: %s is also changed by the port's own patches (%s); the mod's copy is used%s\n",who,name,overlays[k].path,
-  r==MODS_BUILD_REFIX?", with the port's quick-menu background fix applied to it again":" and the port's patch is left out");
+  r==MODS_BUILD_REFIX?", with the port's own edits applied to it again":" and the port's patch is left out");
+ snprintf(yielded,sizeof yielded,"%s",r==MODS_BUILD_REFIX?overlays[k].path:"");
  free(overlays[k].path);free(overlays[k].name);memmove(&overlays[k],&overlays[k+1],(noverlay-k-1)*sizeof(*overlays));noverlay--;nbuild--;if(k<npatch)npatch--;
  return r;
 }
@@ -396,14 +398,19 @@ static uint8_t *zs_decompress(const uint8_t *src,size_t n,size_t *out) {
   else if(in.pos==in.size)break;}   /* the frame ends early */
  free(b);ZSTD_freeDCtx(c);return NULL;
 }
-/* A player's Common layout archive (UI mods: button glyphs, HUD) with the build's quick-menu background fix applied again
-   (mods_capture_fix), served as a zstd frame of raw blocks from <mods>/.cache: capture-fix-<path digest>.blarc.zs, its
-   .key holding the player file's size, modification time and path and the verdict, so the next start with the same file
-   reads nothing. 1 = out names the file to serve; 0 = the player's file is served unchanged (its archive differs from the
-   game's where the fix goes, or it does not read), and the log says the fix is not applied. */
+/* A player's Common layout archive (UI mods: button glyphs, HUD) with the build's own edits applied again: every edit of the
+   build's copy (yielded, from build_yield) that the mod leaves as the game ships it (mods_port_merge: the quick-menu
+   background fix and the layouts for the output's shape, such as Native 16:10), or, without the build's copy, the quick-menu
+   fix alone (mods_capture_fix). Served as a zstd frame of raw blocks from <mods>/.cache: capture-fix-<path digest>.blarc.zs,
+   its .key holding the player file's and the build copy's size, modification time and path and the verdict, so the next
+   start with the same files reads nothing. 1 = out names the file to serve; 0 = the player's file is served unchanged (its
+   archive differs from the game's where the fix goes, or it does not read), and the log says the fix is not applied. */
 static int capture_refix(const char *who,const char *name,const char *file,const struct stat *st,char *out,size_t cap) {
- uint64_t t0=runtime_now_ns();char key[4400],cache[4096],keyfile[4400],saved[5000]={0};
- snprintf(key,sizeof key,"totk-capture-fix-1\t%llu\t%lld.%09ld\t%s",(unsigned long long)st->st_size,(long long)st->st_mtimespec.tv_sec,(long)st->st_mtimespec.tv_nsec,file);
+ uint64_t t0=runtime_now_ns();char key[8800],cache[4096],keyfile[4400],saved[9400]={0},port[4096];struct stat ps;
+ snprintf(port,sizeof port,"%s",yielded);*yielded=0;
+ uint64_t vi=lower(name);if(vi>=file_count||strcmp(entry_name(entry(vi)),name)||stat(port,&ps))*port=0;
+ snprintf(key,sizeof key,"totk-capture-fix-2\t%llu\t%lld.%09ld\t%s\t%llu\t%lld.%09ld\t%s",(unsigned long long)st->st_size,(long long)st->st_mtimespec.tv_sec,(long)st->st_mtimespec.tv_nsec,file,
+  *port?(unsigned long long)ps.st_size:0ull,*port?(long long)ps.st_mtimespec.tv_sec:0ll,*port?(long)ps.st_mtimespec.tv_nsec:0l,port);
  uint8_t d[32];CC_SHA256(file,(CC_LONG)strlen(file),d);
  snprintf(cache,sizeof cache,"%s/.cache",mods_dir());
  if(mkdir(cache,0755)&&errno!=EEXIST){const char *t=getenv("TMPDIR");snprintf(cache,sizeof cache,"%s",t&&*t?t:"/tmp");}
@@ -414,24 +421,32 @@ static int capture_refix(const char *who,const char *name,const char *file,const
  if(!strncmp(saved,key,kl)&&saved[kl]=='\n'){
   const char *verdict=saved+kl+1;
   if(!strncmp(verdict,"fixed\n",6)&&!stat(out,&cs)&&S_ISREG(cs.st_mode)&&cs.st_size>0){
-   fprintf(stderr,"[totk] mods: %s: %s: the quick-menu background fix is applied to the mod's copy (cached: %s)\n",who,name,out);return 1;}
+   fprintf(stderr,"[totk] mods: %s: %s: the port's own edits are applied to the mod's copy (cached: %s)\n",who,name,out);return 1;}
   if(!strncmp(verdict,"unchanged\t",10)){fprintf(stderr,"[totk] mods: %s: %s: %s (cached)\n",who,name,verdict+10);return 0;}
  }
  size_t n=0,m=0;uint8_t *raw=host_file(file,&n,256u<<20),*plain=raw?zs_decompress(raw,n,&m):NULL;free(raw);
- char why[300]="the archive does not decompress",line[600];int moved=plain?mods_capture_fix(plain,m,why,sizeof why):-1;
+ char why[300]="the archive does not decompress",line[600],done[400]="";int moved=-1;
+ if(plain&&*port){   /* all the build's edits the mod leaves alone */
+  size_t pn=0,pm=0,on=0,om=0;uint8_t *pz=host_file(port,&pn,256u<<20),*pp=pz?zs_decompress(pz,pn,&pm):NULL,*oz=image_file(vi,&on),*op=zs_decompress(oz,on,&om);free(pz);free(oz);
+  ModsMerge ms;moved=pp&&op?mods_port_merge(plain,m,op,om,pp,pm,&ms,why,sizeof why):-1;free(pp);free(op);
+  if(moved>=0)snprintf(done,sizeof done,"%u values in %u members (%u values the mod also changes keep the mod's, %u members the mod rebuilt keep the mod's)",
+   ms.words,ms.members-ms.skipped,ms.kept,ms.skipped);
+  else fprintf(stderr,"[totk] mods: %s: %s: the port's edits do not merge (%s); trying the quick-menu background fix alone\n",who,name,why);
+ }
+ if(plain&&moved<0){moved=mods_capture_fix(plain,m,why,sizeof why);if(moved>0)snprintf(done,sizeof done,"the quick-menu background fix alone: %d visibility keys moved from frame 1 to 0",moved);}
  if(moved<=0){
-  if(moved<0)snprintf(line,sizeof line,"the port's quick-menu background fix was not applied (%s); the mod's file is used unchanged, so the quick menus' background can be black at 60 fps",why);
-  else snprintf(line,sizeof line,"the mod's copy already has the quick-menu background fix; used unchanged");
+  if(moved<0)snprintf(line,sizeof line,"the port's own edits were not applied (%s); the mod's file is used unchanged, so the quick menus' background can be black at 60 fps and the layout keeps 16:9",why);
+  else snprintf(line,sizeof line,"the mod's copy already has the port's own edits; used unchanged");
   fprintf(stderr,"[totk] mods: %s: %s: %s\n",who,name,line);free(plain);
   kf=fopen(keyfile,"w");if(kf){fprintf(kf,"%s\nunchanged\t%s\n",key,line);fclose(kf);}
   return 0;}
  size_t fn=0;uint8_t *frame=mods_zstd_raw_frame(plain,m,&fn);free(plain);if(!frame)return 0;
  char tmp[4300];snprintf(tmp,sizeof tmp,"%s.%ld.tmp",out,(long)getpid());int fd=open(tmp,O_WRONLY|O_CREAT|O_TRUNC|O_CLOEXEC,0644);
  int ok=fd>=0&&write(fd,frame,fn)==(ssize_t)fn;if(fd>=0)ok&=!close(fd);free(frame);
- if(!ok||rename(tmp,out)){unlink(tmp);fprintf(stderr,"[totk] mods: %s: %s: cannot write %s (%s); the mod's file is used without the quick-menu background fix\n",who,name,out,strerror(errno));return 0;}
+ if(!ok||rename(tmp,out)){unlink(tmp);fprintf(stderr,"[totk] mods: %s: %s: cannot write %s (%s); the mod's file is used without the port's own edits\n",who,name,out,strerror(errno));return 0;}
  kf=fopen(keyfile,"w");if(kf){fprintf(kf,"%s\nfixed\n",key);fclose(kf);}
- fprintf(stderr,"[totk] mods: %s: %s: the port's quick-menu background fix is applied to the mod's copy (%d visibility keys moved from frame 1 to 0; %zu bytes, zstd raw blocks, %s, %.2f s)\n",
-  who,name,moved,fn,out,(runtime_now_ns()-t0)/1e9);
+ fprintf(stderr,"[totk] mods: %s: %s: the port's own edits are applied to the mod's copy (%s; %zu bytes, zstd raw blocks, %s, %.2f s)\n",
+  who,name,done,fn,out,(runtime_now_ns()-t0)/1e9);
  return 1;
 }
 typedef struct {char **paths;uint32_t *values;size_t n,cap;} Estimates;

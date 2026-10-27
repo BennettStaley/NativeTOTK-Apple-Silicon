@@ -118,3 +118,11 @@ int mods_build_collision(const char *path);
    game's archive and on mods that keep those animations; 0 when all four already are at 0.0), or -1 with why filled
    when the archive's shape differs (a member, pane or key list not as expected; nothing is changed). */
 int mods_capture_fix(uint8_t *sarc, size_t len, char *why, size_t cap);
+/* The port's own edits of that archive carried over to a mod's copy (all of them: the quick-menu fix and the layouts for the
+   output's shape, such as Native 16:10's taller canvas). The edits are values changed in place, so per member the port's copy
+   (port) is compared with the game's (orig) word by word; each changed word the mod (sarc, edited in place) still has as the
+   game ships it takes the port's value, a word the mod changed as well keeps the mod's. A member the mod resized or lacks is
+   left as the mod has it. Returns the words written (st has the counts), or -1 with why filled when an archive is no SARC. */
+typedef struct { unsigned members, skipped, words, kept; } ModsMerge;
+int mods_port_merge(uint8_t *sarc, size_t len, const uint8_t *orig, size_t orig_len, const uint8_t *port, size_t port_len,
+                    ModsMerge *st, char *why, size_t cap);
