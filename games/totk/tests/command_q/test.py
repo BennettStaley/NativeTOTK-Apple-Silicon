@@ -19,6 +19,7 @@ with tempfile.TemporaryDirectory(prefix="totk-command-q-") as work:
                                     capture_output=True, text=True, timeout=5)
             assert result.returncode == 0, result.stderr
             assert expected in result.stderr, result.stderr
+            assert "[probe] state report: closing" in result.stderr, result.stderr   # reported before _exit
             if mode:
                 assert "quitting when the save is done" in result.stderr, result.stderr
             print(f"PASS: save mode {mode}, text entry {text_entry}")

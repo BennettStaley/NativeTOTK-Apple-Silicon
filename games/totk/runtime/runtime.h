@@ -28,7 +28,7 @@ void *runtime_codec_override(const char *name);
 void *runtime_movie_override(const char *name);   /* runtime/movie_host.c: movie::Decoder for VP9 cutscenes */
 void *runtime_time_override(const char *name);
 void *runtime_applet_override(const char *name);
-void *runtime_swkbd_override(const char *name);   /* runtime/swkbd_host.c: nn::swkbd text entry with the Mac keyboard */
+void *runtime_swkbd_override(const char *name);   /* runtime/swkbd_host.c: nn::swkbd text entry with keyboard or controller */
 void runtime_swkbd_probe(void);
 void runtime_swkbd_selftest(void);
 void runtime_dump_threads(void);   /* threads.c: every guest thread's wait state and guest return chain (TOTK_INPUT_FILE "threads") */   /* diagnostic "kbtest": show the text entry bar from a thread of its own */
@@ -39,7 +39,7 @@ uint32_t runtime_thread_current_handle(void);            /* threads.c: handle of
 void *runtime_hle_wrap_named(void *fn, const char *name);/* hle_stack.c: runtime_hle_wrap with a name for diagnostics */
 void runtime_hle_trace_set(int mode);                    /* hle_stack.c: 1 count host calls, 2 also log the first call of each, 0 stop and print */
 void runtime_hle_describe(unsigned index, char *out, size_t cap);   /* hle_stack.c: readable name of a host-call wrapper */
-/* Text entry bar in the game window (runtime/frontend.m, Mac): the player types on the keyboard, Return confirms (1, the text
+/* Text entry in the game window (runtime/frontend.m, Mac): controller keyboard and Mac typing, Return confirms (1, the text
    as UTF-8 in out), Escape cancels (0). The caller waits; give the virtual core up around it (runtime_core_away). */
 typedef struct { const char *prompt, *initial; int max_units, min_units, secure, digits_only; uint32_t disabled; } RuntimeTextRequest;
 int runtime_front_text_input(const RuntimeTextRequest *req, char *out, size_t out_size);
@@ -206,10 +206,18 @@ void *runtime_input_override(const char *name);
 typedef struct { uint64_t buttons; int32_t lx,ly,rx,ry; int connected; } RuntimeGamepadState;
 void runtime_gamepad_start(void);
 void runtime_gamepad_switch_left(void *controller, int x, int y);
+void runtime_gamepad_switch_right(void *controller, int x, int y);
 void runtime_gamepad_read(RuntimeGamepadState *out);
 void runtime_gamepad_left_stick(int32_t *x,int32_t *y);   /* the stick without taking the press edges */
 void runtime_input_left_stick(int32_t *x,int32_t *y);   /* runtime/input.c: keyboard WASD or the controller, the stronger, -32767..32767, y up */
 uint64_t runtime_gamepad_held(void);   /* held buttons, leaving the press edges for runtime_gamepad_read */
+/* Mac software keyboard: exclusive controller capture; UI reads physical positions (controller_map.h),
+   independent of gameplay remaps. Main-thread only. Closing waits for release before gameplay resumes. */
+void runtime_gamepad_text_capture(int on);
+void runtime_gamepad_text_read(RuntimeGamepadState *out);
+/* macOS opts in; the physical L2 + R2 + left-stick click chord, held for a second, is latched independently of guest polling. */
+void runtime_gamepad_settings_enable(int enabled);
+int runtime_gamepad_settings_requested(void);
 /* Forget held buttons and sticks: macOS stops delivering controller events (including releases) while the app is in
    the background, so a button held at focus loss would otherwise stay pressed for the game. */
 void runtime_gamepad_clear(void);
@@ -260,6 +268,7 @@ void runtime_motion_feed(const double acc_g[3], const double gyro_rad_s[3], uint
 int runtime_motion_axes(const char *spec);   /* TOTK_GYRO_AXES ("-x,y,-z"): 1 set, 0 unset, -1 malformed */
 void runtime_motion_deadzone_default(double deg_s);   /* when TOTK_GYRO_DEADZONE is unset: 1.2 for HID motion, else 0 */
 void runtime_motion_live(int on);   /* a controller with motion attached (1) / detached (0) */
+void runtime_motion_phone(int on);  /* the iPhone's own sensor feeds the six-axis device (1) / stops (0) */
 void runtime_motion_mouse(int on);  /* mouse mode (key 7) takes the sensor over (1) / gives it back to the controller (0) */
 void runtime_motion_feed_mouse(const double acc_g[3], const double gyro_rad_s[3], uint64_t now_ns);   /* already in the reference frame */
 void runtime_feedback_quiet(void);   /* focus lost: stop rumbling */

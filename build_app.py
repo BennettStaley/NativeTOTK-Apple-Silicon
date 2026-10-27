@@ -1100,7 +1100,8 @@ def build_launcher(tree, version, logs, env):
     """build/app-launcher: per game and version (runtime/game_version.h: the data folder, the log name, the backup of saves)."""
     defines = [] if version == 'v0' else [f'-DGAME_{version.upper()}=1'] if version.startswith('botw') else [f'-DTOTK_GAME_{version.upper()}=1']
     run(['xcrun', 'clang', '-fobjc-arc', '-O2', '-Wall', '-Ithird_party/d2r_gfx/gfx/nvn', '-Iruntime', *defines, 'app/launcher.m',
-         'runtime/save_package.m', '-framework', 'AppKit', '-lz', '-o', 'build/app-launcher'], logs / 'launcher.log', cwd=tree, env=env)
+         'runtime/save_package.m', '-framework', 'AppKit',
+         '-framework', 'GameController', '-framework', 'IOKit', '-lz', '-o', 'build/app-launcher'], logs / 'launcher.log', cwd=tree, env=env)
 
 
 def build_warm_tool(tree, logs, env):
@@ -1608,6 +1609,18 @@ def source_commit():
     return result.stdout.strip() if result.returncode == 0 else ''
 
 
+def write_main_build_id(nso, target):
+    if not nso.is_file():
+        return
+    with nso.open('rb') as f:
+        f.seek(0x40)
+        build_id = f.read(20)
+    if len(build_id) != 20:
+        raise BuildError(f'{nso}: too short to hold a build ID')
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(build_id.hex().upper() + '\n')
+
+
 def step_app(tree, out, logs, *, version="v0", store=None, game='totk', cheats=None):
     """The app bundle; store (step_store's game-data.json, Tears of the Kingdom on the Mac by default): the large game data
     stays outside it, else it is inside (the RomFS as a data bundle signed once, data_bundle)."""
@@ -1634,6 +1647,7 @@ def step_app(tree, out, logs, *, version="v0", store=None, game='totk', cheats=N
         clone(actors, res / 'build/actor_list.tsv')
     for rel in files:
         clone(tree / rel, res / rel)
+    write_main_build_id(tree / f'extracted/{version}/exefs/main', res / f'extracted/{version}/exefs/main.build-id')
     for rel in (f'extracted/{version}/romfs-patches', f'extracted/{version}/romfs-patches-{NATIVE_TALL}', f'extracted/{version}/romfs-patches-out', 'extracted/firmware/shared-fonts'):
         if (tree / rel).is_dir():   # Breath of the Wild has no RomFS overlays
             copy_tree(tree / rel, res / rel)

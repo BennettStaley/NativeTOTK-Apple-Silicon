@@ -19,3 +19,5 @@ void runtime_noclip_set_speed(float metres_per_second);
 float runtime_noclip_speed(void);
 /* Teleport: noclip on, the player held at xyz (a map pin's position) from the next frame. 0 when refused. */
 int runtime_noclip_goto(const float xyz[3]);
+/* Set by the 1.4.3 patches in survey sessions: the benchmark camera block (world_survey.c). */
+extern uint8_t *runtime_bench_cam;

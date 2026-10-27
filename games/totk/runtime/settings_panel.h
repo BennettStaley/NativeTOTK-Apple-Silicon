@@ -32,7 +32,7 @@
    Below the rows two buttons (user 2026-10-25): contribute the shaders and pipelines the shared list lacks (sent with gh
    in the background when it is signed in, as the launcher's reminder does; else the GitHub form opens and Finder shows the
    file), and star the project (its GitHub page). A setting this game or start cannot change shows its one value, greyed out. While the panel is open the game gets no
-   keyboard or mouse input (TOTKInputView, front_mouse_update: the pointer is let go); a controller still plays. The
+   keyboard, mouse or controller input (TOTKInputView, front_mouse_update and gamepad capture). The
    controls read their values again twice a second, so they always show what is in force. */
 #pragma once
 #include "aspect_math.h"   /* aspect_near, ASPECT_GAME */
@@ -145,6 +145,8 @@ static NSArray<TOTKSettingRow *> *settings_rows(void) {
   @[settings_text("全部（FPS、着色器、读取）","All (FPS, shaders, load)"),settings_text("只显示 FPS","FPS only"),settings_text("关","Off")],
   @[@(HUD_MODE_ALL),@(HUD_MODE_MINIMAL),@(HUD_MODE_OFF)],
   ^int{return fps_overlay_hud_mode();},^(int v){fps_overlay_set_hud_mode(v);[(TOTKHudBox *)hudBox refresh];})];
+ [rows addObject:settings_row(settings_text("FPS graph","FPS graph"),nil,nil,
+  ^int{return fpsGraphEnabled;},^(int v){fpsGraphEnabled=v;runtime_setting_save("fps-graph.txt",v?"on":"off","FPS graph");[(TOTKFpsGraph *)fpsGraphBox setEnabled:v];[(TOTKHudBox *)hudBox refresh];})];
  [rows addObject:settings_row(settings_text("锁帧","Frame lock"),
   @[settings_text("关","Off"),settings_text("30 帧","30 fps"),settings_text("40 帧","40 fps"),settings_text("60 帧","60 fps")],@[@0,@30,@40,@60],
   ^int{return nvn_fps_lock();},^(int v){nvn_fps_lock_set(v);if(v)dm_gfx_set_flag("mfx_interp",MFX_OFF);})];
@@ -195,6 +197,15 @@ static NSArray<TOTKSettingRow *> *settings_rows(void) {
 
 @interface TOTKSettingsPanel:NSView
 @property(strong) NSArray<TOTKSettingRow *> *rows;
+@property(strong) NSMutableArray<NSView *> *controllerTargets;
+@property NSInteger controllerIndex;
+@property BOOL controllerArmed;
+@property uint64_t previousButtons;
+@property int previousDirection;
+@property double repeatAt;
+-(void)controllerPad:(RuntimeGamepadState)pad time:(double)now active:(BOOL)active;
+-(void)controllerHighlight;
+-(void)controllerHint;
 @property(strong) NSTimer *timer;
 @property NSPoint grab;   /* where in the panel the drag started */
 @property(strong) NSTextField *hint;   /* the bottom line; the buttons' results show there */
@@ -207,13 +218,13 @@ static NSPoint g_settings_at = {-1, -1};
 enum { SETTINGS_W = 520, SETTINGS_ROW_H = 34, SETTINGS_GAP = 6, SETTINGS_TOP = 54, SETTINGS_BOTTOM = 86, SETTINGS_POP_W = 260 };
 -(instancetype)init{
  NSArray<TOTKSettingRow *> *rows=settings_rows();
- /* The rows close up (down to 26 pt, 2 pt apart) when the panel would not fit the window (21:9 or 32:9 on a laptop
+ /* The rows close up (down to 24 pt, 2 pt apart: a 26 pt menu then meets the next one's edge) when the panel would not fit the window (21:9 or 32:9 on a laptop
     screen), so its title, close button and first rows stay in view. */
  CGFloat n=rows.count,rowH=SETTINGS_ROW_H,gap=SETTINGS_GAP,room=window?window.contentView.bounds.size.height-8:CGFLOAT_MAX;
- if(n&&SETTINGS_TOP+n*(rowH+gap)-gap+SETTINGS_BOTTOM>room){gap=2;rowH=fmax(26,floor((room-SETTINGS_TOP-SETTINGS_BOTTOM+gap)/n-gap));}
+ if(n&&SETTINGS_TOP+n*(rowH+gap)-gap+SETTINGS_BOTTOM>room){gap=2;rowH=fmax(24,floor((room-SETTINGS_TOP-SETTINGS_BOTTOM+gap)/n-gap));}
  CGFloat h=SETTINGS_TOP+n*(rowH+gap)-gap+SETTINGS_BOTTOM;
  if(!(self=[super initWithFrame:NSMakeRect(0,0,SETTINGS_W,h)]))return nil;
- self.rows=rows;self.appearance=[NSAppearance appearanceNamed:NSAppearanceNameDarkAqua];
+ self.rows=rows;self.controllerTargets=[NSMutableArray array];self.controllerIndex=0;self.appearance=[NSAppearance appearanceNamed:NSAppearanceNameDarkAqua];
  self.wantsLayer=YES;self.layer.backgroundColor=[NSColor colorWithCalibratedRed:0.10 green:0.16 blue:0.20 alpha:0.9].CGColor;
  self.layer.cornerRadius=12;self.layer.borderWidth=1;self.layer.borderColor=[NSColor colorWithCalibratedWhite:1 alpha:0.12].CGColor;
  self.autoresizingMask=NSViewMinXMargin|NSViewMaxXMargin|NSViewMinYMargin|NSViewMaxYMargin;
@@ -230,21 +241,80 @@ enum { SETTINGS_W = 520, SETTINGS_ROW_H = 34, SETTINGS_GAP = 6, SETTINGS_TOP = 5
   if(!r.choices){NSSwitch *s=[NSSwitch new];[s sizeToFit];s.frame=NSMakeRect(rw-12-s.frame.size.width,(rowH-s.frame.size.height)/2,s.frame.size.width,s.frame.size.height);r.control=s;}
   else{NSPopUpButton *p=[[NSPopUpButton alloc] initWithFrame:NSMakeRect(rw-SETTINGS_POP_W-8,floor((rowH-26)/2),SETTINGS_POP_W,26) pullsDown:NO];[p addItemsWithTitles:r.choices];
    p.enabled=r.set!=nil;r.control=p;}
-  r.control.refusesFirstResponder=YES;r.control.target=r;r.control.action=@selector(changed:);[band addSubview:r.control];
+  r.control.refusesFirstResponder=YES;r.control.target=r;r.control.action=@selector(changed:);[band addSubview:r.control];[self.controllerTargets addObject:band];
  }
  CGFloat bw=(SETTINGS_W-28-10)/2;
  NSButton *contrib=[NSButton buttonWithTitle:settings_text("贡献着色器和管线","Contribute shaders and pipelines") target:self action:@selector(contribute:)];
- contrib.frame=NSMakeRect(14,40,bw,30);contrib.refusesFirstResponder=YES;[self addSubview:contrib];
+ contrib.frame=NSMakeRect(14,40,bw,30);contrib.refusesFirstResponder=YES;[self addSubview:contrib];[self.controllerTargets addObject:contrib];
  NSButton *star=[NSButton buttonWithTitle:settings_text("⭐ 给作者点赞","⭐ Star the project") target:self action:@selector(star:)];
- star.frame=NSMakeRect(14+bw+10,40,bw,30);star.refusesFirstResponder=YES;[self addSubview:star];
+ star.frame=NSMakeRect(14+bw+10,40,bw,30);star.refusesFirstResponder=YES;[self addSubview:star];[self.controllerTargets addObject:star];
  NSTextField *hint=[NSTextField labelWithString:settings_text("按 1 或 Esc 关闭 · 打开时键盘和鼠标不会传给游戏","1 or Esc closes it · keyboard and mouse do not reach the game while it is open")];
  hint.font=[NSFont systemFontOfSize:11];hint.textColor=[NSColor colorWithCalibratedWhite:0.7 alpha:1];hint.alignment=NSTextAlignmentCenter;
- hint.lineBreakMode=NSLineBreakByTruncatingMiddle;hint.frame=NSMakeRect(10,12,SETTINGS_W-20,16);[self addSubview:hint];self.hint=hint;
- [self refresh];
+ hint.lineBreakMode=NSLineBreakByTruncatingMiddle;hint.frame=NSMakeRect(10,5,SETTINGS_W-20,32);hint.maximumNumberOfLines=2;[self addSubview:hint];self.hint=hint;
+ [self refresh];[self controllerHint];[self controllerHighlight];
  __weak TOTKSettingsPanel *weak=self;self.timer=[NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *t){(void)t;if(!weak.hidden)[weak refresh];}];
  return self;
 }
 -(void)refresh{for(TOTKSettingRow *r in self.rows)[r refresh];}
+-(BOOL)controllerEnabled:(NSInteger)i{
+ if(i<0||i>=(NSInteger)self.controllerTargets.count)return NO;
+ if(i<(NSInteger)self.rows.count){TOTKSettingRow *r=self.rows[i];return r.set!=nil&&r.control.enabled;}
+ return ((NSButton *)self.controllerTargets[i]).enabled;
+}
+-(void)controllerHighlight{
+ if(![self controllerEnabled:self.controllerIndex]){
+  for(NSUInteger i=0;i<self.controllerTargets.count;i++)if([self controllerEnabled:i]){self.controllerIndex=i;break;}
+ }
+ for(NSUInteger i=0;i<self.controllerTargets.count;i++){
+  NSView *v=self.controllerTargets[i];v.wantsLayer=YES;v.layer.cornerRadius=6;
+  v.layer.borderWidth=(NSInteger)i==self.controllerIndex?2:0;
+  v.layer.borderColor=[NSColor colorWithCalibratedRed:0.7 green:0.95 blue:0.8 alpha:1].CGColor;
+ }
+}
+-(void)controllerHint{
+ int detected=-1,type=runtime_gamepad_type(&detected);if(!type)type=detected;
+ BOOL ps=type==GAMEPAD_TYPE_PLAYSTATION,sw=type==GAMEPAD_TYPE_SWITCH;
+ NSString *select=ps?@"×":@"A",*cancel=ps?@"○":@"B";
+ NSString *chord=ps?@"L2 + R2 + L3":sw?@"ZL + ZR + L stick":@"LT + RT + LS";
+ self.hint.stringValue=[NSString stringWithFormat:settings_text("↑↓ Navigate · ←→ Change · %@ Select · %@ Close\nHold %@ for 1 s: open / close · 1 / Esc", "↑↓ Navigate · ←→ Change · %@ Select · %@ Close\nHold %@ for 1 s: open / close · 1 / Esc"),select,cancel,chord];
+}
+-(void)controllerMove:(int)step{
+ NSInteger count=self.controllerTargets.count;
+ for(NSInteger n=0;n<count;n++){
+  self.controllerIndex=(self.controllerIndex+step+count)%count;
+  if([self controllerEnabled:self.controllerIndex])break;
+ }
+ [self controllerHighlight];[self controllerHint];
+}
+-(void)controllerChange:(int)step select:(BOOL)select{
+ NSInteger i=self.controllerIndex;if(![self controllerEnabled:i])return;
+ if(i>=(NSInteger)self.rows.count){if(select)[(NSButton *)self.controllerTargets[i] performClick:nil];return;}
+ TOTKSettingRow *r=self.rows[i];
+ if(r.choices){
+  NSPopUpButton *p=(NSPopUpButton *)r.control;NSInteger n=p.numberOfItems;if(n<2)return;
+  NSInteger index=p.indexOfSelectedItem;if(index<0)index=0;
+  [p selectItemAtIndex:(index+step+n)%n];
+ }else{
+  NSSwitch *s=(NSSwitch *)r.control;
+  s.state=select?(s.state==NSControlStateValueOn?NSControlStateValueOff:NSControlStateValueOn):(step>0?NSControlStateValueOn:NSControlStateValueOff);
+ }
+ [r changed:r.control];[self controllerHighlight];[self controllerHint];
+}
+-(void)controllerPad:(RuntimeGamepadState)pad time:(double)now active:(BOOL)active{
+ if(!active||!pad.connected){self.controllerArmed=NO;self.previousButtons=0;self.previousDirection=0;return;}
+ int direction=(pad.buttons&(1ull<<13)||pad.ly>16000)?1:(pad.buttons&(1ull<<15)||pad.ly < -16000)?2:
+  (pad.buttons&(1ull<<12)||pad.lx < -16000)?3:(pad.buttons&(1ull<<14)||pad.lx>16000)?4:0;
+ if(!self.controllerArmed){if(!pad.buttons&&!direction)self.controllerArmed=YES;self.previousButtons=pad.buttons;return;}
+ uint64_t edges=pad.buttons&~self.previousButtons;self.previousButtons=pad.buttons;
+ int detected=-1,type=runtime_gamepad_type(&detected);if(!type)type=detected;
+ if(edges&(type==GAMEPAD_TYPE_SWITCH?1u:2u)){settings_show(0);return;}
+ if(direction&&(direction!=self.previousDirection||now>=self.repeatAt)){
+  if(direction<=2)[self controllerMove:direction==1?-1:1];else [self controllerChange:direction==3?-1:1 select:NO];
+  self.repeatAt=now+(direction==self.previousDirection?0.14:0.4);
+ }
+ self.previousDirection=direction;
+ if(edges&(type==GAMEPAD_TYPE_SWITCH?2u:1u))[self controllerChange:1 select:YES];
+}
 -(void)close:(id)sender{(void)sender;settings_show(0);}
 /* The shaders and pipelines this game met that the shared list lacks (totk_shader_contrib.h): sent with gh off the main
    thread, the issue then opened; without gh (or when it fails) the GitHub form opens and Finder shows the file to drag in. */
@@ -285,15 +355,41 @@ static TOTKSettingsPanel *settingsPanel;
 static void settings_refresh_all(void) { [settingsPanel refresh]; }
 static void settings_show(int open) {   /* main thread */
  open=!!open;
- if(!window||open==settingsOpen)return;
+ if(!window||open==settingsOpen||(open&&textEntryOpen))return;
  /* Made again at every opening: what the game offers (aspect ratio, resolution) is known only once its code is in. */
  if(open){[settingsPanel.timer invalidate];[settingsPanel removeFromSuperview];settingsPanel=[TOTKSettingsPanel new];[window.contentView addSubview:settingsPanel];}
  settingsOpen=open;
+ runtime_gamepad_text_capture(open);
  if(open){runtime_input_clear();[settingsPanel center];[settingsPanel refresh];[(TOTKInputView *)window.contentView setCursorAutoHideEnabled:NO];}
  else{[window makeFirstResponder:window.contentView];
   if(window.isKeyWindow&&(window.styleMask&NSWindowStyleMaskFullScreen))[(TOTKInputView *)window.contentView setCursorAutoHideEnabled:YES];}
  settingsPanel.hidden=!open;
  front_mouse_update();
  fprintf(stderr,"[totk] settings panel %s\n",open?"open":"closed");
+ if(totk_sr_settings)totk_sr_settings(open);   /* TOTK_STATE_REPORTING: the game gets no input while it is open */
+}
+/* A single window-lifetime timer owns settings input. It never consumes the text keyboard's edges. */
+static NSTimer *settingsControllerTimer;
+static BOOL settingsControllerReady;
+static void settings_controller_tick(RuntimeGamepadState pad,BOOL requested,BOOL active,double now){
+ if(textEntryOpen||!active||!pad.connected){
+  settingsControllerReady=NO;
+  if(settingsOpen)[settingsPanel controllerPad:pad time:now active:NO];
+  return;
+ }
+ if(!settingsControllerReady){if(!pad.buttons&&!pad.lx&&!pad.ly)settingsControllerReady=YES;return;}
+ if(requested){settings_show(!settingsOpen);return;}
+ if(settingsOpen)[settingsPanel controllerPad:pad time:now active:YES];
+}
+static void settings_controller_start(void){
+ if(settingsControllerTimer)return;
+ runtime_gamepad_settings_enable(1);
+ settingsControllerTimer=[NSTimer timerWithTimeInterval:1.0/60 repeats:YES block:^(NSTimer *t){
+  (void)t;BOOL requested=runtime_gamepad_settings_requested();
+  if(textEntryOpen){settingsControllerReady=NO;return;}
+  RuntimeGamepadState pad;runtime_gamepad_text_read(&pad);
+  settings_controller_tick(pad,requested,window.isKeyWindow&&NSApp.active,runtime_now_ns()/1e9);
+ }];
+ [NSRunLoop.mainRunLoop addTimer:settingsControllerTimer forMode:NSRunLoopCommonModes];
 }
 void runtime_settings_toggle(void){dispatch_async(dispatch_get_main_queue(), ^{settings_show(!settingsOpen);});}

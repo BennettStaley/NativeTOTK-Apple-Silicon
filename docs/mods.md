@@ -132,6 +132,31 @@ carries on, its code half is in the app, and its data half takes effect once the
 (`--install-mod-romfs`, or by hand). With `--update` the patch is merged into the updated module, which is the one
 the app runs.
 
+## Keyboard key icons
+
+When no controller is connected at start and `mods/<version>-keyboard/manifest.tsv` exists, the launcher points
+`TOTK_ROMFS_MODS` at that folder instead, so the prompts show the Mac keyboard's keys while you play on the keyboard:
+
+```sh
+python3.14 scripts/make_button_icons.py "$HOME/Library/Application Support/MacNativeGames/TOTK/mods/v0-keyboard" \
+  --app "Tears of the Kingdom.app" --version v0 --style azerty   # or --style keyboard for a US layout
+```
+
+The choice is made once per start: connecting a controller later keeps the keyboard icons until the next start.
+
+## Code patches at launch (`TOTK_PCHTXT`, Mac)
+
+A main `.pchtxt` can also be applied when the game starts, without a build:
+
+```bash
+open --env TOTK_PCHTXT="/path/to/mods.pchtxt" "/path/to/Tears of the Kingdom.app"
+```
+
+It is read the way `--mod` reads it, and its `@nsobid` must match main's build ID, which a built app keeps in
+`extracted/<version>/exefs/main.build-id`. The rewriter doesn't see these bytes, so a patch that makes system calls,
+uses the thread-pointer or counter registers, or uses x18 still needs a build with `--mod`. A line on a site the app
+patches itself stops the start.
+
 ## The older layout
 
 Before the mods folder, the port loaded one folder, `mods/<v0|v112|v121|v143>`, with a `manifest.tsv` written by

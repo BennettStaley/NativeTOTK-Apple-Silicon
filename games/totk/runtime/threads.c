@@ -1282,7 +1282,14 @@ static void dump_threads(unsigned secs) {
             }
     }
 }
-void runtime_dump_threads(void) { dump_threads(0); }   // TOTK_INPUT_FILE "threads"
+void runtime_dump_threads(void) { dump_threads(0); }
+/* runtime/mem_scan.h: the mach ports of the running guest threads, so a diagnostic watchpoint is armed only where the
+   game's code runs (2026-10-27: armed in every thread, a read watch closed the game from a host thread). */
+int runtime_guest_thread_ports(unsigned *out, int max) {
+    int n = 0; pthread_mutex_lock(&G);
+    for (thr_t *t = g_all; t && n < max; t = t->all) if (t->started && !t->exited && t->mport) out[n++] = t->mport;
+    pthread_mutex_unlock(&G); return n;
+}   // TOTK_INPUT_FILE "threads"
 __attribute__((constructor)) static void dump_init(void) {
     const char *c = getenv("TOTK_LISTCHECK");
     if (c) { pthread_t th; pthread_create(&th, NULL, list_check, (void *)(uintptr_t)strtoull(c, NULL, 0)); pthread_detach(th); }

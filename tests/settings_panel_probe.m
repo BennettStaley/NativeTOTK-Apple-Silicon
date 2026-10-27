@@ -31,6 +31,13 @@ void runtime_mouse_move(double dx, double dy) { (void)dx; (void)dy; }
 void runtime_mouse_button(int button, int down) { (void)button; (void)down; }
 void runtime_mouse_release(void) {}
 void runtime_gamepad_clear(void) {}
+static char savedName[64], savedWord[16];
+void runtime_setting_save(const char *name, const char *word, const char *what) {
+    (void)what; snprintf(savedName, sizeof savedName, "%s", name); snprintf(savedWord, sizeof savedWord, "%s", word);
+}
+int runtime_setting_word(const char *name, char *word, size_t size) { (void)name; (void)word; (void)size; return 0; }
+static int fakeSettingsCapture;
+void runtime_gamepad_text_capture(int on) { fakeSettingsCapture = !!on; }
 /* runtime/hid_feedback.c's and gamepad_feedback.m's rumble, strength and gyro switches without a controller. */
 static int fakeFeedback[2] = {1, 1}, fakeFeedbackLocked[2], fakeFeedbackPresent[2] = {1, 1}, fakeGainLocked;
 static float fakeGain = 1;
@@ -110,9 +117,14 @@ int main(int argc, const char **argv) { @autoreleasepool {
 
     /* Key 1 opens it; a held key acts once. */
     runtime_input_key_synthetic(18, 1); runtime_input_key_synthetic(18, 1); tick(); runtime_input_key_synthetic(18, 0); tick();
-    assert(settingsOpen && settingsPanel && !settingsPanel.hidden && settingsPanel.superview == window.contentView);
+    assert(settingsOpen && fakeSettingsCapture && settingsPanel && !settingsPanel.hidden && settingsPanel.superview == window.contentView);
     assert(NSContainsRect(window.contentView.bounds, settingsPanel.frame));
-    assert(settingsPanel.rows.count == 12);
+    assert(settingsPanel.rows.count == 13);
+
+    /* FPS graph: a switch, off at start, kept in fps-graph.txt. */
+    assert(!switched(@"FPS graph"));
+    flip(@"FPS graph", YES); assert(fpsGraphEnabled && !strcmp(savedName, "fps-graph.txt") && !strcmp(savedWord, "on"));
+    flip(@"FPS graph", NO); assert(!fpsGraphEnabled && !strcmp(savedWord, "off"));
 
     /* Overlay: all -> FPS only -> off; the corner box follows. */
     hud_publish(HUD_FPS, "FPS 60  2560x1440", 0); hud_publish(HUD_SHADER, "New shaders 3 / total 9", 0);

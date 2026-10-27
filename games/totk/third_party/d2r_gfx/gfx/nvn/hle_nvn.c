@@ -21,6 +21,7 @@
 #include "nvn_dirty.h"
 #include "totk_vpool.h"
 #include "totk_lifelog.h"
+#include "totk_state_report.h"
 #include <mach/mach_time.h>
 #include <setjmp.h>
 #include <signal.h>
@@ -1364,7 +1365,10 @@ static int inline_bulk_on(void) {
     int v = atomic_load_explicit(&g_inline_bulk_on, memory_order_relaxed);
     if (v < 0) {
         const char *e = getenv("TOTK_INLINE_BULK"); int expected = -1;
-        atomic_compare_exchange_strong(&g_inline_bulk_on, &expected, e ? strcmp(e, "0") != 0 : !TOTK_BOTW_BUILD);   // default on since 2026-10-21 (TOTK; Breath of the Wild =1); TOTK_INLINE_BULK=0 off
+        /* Default on since 2026-10-21 (TOTK) and 2026-10-27 (Breath of the Wild 1.6.0, Hebra, same-run flag A/B: frame
+           9.09 / 9.14 -> 8.96 / 8.98 ms and 9.30 / 9.36 -> 9.08 / 9.10 ms; the record-by-record copy was 9% of its main
+           thread). TOTK_INLINE_BULK=0 off. */
+        atomic_compare_exchange_strong(&g_inline_bulk_on, &expected, e ? strcmp(e, "0") != 0 : 1);
         v = atomic_load_explicit(&g_inline_bulk_on, memory_order_relaxed);
     }
     return v;
@@ -2322,7 +2326,7 @@ static win_t *g_xp_win; static uint64_t g_xp_job[4];   // job number of each swa
 static _Atomic uint64_t g_x_drains, g_x_drain_ns;
 static int async_replay(void) {
     static int v = -1;
-    if (v < 0) { const char *e = getenv("TOTK_ASYNC_REPLAY"); v = e ? atoi(e) > 0 : TARGET_OS_OSX && !TOTK_BOTW_BUILD;   /* Breath of the Wild: not measured with it yet, =1 turns it on */ if (v) LOG("[nvn] translation thread: submits and present queueing are replayed on a separate thread (TOTK_ASYNC_REPLAY=0 turns it off)"); }
+    if (v < 0) { const char *e = getenv("TOTK_ASYNC_REPLAY"); v = e ? atoi(e) > 0 : TARGET_OS_OSX && !TOTK_BOTW_BUILD;   /* Breath of the Wild: off, 2026-10-27 1.6.0 Hebra 9.30 / 9.08 ms against 9.09 / 8.96 without it, no gain; =1 turns it on */ if (v) LOG("[nvn] translation thread: submits and present queueing are replayed on a separate thread (TOTK_ASYNC_REPLAY=0 turns it off)"); }
     return v;
 }
 static void submit_exec(int n, const uint64_t *h, void *ucap);
@@ -2789,6 +2793,12 @@ static void dump_frame(void) {
     if (g_frame <= (uint64_t)nframes) LOG("[nvn] %s %llu: %u functions %llu calls |%s", g_frame ? "frame" : "init", g_frame, nfn, total, line);
     else if (g_frame % 300 == 0) LOG("[nvn] frame %llu: %u functions %llu calls", g_frame, nfn, total);
     g_frame++; g_frame_pub = g_frame; cs_dump();
+    /* TOTK_BENCH_FRAMES=<file> (benchmark, 2026-10-20): "<frame> <ns>" at every game frame, on the clock the survey
+       reports use (scripts/bench_run.py cuts the run into its fly segments by those frame numbers). */
+    { static FILE *bf; static int on = -1;
+      if (on < 0) { const char *e = getenv("TOTK_BENCH_FRAMES"); on = e && *e && (bf = fopen(e, "w")) != NULL; }
+      if (on) { fprintf(bf, "%llu %llu\n", (unsigned long long)g_frame, (unsigned long long)clock_gettime_nsec_np(CLOCK_UPTIME_RAW));
+                if (!(g_frame % 60)) fflush(bf); } }
     { void runtime_watch_tick(uint64_t); runtime_watch_tick(g_frame); }   // TOTK diagnostic write watchpoint (TOTK_WATCH_ADDR)
     // Every 300 frames read resident memory and hand it to the graphics layer to print the memory readout line (mtl_mem_stat, low frequency, capped). Memory watchdog: when resident memory exceeds the cap, log a failure and exit on its own. On by default only on the Mac host (24 GB: runaway host memory
     // drags the whole machine into a kernel panic, which happened twice with other programs on the same machine), or set for tests with DM_MEM_CAP_GB=<integer>; the player's iOS app has no cap (exiting before the system kills it is pointless and only adds another kind of crash)
@@ -3233,6 +3243,18 @@ static uint64_t present_period(const win_t *o) {
     if (itv > 1 && per > floor30) per = one > floor30 ? one : floor30;
     return per;
 }
+/* TOTK_STATE_REPORTING (totk_state_report.m): this frame's cap as the pacing applies it (present_ticks / present_period):
+   a held rate and why (and whether our own clock paces it, mfx_own_clock), else the uncapped ceiling (divided by the
+   game's present interval unless that is ignored), else the game's interval at the display's rate. Game thread. */
+static void sr_frame(const win_t *o) {
+    int hold = game_hold_fps(), src, cap = hold;
+    if (hold) src = runtime_game_fps_limit() == 30 ? SR_CAP_MOVIE : phone_holds_30() ? SR_CAP_PHONE : mfx_hold_fps(mfx_enabled()) ? SR_CAP_INTERP : SR_CAP_LOCK;
+    else if (!g_hz) src = SR_CAP_NONE;
+    else if (g_display_mode) { src = SR_CAP_DISPLAY; cap = g_hz; }
+    else if (uncapped_now()) { cap = g_hz; src = !dm_detclock_enabled() && uncapped_interval_on() ? SR_CAP_UNCAPPED : SR_CAP_UNCAPPED_INTERVAL; }
+    else { cap = g_hz; src = SR_CAP_GAME; }
+    totk_sr_frame(cap, src, hold && mfx_own_clock(), g_paced_hz, present_ticks(o));
+}
 /* Exercise production policy, including the shrine's interval=2 and the
    legacy 30 FPS path. No sleep, present or GPU allocation is involved. */
 void dm_nvn_probe_present_interval(void) {
@@ -3516,6 +3538,7 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
         LOG("[nvn] translation thread to frame %llu: %llu drain waits / %.1f ms (last 300 frames), %llu items queued", (unsigned long long)g_frame, (unsigned long long)d, dn / 1e6, (unsigned long long)q); }
     // Real-device semantics: present only enqueues and returns immediately; this frame's display time is scheduled by the pacer, and the texture can be acquired again only at "display time + one period" (blocking in AcquireTexture)
     uint64_t period = present_period(o), now = dm_detclock_enabled() ? guest_ns() : now_ns();
+    if (totk_sr_on()) sr_frame(o);
     nvn_pacer pc = {o->pace};
     uint64_t slot = now + nvn_pace(&pc, now, period);
     o->pace = pc.target;

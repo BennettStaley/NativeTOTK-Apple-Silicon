@@ -8,6 +8,9 @@
 // If the game is already running, the launcher only brings it to the front.
 #import <AppKit/AppKit.h>
 #include <sys/sysctl.h>
+#import <GameController/GameController.h>
+#include <IOKit/hid/IOHIDManager.h>
+#include <IOKit/hid/IOHIDUsageTables.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <libproc.h>
@@ -30,6 +33,26 @@ static void show_error(NSString *detail) {
     alert.messageText = @"The game could not start";
     alert.informativeText = detail;
     [alert runModal];
+}
+
+/* Whether a game controller is connected: a HID joystick / gamepad (DualSense, Pro Controller, Xbox over Bluetooth),
+   or one the GameController framework adopts (Xbox over USB), which it reports a moment after the first run loop turns. */
+static BOOL controller_connected(void) {
+    IOHIDManagerRef hid = IOHIDManagerCreate(kCFAllocatorDefault, kIOHIDOptionsTypeNone);
+    NSMutableArray *matching = [NSMutableArray array];
+    for (NSNumber *usage in @[@(kHIDUsage_GD_Joystick), @(kHIDUsage_GD_GamePad), @(kHIDUsage_GD_MultiAxisController)])
+        [matching addObject:@{@kIOHIDDeviceUsagePageKey: @(kHIDPage_GenericDesktop), @kIOHIDDeviceUsageKey: usage}];
+    IOHIDManagerSetDeviceMatchingMultiple(hid, (__bridge CFArrayRef)matching);
+    CFSetRef devices = IOHIDManagerCopyDevices(hid);
+    BOOL found = devices && CFSetGetCount(devices) > 0;
+    if (devices) CFRelease(devices);
+    CFRelease(hid);
+    for (int i = 0; !found && i < 10; i++) {
+        for (GCController *controller in GCController.controllers)
+            if (controller.extendedGamepad) found = YES;
+        if (!found) [NSRunLoop.mainRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.05]];
+    }
+    return found;
 }
 
 static NSDictionary<NSString *, NSString *> *kv_read(NSString *path) {
@@ -360,7 +383,15 @@ int main(int argc, char **argv) {
         /* Player mods (runtime/mods.h): one folder per mod in <data>/mods, mods.txt for the order; a TOTK_MODS_DIR already
            set wins (a test's own folder). The older single folder <data>/mods/<version> with its manifest.tsv still loads. */
         setenv("TOTK_MODS_DIR", [data stringByAppendingPathComponent:@"mods"].fileSystemRepresentation, 0);
-        setenv("TOTK_ROMFS_MODS", [data stringByAppendingPathComponent:@"mods/" TOTK_GAME_DIR].fileSystemRepresentation, 0);
+        /* With no controller connected at start, <data>/mods/<version>-keyboard takes the older folder's place when it holds a
+           manifest (keyboard key icons in the prompts: scripts/make_button_icons.py --style keyboard or azerty). The fonts
+           are read once, so it holds for the session. */
+        NSString *mods = [data stringByAppendingPathComponent:@"mods/" TOTK_GAME_DIR];
+        NSString *keyboardMods = [mods stringByAppendingString:@"-keyboard"];
+        if (!getenv("TOTK_ROMFS_MODS") && [NSFileManager.defaultManager fileExistsAtPath:[keyboardMods stringByAppendingPathComponent:@"manifest.tsv"]] &&
+            !controller_connected())
+            mods = keyboardMods;
+        setenv("TOTK_ROMFS_MODS", mods.fileSystemRepresentation, 0);
         /* Cheats (runtime/cheat_files.h): <build ID>.txt files in <data>/cheats, read at every start; a test's own folder wins. */
         setenv("TOTK_CHEATS_DIR", [data stringByAppendingPathComponent:@"cheats"].fileSystemRepresentation, 0);
         /* The community cheat list the game downloads (runtime/cheat_db_fetch.h): <data>/cheats-db; a test's own folder wins. */

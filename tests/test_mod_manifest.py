@@ -208,6 +208,22 @@ class MergeWithBuildPatch(unittest.TestCase):
         self.assertEqual(again.returncode, 0, again.stderr)
         self.assertEqual((self.mod/COMMON).read_bytes(), merged)
 
+    @unittest.skipUnless(importlib.util.find_spec('fontTools'), 'needs fontTools')
+    def test_button_icons_merge_the_common_archive_too(self):
+        # make_button_icons.py redraws the button guide in this archive; its manifest used to name the RomFS original,
+        # and the game stopped at start: two overlays replaced the same file
+        import make_button_icons
+        self.put_mod({**self.members, 'timg/__Combined.bntx': b'keyboard textures' * 40})
+        index = make_mod_manifest.read_index(self.romfs/'runtime-index.bin')
+        merged, found = make_button_icons.write_mod_manifest(self.mod, self.romfs, index)
+        self.assertEqual(list(merged), [COMMON])
+        data = (self.mod/COMMON).read_bytes()
+        self.assertEqual(self.member(data, 'timg/__Combined.bntx'), b'keyboard textures' * 40)
+        for name in CAPTURE:
+            self.assertEqual(self.member(data, name), self.member(self.build, name))
+        self.assertEqual(found.lines, ['\t'.join([COMMON, str(len(data)), hashlib.sha256(data).hexdigest(),
+                                                  hashlib.sha256(self.build).hexdigest()])])
+
     def test_mod_that_changes_a_patched_member_is_refused(self):
         changed = bflan(CAPTURE['anim/AutoBuilder_00_In.bflan'], frame=0.5)
         self.put_mod({**self.members, 'anim/AutoBuilder_00_In.bflan': changed})

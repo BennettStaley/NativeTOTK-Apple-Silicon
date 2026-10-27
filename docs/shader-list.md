@@ -184,8 +184,11 @@ python3 games/totk/scripts/shader_list.py merge games/totk/assets/shader_list.ts
 python3 games/totk/scripts/shader_list.py stats games/totk/assets/shader_list.tsv
 ```
 
-- **iPhone / iPad:** `games/totk/ios/tools/fill_shaders.py` translates what a device missed. It also merges those
-  variants into the list automatically.
+- **iPhone / iPad:** `games/totk/ios/tools/fill_shaders.py` translates what a device missed. Like the Mac, it puts the
+  new variants in the contribution file, not in the shipped list: add `--update-list` when you want the next build from
+  this tree to carry them too. For Breath of the Wild it checks Breath of the Wild's own list (`--game botw`, the default
+  for a `.botw` bundle identifier), and `--from-cache <rt-folder> --seed <seed>` packs the shaders the Mac's own Breath
+  of the Wild cache has and the app lacks, already translated, for the device.
 - **Pipelines:** merging a cache folder adds only its `V` rows. A cache's `pso_collected.tsv` holds every pipeline ever
   built, tens of thousands of them. To add pipelines, name a `pso_user.tsv` or `pso_collected.tsv` file explicitly.
 - **Title rows:** record them with the warm-up off, then add them with `merge --title`.

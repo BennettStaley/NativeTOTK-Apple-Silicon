@@ -230,6 +230,19 @@ def build_patches(romfs):
     return folder, patches
 
 
+def merge_build_patches(mod, romfs, index):
+    """Merge each mod file the build's own overlay also replaces with the build's edit (merge_build_patch): path -> the
+    SHA-256 of the build's file, the `merged` of manifest() and write_manifest(). Raises ValueError when one can't be
+    merged. Tools that write a mod's files (this script, make_button_icons.py) call it before writing the manifest."""
+    folder, patches = build_patches(romfs)
+    merged = {}
+    for name, build_sha in patches.items():
+        if name in index and ((mod/name).is_file() or (mod/(name + KEPT)).is_file()) and \
+                merge_build_patch(mod, name, romfs, index, folder, build_sha):
+            merged[name] = build_sha
+    return merged
+
+
 def changes_original(name, mod, romfs, index):
     """Whether the mod's own copy of `name` differs from the RomFS original - true when a merge would change something.
     Read-only, for --check: it says what would be merged without writing the merged archive."""
@@ -335,23 +348,20 @@ def main():
     # A file the build's own overlay replaces is merged with the build's edit rather than left out (issue #73). --check
     # writes nothing, so there it only says what it would merge, and counts the file as one the mod changes.
     index = read_index(romfs/'runtime-index.bin')
-    folder, patches = build_patches(romfs)
-    merged = {}
-    for name, build_sha in patches.items():
-        if name not in index or not ((args.mod/name).is_file() or (args.mod/(name + KEPT)).is_file()):
-            continue
-        if args.check:
-            if changes_original(name, args.mod, romfs, index):
+    if args.check:
+        merged = {}
+        for name, build_sha in build_patches(romfs)[1].items():
+            if name in index and ((args.mod/name).is_file() or (args.mod/(name + KEPT)).is_file()) and \
+                    changes_original(name, args.mod, romfs, index):
                 merged[name] = build_sha
                 print(f'would merge with the build\'s patch: {name} (nothing written: --check)')
-            continue
+    else:
         try:
-            if not merge_build_patch(args.mod, name, romfs, index, folder, build_sha):
-                continue
+            merged = merge_build_patches(args.mod, romfs, index)
         except ValueError as error:
             sys.exit(f'nothing written: {error}')
-        merged[name] = build_sha
-        print(f'merged with the build\'s patch: {name} (the mod\'s own file: {name}{KEPT})')
+        for name in merged:
+            print(f'merged with the build\'s patch: {name} (the mod\'s own file: {name}{KEPT})')
     found = manifest(args.mod, romfs, args.exclude, replaced, merged)
     for name in found.same:
         print(f'left out (same as the original): {name}')

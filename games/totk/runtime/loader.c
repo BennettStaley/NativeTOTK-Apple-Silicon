@@ -446,6 +446,9 @@ static int stale_target_reference(int num,siginfo_t *info,ucontext_t *u){
 #endif
 static void crash(int num,siginfo_t *info,void *context) {
  ucontext_t *u=context;
+#if !TARGET_OS_IPHONE
+ if(num==SIGTRAP){extern int runtime_mem_scan_trap(void *);if(runtime_mem_scan_trap(context))return;}   /* mscan watch (diagnostic, runtime/mem_scan.h) */
+#endif
 #ifdef GAME_BOTW
  if(num==SIGTRAP){extern int botw_jq_hook(void *);if(botw_jq_hook(context))return;}   /* TOTK_JQ_CHECK diagnostics (game_patches_botw.c) */
 #endif

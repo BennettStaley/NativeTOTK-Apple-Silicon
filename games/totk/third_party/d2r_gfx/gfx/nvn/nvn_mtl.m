@@ -25,12 +25,14 @@
 #include "totk_mfx_up.h"
 #include "totk_taa.h"
 #include "totk_sysload.h"
+#include "totk_state_report.h"   // TOTK_STATE_REPORTING: the game's states for Apple's performance tools (macOS 27)
 /* TOTK_MFX_UPSCALE: for the one compose draw that samples the smaller scene, the scene texture and its MetalFX upscale
    (mfxup_draw before the draw, encode_args swaps the binding). */
 static __strong id<MTLTexture> g_mfxup_src, g_mfxup_out; static __unsafe_unretained id g_mfxup_sh;
 static _Atomic uint64_t g_mfxup_last;   // game frame of the last MetalFX upscale (the FPS box shows " MFX" while recent)
 static _Atomic uint64_t g_mfxi_last;    // game frame of the last interpolated frame shown (the FPS box shows "+<generated>" while recent)
 static uint64_t g_gen_shown;            // interpolated frames handed to the screen (present threads)
+static _Atomic uint64_t g_taa_last;     // game frame of the last edge smoothing (TAA), kept only for the state reports
 #include "../tex/nvn_bcdec.h"
 
 #include "nvn_dirty.h"
@@ -769,7 +771,7 @@ static _Atomic uint64_t g_reg_gen = 1;   // Change generation of memory pool / t
    kIOReturnNoMemory. A zero-copy buffer makes the whole range resident, so ranges with inaccessible pages (sparse
    virtual pools) or very large ranges are refused here, with details, instead of being handed to the driver. */
 #include "mach_vm_compat.h"
-/* 1 GiB, or TOTK_POOL_BUFFER_MAX_MB (at most 2048): the launcher allows 2 GiB only for a 3D world above 1440p (settings:
+/* 1 GiB; 4 GiB with TOTK_DRAM_8GB (the 8 GB pool for big texture packs, whose TextureHeap pool is ~3.8 GiB); or TOTK_POOL_BUFFER_MAX_MB (at most 2048): the launcher allows 2 GiB only for a 3D world above 1440p (settings:
    Maximum render resolution), whose texture heap passes 1 GiB. That heap holds textures, which are separate Metal textures
    here, so its zero-copy buffer is not made resident unless the GPU reads a buffer address in it (pool_res logs it). */
 static uint64_t pool_buffer_max(void) {
@@ -777,6 +779,7 @@ static uint64_t pool_buffer_max(void) {
     if (!v) {
         const char *e = getenv("TOTK_POOL_BUFFER_MAX_MB"); long mb = e ? atol(e) : 0;
         v = (mb >= 1024 && mb <= 2048 ? (uint64_t)mb : 1024) << 20;
+        { const char *d = getenv("TOTK_DRAM_8GB"); if (d && *d && strcmp(d, "0") && v < (4ull << 30)) v = 4ull << 30; }
         if (v > (1ull << 30)) MLOG("memory pools: zero-copy GPU buffers up to %llu MiB (TOTK_POOL_BUFFER_MAX_MB)", (unsigned long long)(v >> 20));
     }
     return v;
@@ -3057,6 +3060,7 @@ void dm_gfx_set_flag(const char *name, int v) {
     if (!strcmp(name, "mfx_upscale")) { mfxup_set(v < 0 ? !mfxup_enabled() : v); return; }   // TOTK_MFX_UPSCALE at run time (manual key 3 picture mode)
     if (!strcmp(name, "mfx_interp")) { mfx_set(v); return; }
     if (!strcmp(name, "vrr")) { mtl_vrr_set(v); return; }   // TOTK_VRR at run time (setting framerate.vrr)
+    if (!strcmp(name, "state_reporting")) { totk_sr_set(v); return; }   // TOTK_STATE_REPORTING while playing (A/B in one session)
     if (!strcmp(name, "mfx_mv_dyn")) { mfx_set_mv_dyn(v); return; }
     if (!strcmp(name, "mfx_debug_view")) { mfx_debug_view_set(v); return; }   // TOTK_MFX_DEBUG_VIEW at run time (setting graphics.mfx_debug_view)
     if (!strcmp(name, "link_pause")) { void mtl_link_pause(int on); mtl_link_pause(v); MLOG("[flag] link_pause = %d (the display link stops calling back, as when the system stalls it)", v != 0); return; }   // tests the display-link rescue
@@ -9885,6 +9889,7 @@ static void warm_start(void) {
     NSMutableSet<NSString *> *eligible = [NSMutableSet set];
     warm_plan(paths,files,planned_keys,eligible,&total,&shader_total,&pipeline_total);
     if (runtime_warm_progress) runtime_warm_progress(0,total,0,shader_total,0,pipeline_total);
+    totk_sr_warmup(g_par_valid);   // TOTK_STATE_REPORTING: shaderWarmup, archive reused or rebuilt
     g_warm_t0 = bp_now();
     dispatch_queue_attr_t attr = dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INITIATED, 0);   // Not optional background work: it decides whether the pipelines are ready before the player enters a run
     dispatch_queue_t q = dispatch_queue_create("dm.nvn.pso-warm", attr);
@@ -10063,18 +10068,26 @@ static uint64_t zero_bank_gpu(void) { static uint64_t gpu; if (!gpu) gpu = zero_
 // Moving the viewport is not used: the viewport's top edge is the edge of the clip volume, so top-anchored widgets that the host lifts back to the real top of the picture (UI coordinate y negative) would be clipped away entirely.
 // g_ui_moff is set per draw by draw() (0 = no change); the copies live in a ring buffer, and the same address in the same pass is copied only once.
 static double g_ui_moff;
+/* TOTK's map (user 2026-10-26: black bars instead of more map): its picture spans NDC -1.17..1.17 and the clip volume cut
+   it to the middle 16:9 of a wide screen. g_ui_xs (1 = no change) scales clip-space x in the same copy (row 0 of nn::ui2d's
+   projection, c3[0]), and the draw widens its viewport by as much, so all of the picture is drawn, in its proportions. */
+static double g_ui_xs = 1;
+static int ui_mat_on(void) { return g_ui_moff != 0 || g_ui_xs != 1; }
 static __strong id<MTLTexture> g_flash_hdr_source;   // diagnostic: tone-map input (may be reused later in the frame)
 static __strong id<MTLTexture> g_flash_tonemap_target; // diagnostic: tone-map output, before FXAA
 static int ui_mat_ok(void) { const p_bind_buf *u = &S.ubo[0][0]; void *mb; uint64_t mo; return u->addr && u->size >= 64 && u->size <= 4096 && !pend_hits(u->addr, u->size) && mtl_addr(u->addr, u->size, &mb, &mo); }
 static uint64_t ui_mat_patch(const p_bind_buf *u, void *mb, uint64_t mo) {
     enum { RING = 4 << 20 }; static __strong id<MTLBuffer> ring; static uint64_t ring_gpu, la, ls, lp, lg; static size_t at; static double lo;
     if (!ring) { ring = [g_dev newBufferWithLength:RING options:MTLResourceStorageModeShared]; res_add(ring); ring_gpu = ring.gpuAddress; }
-    if (la == u->addr && ls == u->size && lp == g_pass.serial && lo == g_ui_moff) return lg;
+    static double lx = 1;
+    if (la == u->addr && ls == u->size && lp == g_pass.serial && lo == g_ui_moff && lx == g_ui_xs) return lg;
     const uint8_t *src = [(__bridge id<MTLBuffer>)mb contents]; if (!src || u->size < 64 || u->size > 4096) return 0;
     size_t n = (u->size + 255) & ~(size_t)255; if (at + n > RING) at = 0;
     uint8_t *dst = (uint8_t *)ring.contents + at; memcpy(dst, src + mo, u->size);
-    float m[16], o = (float)g_ui_moff; memcpy(m, dst, 64); m[1] += o * m[3]; m[5] += o * m[7]; m[9] += o * m[11]; m[13] += o * m[15]; memcpy(dst, m, 64);
-    la = u->addr; ls = u->size; lp = g_pass.serial; lo = g_ui_moff; lg = ring_gpu + at; at += n;
+    float m[16], o = (float)g_ui_moff; memcpy(m, dst, 64); m[1] += o * m[3]; m[5] += o * m[7]; m[9] += o * m[11]; m[13] += o * m[15];
+    for (int k = 0; k < 4; k++) m[k] *= (float)g_ui_xs;
+    memcpy(dst, m, 64);
+    la = u->addr; ls = u->size; lp = g_pass.serial; lo = g_ui_moff; lx = g_ui_xs; lg = ring_gpu + at; at += n;
     return lg;
 }
 /* TOTK_NAN_TRACE: g_nt_watch is the texture the traced shader read in its watched slot (see nt_watch_after_pass). */
@@ -10098,7 +10111,7 @@ static void driver_cache_check_set(int v) { atomic_store(&g_driver_cache_check, 
 static void driver_cache_set(int v) { atomic_store(&g_driver_cache_on, v != 0); MLOG("[flag] drv_cache = %d", v != 0); }
 static int driver_cache_on(void) {
     int v = atomic_load(&g_driver_cache_on);
-    if (v < 0) { const char *e = getenv("TOTK_DRV_CACHE"); v = e ? strcmp(e, "0") != 0 : !TOTK_BOTW_BUILD; atomic_store(&g_driver_cache_on, v); }   // default on since 2026-10-21 (self-checked over the full benchmark; TOTK, Breath of the Wild =1); TOTK_DRV_CACHE=0 off
+    if (v < 0) { const char *e = getenv("TOTK_DRV_CACHE"); v = e ? strcmp(e, "0") != 0 : !TOTK_BOTW_BUILD; atomic_store(&g_driver_cache_on, v); }   // default on since 2026-10-21 (self-checked over the full benchmark; TOTK; Breath of the Wild off, 2026-10-27 1.6.0 Hebra same-run 8.94 vs 8.96 ms, =1 on); TOTK_DRV_CACHE=0 off
     return v;
 }
 static void driver_bank_fill(uint8_t *d, int bank, int stage) {
@@ -10248,7 +10261,7 @@ static inline __attribute__((always_inline)) void ea_bind_loop(NvShader *sh, int
             const p_bind_buf *u = reg < 16 ? &S.ubo[nvn_stage][reg] : NULL;
             uint64_t clen = u && u->addr ? (bl ? u->size : cb_read_len(sh, i, u->size)) : 0;   // the bytes a private copy takes (TOTK_CB_EXTENT)
             cbc_ent *ce = NULL; cbc_ctx cx; int ce_hit = 0;   // TOTK_CBUF_CACHE (keyed by the copied length too: shaders reading different lengths get different copies)
-            if (cbc && u && u->addr && !(nvn_stage == 0 && reg == 0 && g_ui_moff != 0)) {
+            if (cbc && u && u->addr && !(nvn_stage == 0 && reg == 0 && ui_mat_on())) {
                 cbc_ctx_now(&cx); ce = &g_cbc[cbc_slot(u->addr, clen)];
                 ce_hit = ce->addr == u->addr && ce->size == clen && !memcmp(&ce->cx, &cx, sizeof cx);
                 if (ce_hit) { g_cbc_hits++; if (cbc < 2) { slots[aid] = ce->gpu; continue; } } else g_cbc_misses++;
@@ -10257,8 +10270,8 @@ static inline __attribute__((always_inline)) void ea_bind_loop(NvShader *sh, int
             if (!u || !u->addr || !mtl_gpu_addr(u->addr, 1, &mb, &mo, &gpu)) { RED_ONCE(16, "stage %d cb%d has no uniform buffer bound", nvn_stage, reg); continue; }
             if (diag) use_rec("buf", u->addr, u->size, 0, NULL);
             uint64_t ren = g_nupd ? upd_shadow(u->addr, clen) : 0;   // TOTK: renamed inline updates (see upd_shadow); with TOTK_CB_EXTENT=1 only the bytes the shader reads (cb_extent_scan; the whole binding while the pass dump reads it back)
-            if (ren) { gpu = ren; if (nvn_stage == 0 && reg == 0 && g_ui_moff != 0) RED_ONCE(58, "UI matrix patch reads memory, skipping the uniform copy with inline updates"); }
-            else if (nvn_stage == 0 && reg == 0 && g_ui_moff != 0) { uint64_t pg = ui_mat_patch(u, mb, mo); if (pg) gpu = pg; }
+            if (ren) { gpu = ren; if (nvn_stage == 0 && reg == 0 && ui_mat_on()) RED_ONCE(58, "UI matrix patch reads memory, skipping the uniform copy with inline updates"); }
+            else if (nvn_stage == 0 && reg == 0 && ui_mat_on()) { uint64_t pg = ui_mat_patch(u, mb, mo); if (pg) gpu = pg; }
             else { const usnap_t *sc = usnap_find(u->addr, u->size ? u->size : 1); if (sc) gpu = sc->gpu + (u->addr - sc->lo); }   // TOTK: contents as of the submit call
             if (bl) {
                 PD("B %llu st%d cb reg%d addr=%#llx size=%llu pool=%#llx+%#llx f=%g,%g,%g,%g", g_stat_pass, nvn_stage, reg, (unsigned long long)u->addr, (unsigned long long)u->size,
@@ -12476,6 +12489,70 @@ static int ui_cover_all(double hf) {
         x0 = fminf(x0, nx); x1 = fmaxf(x1, nx); y0 = fminf(y0, ny); y1 = fmaxf(y1, ny); }
     return x0 < 0.002f && x1 > 0.998f && y0 < 0.002f && fabsf(y1 - (float)hf) < 0.002f;
 }
+/* Key 4 / the phone's full screen: a UI quad that covers the whole 16:9 layout, textured or not (a menu's backdrop, the dimming
+   when a panel opens, a transition's curtain), is a background, not a widget: squeezed into the middle 16:9 like the HUD it
+   left black bars at the sides (user 2026-10-25, iPhone: the menus and the weapon / shield selection). It keeps the canvas
+   instead; widgets never cover the whole layout. TOTK_UI_COVER_WIDE=0 squeezes it as before. */
+static int ui_covers_layout(void) {
+    static int off = -1; if (off < 0) { const char *e = getenv("TOTK_UI_COVER_WIDE"); off = e && !strcmp(e, "0"); }
+    if (off || S.vbuf[0].size != 80) return 0;
+    const p_bind_buf *u = &S.ubo[0][0]; void *vb, *mb; uint64_t vo, mo; const uint8_t *vp_, *mp_;
+    if (!u->addr || u->size < 64 || pend_hits(u->addr, 64) || pend_hits(S.vbuf[0].address, 80)) return 0;
+    if (!mtl_addr(S.vbuf[0].address, 80, &vb, &vo) || !(vp_ = [(__bridge id<MTLBuffer>)vb contents]) || !mtl_addr(u->addr, 64, &mb, &mo) || !(mp_ = [(__bridge id<MTLBuffer>)mb contents])) return 0;
+    float m[16], x0 = 9, y0 = 9, x1 = -9, y1 = -9; memcpy(m, mp_ + mo, 64);
+    for (int i = 0; i < 4; i++) { float f[2]; memcpy(f, vp_ + vo + 20 * i, 8); float nx = (m[0] * f[0] + m[4] * f[1] + m[12] + 1) / 2, ny = (m[1] * f[0] + m[5] * f[1] + m[13] + 1) / 2;
+        x0 = fminf(x0, nx); x1 = fmaxf(x1, nx); y0 = fminf(y0, ny); y1 = fmaxf(y1, ny); }
+    return x0 < 0.002f && x1 > 0.998f && y0 < 0.002f && y1 > 0.998f;
+}
+/* The same for a menu's backdrop in TOTK (user 2026-10-25, iPhone screenshots): its UI quads are 6-index draws of float2
+   vertices, and behind the weapon wheel and the inventory they draw the paused scene, blurred, from a 16:9 picture the game
+   rendered itself (480x270, a quarter of the 1080p canvas: TOTK_UW_CATALOG). The widgets' textures are the game's art,
+   loaded from its files: never render targets. A UI draw that samples a 16:9 render target keeps the canvas. */
+/* Where a TOTK UI quad lands on the screen (nn::ui2d's vertex shaders, read in their translation): the vertex is a corner
+   of the unit quad (float2, stride 8), placed by c3[33] (size .xy, offset .zw, y down), moved by the pane's matrix rows
+   c3[4..6] and projected by c3[0..3], all in the vertex stage's hardware constant buffer 3 - which is NVN's uniform buffer
+   binding 0 (the shaders' reflection: vp_c3 = cbuf reg 0), so S.ubo[0][0], the block ui_mat_patch edits. 1 when the quad covers the whole screen
+   (a backdrop: the blurred scene, the grey layer of the weapon wheels), 0 when it does not (a widget, a save's picture),
+   2 / 3 for a strip of the full height in the left / right half (the side pieces of the map's frame: 149 to 257 x 1080
+   textures), 4 for a band of the full width (the map's top and bottom bars: 1920 x 224, 1920 x 20), 5 / 6 for a quad from
+   the left / right edge past the middle (the map's tint, 1310 x 1080), or of part of the height (its corner pieces), -1 when this draw does not
+   have that shape or its data cannot be read now. Its NDC box stays in g_ui2d_box (x0, x1, y0, y1). */
+static float g_ui2d_box[4];
+static int g_uw_seq, g_uw_phase;   // catalogue: order in the frame; 0 not the map screen, 1 the map, 2 its markers, 3 the rest
+static int ui2d_quad_covers_screen(void) {
+    if (S.nattr != 1 || S.stream[0].stride != 8 || S.vbuf[0].size < 32) return -1;
+    const p_bind_buf *u = &S.ubo[0][0]; void *vb, *mb; uint64_t vo, mo; const uint8_t *vp_, *mp_;
+    if (!u->addr || u->size < 34 * 16 || pend_hits(u->addr, 34 * 16) || pend_hits(S.vbuf[0].address, 32)) return -1;
+    if (!mtl_addr(S.vbuf[0].address, 32, &vb, &vo) || !(vp_ = [(__bridge id<MTLBuffer>)vb contents]) ||
+        !mtl_addr(u->addr, 34 * 16, &mb, &mo) || !(mp_ = [(__bridge id<MTLBuffer>)mb contents])) return -1;
+    float c[34][4]; memcpy(c, mp_ + mo, sizeof c);
+    float x0 = 9, x1 = -9, y0 = 9, y1 = -9;
+    for (int i = 0; i < 4; i++) {
+        float v[2]; memcpy(v, vp_ + vo + 8 * i, 8);
+        float px = v[0] * c[33][0] + c[33][2], py = -v[1] * c[33][1] + c[33][3], w[3], q[4];
+        for (int r = 0; r < 3; r++) w[r] = c[4 + r][0] * px + c[4 + r][1] * py + c[4 + r][3];
+        for (int r = 0; r < 4; r++) q[r] = c[r][0] * w[0] + c[r][1] * w[1] + c[r][2] * w[2] + c[r][3];
+        if (!(fabsf(q[3]) > 1e-6f)) return -1;
+        float nx = q[0] / q[3], ny = q[1] / q[3];
+        x0 = fminf(x0, nx); x1 = fmaxf(x1, nx); y0 = fminf(y0, ny); y1 = fmaxf(y1, ny);
+    }
+    g_ui2d_box[0] = x0; g_ui2d_box[1] = x1; g_ui2d_box[2] = y0; g_ui2d_box[3] = y1;
+    /* Only what starts at a screen edge (not a marker half off the screen, user 2026-10-26); a narrow strip there keeps its
+       width (the frame's sides), a wider piece is stretched from the edge (a tint, a gradient). */
+    int wide = x0 <= -0.99f && x1 >= 0.99f, el = fabsf(x0 + 1) < 0.01f, er = fabsf(x1 - 1) < 0.01f, narrow = x1 - x0 < 0.35f;
+    if (y0 > -0.99f || y1 < 0.99f) return wide ? 4 : el && !narrow ? 5 : er && !narrow ? 6 : 0;   // a tint's corner piece
+    return wide ? 1 : el ? (narrow ? 2 : 5) : er ? (narrow ? 3 : 6) : 0;
+}
+static int ui_samples_scene_picture(void) {
+    static int off = -1; if (off < 0) { const char *e = getenv("TOTK_UI_COVER_WIDE"); off = e && !strcmp(e, "0"); }
+    if (off) return 0;
+    uint64_t h = ghost_tex(); int tid = (int)(h & 0xfffff);
+    if (tid <= 0 || tid >= g_ntreg || !g_treg[tid].ok) return 0;
+    const tex_t *t = &g_treg[tid].t;
+    if (!t->d.width || !t->d.height || fabs((double)t->d.width / t->d.height / (16.0 / 9.0) - 1) > 0.01) return 0;
+    id<MTLTexture> m = tex_mtl(t);
+    return m && (m.usage & MTLTextureUsageRenderTarget);
+}
 static void ghost_note(const p_draw *dw) {
     if (g_gh.busy || dw->count != 4 || S.nattr != 2 || S.stream[0].stride != 20 || S.vbuf[0].size != 80) return;
     if (g_gh.pass != g_stat_pass) { for (int i = 0; i < g_gh.n; i++) free(g_gh.c[i].S_); g_gh.n = g_gh.nt = 0; g_gh.pass = g_stat_pass; }
@@ -13182,6 +13259,28 @@ static uint16_t vertex_stream_mask(NvShader *vs) {
     }
     return mask;
 }
+/* TOTK_VBUF_LOG=1 (diagnostic, off by default): each new combination of the draw's shaders, the vertex attributes its vertex
+   shader reads (location:format:offset:stream), the streams' stride, divisor and bound size, and the draw's index type, count
+   and base vertex, as "[vbuf] vs fs a=... s=... i=type:count:base" (at most 200,000 lines). The index count is what ties a
+   draw to a model shape (one of its LODs); a stream's size / stride is not a vertex count, buffers are shared. Used to find
+   which shader program the game draws a model shape with (MacNativeGames-artifacts/claude/cmodel/match.py, 2026-10-26). */
+static void vbuf_log(NvShader *vs, NvShader *fs, const p_draw *dw, const p_draw_idx *di) {
+    static int on = -1; static NSMutableSet<NSString *> *seen; static unsigned logged;
+    if (on < 0) { const char *e = getenv("TOTK_VBUF_LOG"); on = e && atoi(e) > 0; if (on) seen = [NSMutableSet set]; }
+    if (!on || !vs || logged >= 200000) return;
+    NSMutableString *a = [NSMutableString string], *st = [NSMutableString string]; uint32_t used = 0;
+    const nvn_refl *rf = &vs->rf;
+    for (int v = 0; v < rf->nv; v++) {
+        int at = rf->v[v].nvn; if (at >= 16 || at >= S.nattr) continue;
+        va_st x = S.attr[at]; if (!x.fmt) continue;
+        [a appendFormat:@"%d:%x:%u:%u,", at, (unsigned)x.fmt, (unsigned)x.offset, (unsigned)x.stream]; if (x.stream < 16) used |= 1u << x.stream;
+    }
+    for (int k = 0; k < 16; k++) if (used >> k & 1) [st appendFormat:@"%d:%u:%u:%llu,", k, S.stream[k].stride, S.stream[k].divisor, (unsigned long long)S.vbuf[k].size];
+    NSString *line = [NSString stringWithFormat:@"%s %s a=%@ s=%@ i=%d:%d:%d", vs->key, fs ? fs->key : "-", a, st, di ? (int)di->itype : -1, di ? (int)di->count : dw ? (int)dw->count : 0, di ? (int)di->base_vertex : dw ? (int)dw->first : 0];
+    if ([seen containsObject:line]) return;
+    [seen addObject:line]; logged++;
+    MLOG("[vbuf] %s", line.UTF8String);
+}
 static void bind_vertex_streams(id<MTL4RenderCommandEncoder> en, NvShader *vs) {
     uint16_t mask=vertex_streams_on()?vertex_stream_mask(vs):UINT16_MAX;
     uint64_t bound=0,omitted=0;
@@ -13329,6 +13428,7 @@ static int mfxup_draw(NvProg *pr) {
             taa_out = taa_encode(g_cb, src);
             if (taa_out) {
                 static int added; if (!added && taa_residency()) { [g_q4 addResidencySet:taa_residency()]; added = 1; }
+                if (totk_sr_on()) atomic_store(&g_taa_last, atomic_load(&g_cur_frame));
                 g_mfxup_src = src; g_mfxup_out = taa_out; g_mfxup_sh = fs;
             }
         }
@@ -13384,6 +13484,81 @@ static void movie_letterbox(__unsafe_unretained NvProg *pr, NSUInteger tw, NSUIn
 #include "nvn_cube_group.h"
 #include "nvn_lazy_clear.h"
 #include "nvn_par_encode.h"   // TOTK_PAR_ENCODE: parallel encoding of the G-buffer pass, step 1
+#ifndef GAME_BOTW
+/* TOTK only (PR #990; Breath of the Wild's UI is not measured with it and keeps the squeeze as it was): on a screen wider
+   than 16:9, what uw_ui_squeeze squeezed into the middle 16:9 is looked at once more by where its nn::ui2d quad lands
+   (ui2d_quad_covers_screen): a backdrop keeps the canvas, the map is squeezed in its own proportions without the 16:9 cut,
+   its frame and layer panel go against the screen edges. In: the squeeze (*ux, *uy); out: the squeeze, edge (-1 / 1 a side
+   strip kept at that edge, -2 / 2 a piece stretched from it), world (the map's picture) and map_screen (the map is shown,
+   so a scissor of the whole canvas stays whole). TOTK_UI_COVER_WIDE=0 turns it off. */
+static void totk_uw_wide_ui(NvProg *pr, const p_draw *dw, const p_draw_idx *di, NSUInteger tw, NSUInteger th,
+                            double *pux, double *puy, int *pedge, int *pworld, int *map_screen) {
+    double ux = *pux, uy = *puy; int edge = 0, world = 0; (void)th;
+    if ((ux != 1 || uy != 1) && dw && dw->count == 4 && S.nattr == 2 && S.stream[0].stride == 20 && ui_covers_layout()) ux = uy = 1;   // a backdrop keeps the canvas
+    if (ux != 1 || uy != 1) {   // a TOTK backdrop keeps the canvas: by where its quad lands, or else by the scene picture it samples
+        static int off = -1; if (off < 0) { const char *e = getenv("TOTK_UI_COVER_WIDE"); off = e && !strcmp(e, "0"); }
+        int cover = off ? 0 : ui2d_quad_covers_screen(), kept = cover == 1 || cover == 4 || (cover < 0 && ui_samples_scene_picture());
+        edge = cover == 2 ? -1 : cover == 3 ? 1 : cover == 5 ? -2 : cover == 6 ? 2 : 0;
+        /* The map (user 2026-10-26: stretched, and its markers slid on it): its picture is wider than the Switch's screen
+           (2250 x 1080, NDC -1.17..1.17), so squeezed like the markers over it, in its own proportions, it nearly fills the
+           wide screen (+-0.96): it is squeezed, but its scissor is not, so the 16:9 middle does not cut it (nor the markers over it: a scissor of the whole canvas is never squeezed). */
+        if (cover == 1 && (g_ui2d_box[0] < -1.05f || g_ui2d_box[1] > 1.05f)) { kept = 0; world = 1; }
+        /* Then, once the map's chrome starts (its frame strips and bars come after the markers), what lies in a side quarter
+           of the map screen - the layer panel on the left, its divider, the gradients on the right - goes against its edge
+           with the frame, as on the Switch, instead of leaving a band between the frame and the middle 16:9 (user
+           2026-10-26 "la barre bleue", Codex's read of the catalogue). The markers, drawn before, stay on the map. */
+        static uint64_t map_frame, chrome_frame, seq_frame; static int seq0;
+        uint64_t fr = atomic_load(&g_cur_frame);
+        if (seq_frame != fr) { seq_frame = fr; seq0 = 0; }
+        g_uw_seq = seq0++;   // the draw's place among this frame's squeezed UI draws (catalogue)
+        if (world) map_frame = fr;
+        else if (map_frame == fr && cover >= 2) chrome_frame = fr;
+        int map_on = map_frame && map_frame + 2 >= fr, markers = map_frame == fr && chrome_frame != fr;   // between the map and its frame
+        *map_screen = map_on;
+        g_uw_phase = !map_on ? 0 : world ? 1 : markers ? 2 : 3;
+        if (!world && !kept && cover == 0 && map_on && !markers) {
+            if (g_ui2d_box[1] <= -0.6f) edge = -1; else if (g_ui2d_box[0] >= 0.6f) edge = 1;
+        }
+        /* The layer panel is drawn among the markers (catalogue seq/phase, Codex 2026-10-26): it opens with its divider, an
+           untextured line of the full height at x = -0.74, and its icons follow in the left column. From that line until a
+           draw lands outside the column, the left column goes against the left edge with the frame. */
+        static uint64_t panel_frame;
+        if (map_on && markers && cover == 0 && !kept) {
+            int line = g_ui2d_box[2] <= -0.99f && g_ui2d_box[3] >= 0.99f && g_ui2d_box[1] - g_ui2d_box[0] < 0.03f && g_ui2d_box[1] <= -0.6f;
+            if (line) panel_frame = fr;
+            if (panel_frame == fr) {
+                if (g_ui2d_box[1] <= -0.6f) edge = -1;
+                else if (g_ui2d_box[0] > -0.6f && g_ui2d_box[0] < 1) panel_frame = 0;   // back on the map: a marker
+            }
+        }
+    /* TOTK_UW_CATALOG=1 (the iPhone's debug log turns it on): each kind of UI draw the squeeze applies to once - its shaders,
+       vertices, the texture its fragment shader samples, its viewport, cover and whether it kept the canvas - to tell a
+       menu's backdrop from the widgets around it. Kinds are told apart by cover and kept too (a grey layer and a widget
+       may share shaders and an 8x8 texture). */
+    {
+        static int cat = -1; static uint64_t seen[256]; static int nseen;
+        if (cat < 0) { const char *e = getenv("TOTK_UW_CATALOG"); cat = e && strcmp(e, "0"); }
+        if (cat) {   // off: no texture lookup or hashing per UI draw
+        uint64_t h = ghost_tex(); int tid = (int)(h & 0xfffff); const tex_t *t = tid > 0 && tid < g_ntreg && g_treg[tid].ok ? &g_treg[tid].t : NULL;
+        const char *vk = pr && pr->sh[0] ? pr->sh[0]->key : "-", *fk = pr && pr->sh[1] ? pr->sh[1]->key : "-";
+        uint64_t k = 1469598103934665603ull;
+        for (const char *c = vk; *c && c < vk + 8; c++) k = (k ^ (uint8_t)*c) * 1099511628211ull;
+        for (const char *c = fk; *c && c < fk + 8; c++) k = (k ^ (uint8_t)*c) * 1099511628211ull;
+        k ^= (uint64_t)(t ? t->d.width : 0) << 32 ^ (t ? t->d.height : 0) ^ (uint64_t)(cover + 1) << 60 ^ (uint64_t)kept << 63 ^ (uint64_t)world << 59 ^ (uint64_t)g_uw_phase << 56;
+        int known = 0; for (int i = 0; i < nseen; i++) known |= seen[i] == k;
+        if (cat && !known && nseen < 256) { seen[nseen++] = k;
+            MLOG("[uw-cat] vs %.8s fs %.8s %s %u inst %d nattr %d stride %d vbuf %llu tex %ux%u fmt %#x vp %g,%g %gx%g canvas %lux%lu blend %#x cover %d kept %d world %d seq %d phase %d box %.2f..%.2f x %.2f..%.2f",
+                 vk, fk, dw ? "draw" : "indexed", dw ? dw->count : di ? di->count : 0, dw ? dw->instances : di ? di->instances : 0, S.nattr, S.stream[0].stride,
+                 (unsigned long long)S.vbuf[0].size, t ? t->d.width : 0, t ? t->d.height : 0, t ? (unsigned)t->d.format : 0u,
+                 S.has_vp ? S.vp[0][0] : 0, S.has_vp ? S.vp[0][1] : 0, S.has_vp ? S.vp[0][2] : 0, S.has_vp ? S.vp[0][3] : 0, (unsigned long)tw, (unsigned long)th, S.color.blend_en, cover, kept, world, g_uw_seq, g_uw_phase,
+                 cover >= 0 ? g_ui2d_box[0] : 0, cover >= 0 ? g_ui2d_box[1] : 0, cover >= 0 ? g_ui2d_box[2] : 0, cover >= 0 ? g_ui2d_box[3] : 0); }
+        }
+    }
+        if (kept) ux = uy = 1;
+    }
+    *pux = ux; *puy = uy; *pedge = edge; *pworld = world;
+}
+#endif
 static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
     par_draw();
     if (!S.prog) { RED_ONCE(18, "No program bound before draw"); g_draw_skip[0]++; return; }
@@ -13644,10 +13819,25 @@ frz_plain:;
         if (uh > 0 && uh < 1) { if (ui_cover_all(uh)) vs = 1 / uh; else if (uy > 0) { so = lround(uy * th); if (ui_mat_ok()) moff = 2 * uy; else { vo = so; static int n; if (n++ < 4) MLOG("UI shift down: projection matrix unreadable this time, falling back to moving the viewport (pass %llu)", g_stat_pass); } } } }
     if (moff != g_ui_moff) { g_ui_moff = moff; args_dirty_stage(0); }
     double ux, uy, cx = tw / 2.0, cy = th / 2.0;   // key 4: UI squeezed by 1 / ux across, 1 / uy down, about the canvas centre
+    int world = 0;   // 1: the map's picture, squeezed but not cut to the middle 16:9 (totk_uw_wide_ui)
+    int edge = 0;   // a frame's side strip: squeezed, but kept against the left (-1) / right (1) edge of the canvas; +-2: a quad
+                    // from that edge past the middle, stretched from the canvas edge to where its inner side is squeezed to
+    int map_screen = 0;   // TOTK's map is shown: a scissor of the whole canvas is not squeezed (its markers reach the sides)
     uw_ui_squeeze(pr && pr->sh[0] ? pr->sh[0]->key : NULL, dw, di, tw, th, &ux, &uy);
+#ifndef GAME_BOTW
+    totk_uw_wide_ui(pr, dw, di, tw, th, &ux, &uy, &edge, &world, &map_screen);
+#endif
     if (ux == 1 && uy == 1) movie_letterbox(pr, tw, th, &ux, &uy);   // Native 16:10: a pre-rendered video keeps 16:9
     double vx = S.has_vp ? S.vp[0][0] : 0, vw = S.has_vp ? S.vp[0][2] : tw, vy = S.has_vp ? S.vp[0][1] + vo : vo, vh = S.has_vp ? S.vp[0][3] * vs : th * vs;
-    if (ux != 1) { vx = cx + (vx - cx) / ux; vw /= ux; }
+    double ax = edge == -1 ? vx : edge == 1 ? vx + vw : cx, kx = 1 / ux;   // across: x -> ax + (x - ax) * kx (the centre, or a side strip's own edge)
+    if (ux != 1 && (edge == -2 || edge == 2)) {   // the outer side stays at the canvas edge, the inner side goes where the squeeze puts it
+        double X0 = vx + (g_ui2d_box[0] + 1) / 2 * vw, X1 = vx + (g_ui2d_box[1] + 1) / 2 * vw;
+        if (X1 - X0 > 1) { ax = edge < 0 ? X0 : X1; kx = edge < 0 ? (cx + (X1 - cx) / ux - X0) / (X1 - X0) : (X1 - cx - (X0 - cx) / ux) / (X1 - X0); }
+    }
+    double xs = 1;
+    if (world && ux != 1) { float r = fmaxf(-g_ui2d_box[0], g_ui2d_box[1]); if (r > 1) { xs = 1 / r; kx /= xs; } }
+    if (xs != g_ui_xs) { g_ui_xs = xs; args_dirty_stage(0); }
+    if (ux != 1) { vx = ax + (vx - ax) * kx; vw *= kx; }
     if (uy != 1) { vy = cy + (vy - cy) / uy; vh /= uy; }
     if ((atomic_load(&g_uw_log) > 0 && uw_on_canvas()) || atomic_load(&g_draw_log) > 0)
         MLOG("[uw] F%llu pass %llu ui %d squeeze %.3f/%.3f vs %.8s fs %.8s count %u inst %d vp %s%g,%g,%g,%g sc %s%d,%d,%d,%d blend %#x tex %ux%u fmt %#x ser %llu bl %u,%u,%u/%u,%u,%u cm %#x prim %d",
@@ -13695,7 +13885,7 @@ frz_plain:;
     MTLScissorRect sc = {0, 0, tw, th};
     if (R.has_sc) {
         long sx0 = R.sc.x, sx1 = (long)R.sc.x + R.sc.w;
-        if (ux > 1) { sx0 = lround(cx + (sx0 - cx) / ux); sx1 = lround(cx + (sx1 - cx) / ux); }
+        if (ux != 1 && !world && (!map_screen || sx0 > 0 || sx1 < (long)tw)) { sx0 = lround(ax + (sx0 - ax) * kx); sx1 = lround(ax + (sx1 - ax) * kx); }   // as the viewport, or a side strip is cut away
         long x0 = sx0 < 0 ? 0 : sx0, y0 = R.sc.y <= 0 ? 0 : R.sc.y + so, x1 = sx1, y1 = vs != 1 ? (long)th : (long)R.sc.y + R.sc.h + so;
         if (uy != 1) { y0 = lround(cy + (R.sc.y - cy) / uy); y1 = lround(cy + ((long)R.sc.y + R.sc.h - cy) / uy); if (y0 < 0) y0 = 0; }   // the Mac only: so = 0, vs = 1
         if (x1 > (long)tw) x1 = tw; if (y1 > (long)th) y1 = th;
@@ -13737,6 +13927,7 @@ frz_plain:;
     enc_r_blend_color(en, S.blend_color[0], S.blend_color[1], S.blend_color[2], S.blend_color[3]);
     bind_vertex_streams((id<MTL4RenderCommandEncoder>)en,pr->sh[0]);
     if (g_pass.objmv && g_mfx.role == MFX_ROLE_MOTION && pr->sh[0]) om_bind((id<MTL4RenderCommandEncoder>)en, pr, dw, di);   // TOTK_OBJ_MOTION: this draw's positions
+    vbuf_log(pr->sh[0], pr->sh[1], dw, di);
     if (g_lay.active) enc_r_vbuf(en, LAY_BUF_INDEX, lay_gpu(g_lay_probe_neg == 1 ? 0 : g_lay.cur - g_lay.base));   // TOTK: this draw's layer within the layered pass
     if (pr->sh[0]) encode_args(en, pr->sh[0], 0, 1);
     if (pr->sh[1]) encode_args(en, pr->sh[1], 1, 0);
@@ -16509,6 +16700,33 @@ uint64_t mtl_present(const tex_t *t, double period, const int crop[4]) {
     pthread_mutex_unlock(&g_pq_mu);
     return ring >= 0 ? 0 : tk;   // ticket 0: acquiring this image does not wait for the display (the copy is ordered before its next use)
 }
+#if TARGET_OS_OSX
+/* TOTK_STATE_REPORTING (totk_state_report.m): the configuration the renderer runs with, from what it reads every frame
+   (any thread), and the game frames on which a MetalFX upscale and edge smoothing last ran. */
+void mtl_sr_picture(totk_sr_gfx *s, uint64_t *upscaled_at, uint64_t *antialiased_at) {
+    s->out_w = (int)atomic_load(&g_out_w); s->out_h = (int)atomic_load(&g_out_h);
+    float a = runtime_aspect_now ? runtime_aspect_now() : 0;
+    s->aspect_milli = a > 0 && fabsf(a - 16.0f / 9.0f) > 0.01f ? (int)lroundf(a * 1000) : 0;
+    s->upscale = mfxup_enabled() ? 1 + mfxup_output_enabled() : 0;
+    s->taa = taa_enabled(); s->fi_mode = mfx_enabled();
+    s->present_path = __atomic_load_n(&g_rescue_mode, __ATOMIC_RELAXED) ? 2 : !__atomic_load_n(&g_dm_present_link, __ATOMIC_RELAXED);
+    *upscaled_at = atomic_load(&g_mfxup_last); *antialiased_at = atomic_load(&g_taa_last);
+}
+/* The game's counters for the state reports, read without any lock (a report may see a frame less): game presents (the
+   present queue's tickets, as the FPS box counts them), interpolated frames handed to the screen, game frames the display
+   link merged away, shader variants translated this run, Metal libraries and pipelines made on the submit thread (and
+   their time), Metal memory and the scene size. */
+void mtl_sr_counters(totk_sr_counters *c) {
+    c->game_frames = __atomic_load_n(&g_pq_in, __ATOMIC_RELAXED);
+    c->generated = __atomic_load_n(&g_gen_shown, __ATOMIC_RELAXED);
+    c->merged = __atomic_load_n(&g_link_dropped, __ATOMIC_RELAXED);
+    c->translations = totk_rt_new_variants();
+    c->libraries = __atomic_load_n(&g_bp_lib_n, __ATOMIC_RELAXED); c->pipelines = __atomic_load_n(&g_bp_pso_n, __ATOMIC_RELAXED);
+    uint64_t lib_ns, pso_ns; mtl_create_ns(&lib_ns, &pso_ns); c->create_ns = lib_ns + pso_ns;
+    c->metal_bytes = g_dev ? g_dev.currentAllocatedSize : 0;
+    c->scene_w = (int)atomic_load(&g_scene_w); c->scene_h = (int)atomic_load(&g_scene_h);
+}
+#endif
 // Do not wait during discard: the frame enqueued only after the flag was set (the present thread had just passed the flag check) has nobody to take it, and waiting for it would stall again; it is left for the following mtl_drain to clear
 // Do not wait indefinitely in display-link mode: see the note at STALL_NS. Only frames "not yet taken by the display link" are dropped; the one already on its way to the screen is waited for until handed to the GPU (same dropping as when entering the background)
 void mtl_present_wait(uint64_t tk) {
@@ -18945,14 +19163,47 @@ void mtl_mem_report(const char *tag) {
    formats x 8 write masks) are built on 4 threads and added like the warm-up adds them (par_add, each thread its own
    batch, par_flush_thread), one key twice from two threads; then the folder is read back as a later start reads it,
    with files a cut-short write leaves, and every pipeline must come from its file without compiling
-   (MTLPipelineOptionFailOnBinaryArchiveMiss). The build folders the batches made must be gone. */
+   (MTLPipelineOptionFailOnBinaryArchiveMiss). The build folders the batches made must be gone. A forced late startup
+   cleanup while two batches overlap must keep their live folder; only the last batch may remove it. */
+static int par_probe_startup_cleanup(NSString *dir) {
+    NSFileManager *fm = NSFileManager.defaultManager;
+    NSString *owned = [dir stringByAppendingPathComponent:@"probe-owned"], *shared = [dir stringByAppendingPathComponent:@"probe-shared"];
+    NSString *stale = [owned stringByAppendingPathComponent:@"gpuarchiver-stale"], *other = [shared stringByAppendingPathComponent:@"gpuarchiver-shared"];
+    NSString *unrelated = [owned stringByAppendingPathComponent:@"keep-this-entry"], *live = [owned stringByAppendingPathComponent:@"gpuarchiver-live"];
+    for (NSString *path in @[stale, other, unrelated]) [fm createDirectoryAtPath:path withIntermediateDirectories:YES attributes:nil error:nil];
+    g_par_probe_ga_dirs = @[@{@"path": owned, @"own": @YES}, @{@"path": shared, @"own": @NO}];
+    par_open_dir(g_dev);
+    if ([fm fileExistsAtPath:stale] || ![fm fileExistsAtPath:other] || ![fm fileExistsAtPath:unrelated])
+        MDIE("pipeline archive probe: startup cleanup did not finish or removed unrelated/shared entries");
+    par_batch_begin();
+    [fm createDirectoryAtPath:live withIntermediateDirectories:YES attributes:nil error:nil];
+    dispatch_semaphore_t entered = dispatch_semaphore_create(0), leave = dispatch_semaphore_create(0);
+    dispatch_group_t workers = dispatch_group_create();
+    dispatch_group_async(workers, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        par_batch_begin(); dispatch_semaphore_signal(entered);
+        if (dispatch_semaphore_wait(leave, dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC))) MDIE("pipeline archive probe: batch release timed out");
+        par_batch_end();
+    });
+    if (dispatch_semaphore_wait(entered, dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC))) MDIE("pipeline archive probe: overlapping batch did not start");
+    // Force a delayed startup request while both batches are live: the old unconditional deletion removes live.
+    dispatch_sync(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ par_ga_cleanup_startup(); });
+    if (![fm fileExistsAtPath:live]) MDIE("pipeline archive probe: delayed startup cleanup removed an active batch folder");
+    par_batch_end();
+    if (![fm fileExistsAtPath:live]) MDIE("pipeline archive probe: first batch removed another batch's live folder");
+    dispatch_semaphore_signal(leave);
+    if (dispatch_group_wait(workers, dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC))) MDIE("pipeline archive probe: final batch did not finish");
+    if ([fm fileExistsAtPath:live] || ![fm fileExistsAtPath:other] || ![fm fileExistsAtPath:unrelated])
+        MDIE("pipeline archive probe: final batch cleanup left its folder or removed unrelated/shared entries");
+    g_par_probe_ga_dirs = nil;   // all fixture workers joined; real Metal batches use the normal cache folders
+    return 6;
+}
 int mtl_probe_pipeline_archive(void) {
     NSString *dir = [NSTemporaryDirectory() stringByAppendingFormat:@"totk-probe-pipeline-archive-%d", getpid()];
     [NSFileManager.defaultManager removeItemAtPath:dir error:nil];
     setenv("TOTK_SHADER_CACHE", dir.fileSystemRepresentation, 1); setenv("TOTK_SHADER_SEED", "off", 1);
     mtl_init();
     if (![totk_rt_dir() isEqualToString:dir]) MDIE("pipeline archive probe: the cache folder was chosen before the probe (%s)", totk_rt_dir().UTF8String);
-    par_open_dir(g_dev);
+    int cleanup_checks = par_probe_startup_cleanup(dir);
     if (!g_par_on || g_par_valid) MDIE("pipeline archive probe: archive on %d, valid %d in an empty folder", g_par_on, g_par_valid);
     NSError *error = nil;
     id<MTLLibrary> lib = [g_dev newLibraryWithSource:@"#include <metal_stdlib>\nusing namespace metal;\nstruct V { float4 p [[position]]; };\n"
@@ -19018,5 +19269,5 @@ int mtl_probe_pipeline_archive(void) {
     }
     if (g_par_open.count != want) MDIE("pipeline archive probe: %lu files opened (want %lu)", (unsigned long)g_par_open.count, (unsigned long)want);
     [NSFileManager.defaultManager removeItemAtPath:dir error:nil];
-    return atomic_load(&built) + from_archive;
+    return cleanup_checks + atomic_load(&built) + from_archive;
 }

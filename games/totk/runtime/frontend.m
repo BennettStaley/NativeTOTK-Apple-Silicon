@@ -37,11 +37,26 @@ static void *vsyncEvents[16];
 static unsigned vsyncCount;
 void hle_bind_system_event(void *,int);
 void hle_signal_system_event(void *);
+/* TOTK_STATE_REPORTING (gfx/nvn/totk_state_report.m; absent in tests): the game's states for Apple's performance tools on
+   macOS 27. Main-thread events only; each call stores a few values and returns. */
+extern void totk_sr_start(const char *game,const char *version) __attribute__((weak_import));
+extern void totk_sr_picture(int key,int visible) __attribute__((weak_import));
+extern void totk_sr_window(int key,int visible) __attribute__((weak_import));
+extern void totk_sr_view(int w,int h,int display_hz,int fullscreen) __attribute__((weak_import));
+extern void totk_sr_closing(void) __attribute__((weak_import));
+extern void totk_sr_settings(int open) __attribute__((weak_import));
+int runtime_front_window_visible(void);   /* below: 1 seen, 0 covered, -1 not known yet */
 void *front_metal_layer(void){return (__bridge void *)metalLayer;}
+/* The start-up screen goes once a frame was presented and the warm-up is done: the player sees the game from here on. */
+static void boot_overlay_hide(void){
+ if(!bootOverlay||bootOverlay.hidden)return;
+ bootOverlay.hidden=YES;
+ if(totk_sr_picture)totk_sr_picture(window.isKeyWindow,runtime_front_window_visible()!=0);
+}
 void front_frame_presented(void){
  if(atomic_fetch_add_explicit(&presentedFrames,1,memory_order_relaxed)==0){
   fprintf(stderr,"[totk-boot] %.3f first presented frame\n",(runtime_now_ns()-bootStartNS)/1e9);
-  dispatch_async(dispatch_get_main_queue(), ^{if(!atomic_load(&warmPending))bootOverlay.hidden=YES;});
+  dispatch_async(dispatch_get_main_queue(), ^{if(!atomic_load(&warmPending))boot_overlay_hide();});
  }
 }
 void runtime_boot_progress(const char *stage,uint64_t done,uint64_t total){
@@ -92,7 +107,7 @@ void runtime_warm_progress(uint64_t done,uint64_t total,uint64_t shaders,uint64_
 }
 void runtime_warm_done(void){
  atomic_store(&warmPending,0);
- dispatch_async(dispatch_get_main_queue(), ^{if(atomic_load(&presentedFrames))bootOverlay.hidden=YES;});
+ dispatch_async(dispatch_get_main_queue(), ^{if(atomic_load(&presentedFrames))boot_overlay_hide();});
 }
 uint64_t front_game_res(int docked){(void)docked;return (720ULL<<32)|1280;}
 /* TOTK_ASSUME_FOCUS=1: unattended test runs. macOS refuses to activate an app launched from the background while the user is working in
@@ -272,6 +287,13 @@ void runtime_shortcut_help_toggle(void){int mode=fps_overlay_toggle_hints();disp
    scales it down for the screen. It lets a test exercise the 2K output path (a 2560x1440 picture) on a screen smaller than
    that (2026-10-17: the Mac reported a 1920x1080 display); the desktop launcher never sets it. */
 static CGFloat drawable_scale(void){static CGFloat f=-1;if(f<0){const char *e=getenv("TOTK_DRAWABLE_SCALE");f=e?atof(e):1;if(f<0.25||f>4)f=1;}return f;}
+/* TOTK_STATE_REPORTING: the drawable, the refresh rate of the screen the window is on, full screen. */
+static void front_sr_view(void){
+ if(!totk_sr_view||!window||!metalLayer)return;
+ CGSize px=metalLayer.drawableSize;
+ totk_sr_view((int)px.width,(int)px.height,window.screen?(int)window.screen.maximumFramesPerSecond:0,(window.styleMask&NSWindowStyleMaskFullScreen)!=0);
+}
+static void front_sr_window(void){if(totk_sr_window&&window)totk_sr_window(window.isKeyWindow,runtime_front_window_visible()!=0);}
 static void front_sync_drawable(void){
  NSView *v=window.contentView;if(!v||!metalLayer)return;
  CGFloat s=window.backingScaleFactor>0?window.backingScaleFactor:1,ts=drawable_scale();CGSize px=CGSizeMake(round(v.bounds.size.width*s*ts),round(v.bounds.size.height*s*ts));
@@ -363,11 +385,12 @@ void runtime_front_resize_aspect(double ratio){
 @interface TOTKWindowDelegate:NSObject<NSWindowDelegate>
 @end
 @implementation TOTKWindowDelegate
--(void)windowDidBecomeKey:(NSNotification *)n{(void)n;atomic_store(&focused,1);if(window.styleMask&NSWindowStyleMaskFullScreen)[(TOTKInputView *)window.contentView setCursorAutoHideEnabled:YES];runtime_oe_push_message(15);front_mouse_update();fprintf(stderr,"[totk] window gained focus\n");}
--(void)windowDidResignKey:(NSNotification *)n{(void)n;atomic_store(&focused,0);[(TOTKInputView *)window.contentView setCursorAutoHideEnabled:NO];front_mouse_update();runtime_input_clear();runtime_oe_push_message(15);fprintf(stderr,"[totk] window lost focus\n");}
+-(void)windowDidBecomeKey:(NSNotification *)n{(void)n;atomic_store(&focused,1);if(window.styleMask&NSWindowStyleMaskFullScreen)[(TOTKInputView *)window.contentView setCursorAutoHideEnabled:YES];runtime_oe_push_message(15);front_mouse_update();fprintf(stderr,"[totk] window gained focus\n");front_sr_window();}
+-(void)windowDidResignKey:(NSNotification *)n{(void)n;atomic_store(&focused,0);[(TOTKInputView *)window.contentView setCursorAutoHideEnabled:NO];front_mouse_update();runtime_input_clear();runtime_oe_push_message(15);fprintf(stderr,"[totk] window lost focus\n");front_sr_window();}
 /* The process ends with the window. Save writes go straight to the files (runtime/fs_host.c), so a close in the middle of a
    save waits (up to 15 s, the window already gone) until the game has written and committed it (runtime_fs_save_busy). */
 -(void)windowWillClose:(NSNotification *)n{(void)n;
+ if(totk_sr_closing)totk_sr_closing();
  [(TOTKInputView *)window.contentView setCursorAutoHideEnabled:NO];
  if(mouseHeld){mouseHeld=NO;CGAssociateMouseAndMouseCursorPosition(true);[NSCursor unhide];}
  if(!runtime_fs_save_busy()){fprintf(stderr,"[totk] window closed; graceful guest shutdown pending\n");_exit(0);}
@@ -377,17 +400,18 @@ void runtime_front_resize_aspect(double ratio){
   fprintf(stderr,"[totk] save %s after %.2f s; quitting\n",runtime_fs_save_busy()?"still in progress (gave up)":"done",(runtime_now_ns()-t0)/1e9);_exit(0);});
 }
 -(void)windowDidResize:(NSNotification *)n{(void)n;front_sync_drawable();}
--(void)windowDidEnterFullScreen:(NSNotification *)n{(void)n;note_refresh_range("entered full screen");[(TOTKInputView *)window.contentView setCursorAutoHideEnabled:window.isKeyWindow];}
--(void)windowDidExitFullScreen:(NSNotification *)n{(void)n;note_refresh_range("left full screen");[(TOTKInputView *)window.contentView setCursorAutoHideEnabled:NO];}
+-(void)windowDidEnterFullScreen:(NSNotification *)n{(void)n;note_refresh_range("entered full screen");front_sr_view();[(TOTKInputView *)window.contentView setCursorAutoHideEnabled:window.isKeyWindow];}
+-(void)windowDidExitFullScreen:(NSNotification *)n{(void)n;note_refresh_range("left full screen");front_sr_view();[(TOTKInputView *)window.contentView setCursorAutoHideEnabled:NO];}
 /* Whether any part of the window can be seen (TOTK, 2026-10-16 night): macOS stops the display link's callbacks for a
    fully covered window, so presents stop and per-picture measurements of that stretch are void; a test session's log
    says when (the user working in other apps covered the test windows of the frame interpolation tests). */
 static _Atomic int windowVisible=-1;   /* -1 not known yet; read by the present path's stall lines (runtime_front_window_visible) */
 static void note_occlusion(const char *when){int v=(window.occlusionState&NSWindowOcclusionStateVisible)!=0;atomic_store(&windowVisible,v);
- fprintf(stderr,"[totk] window %s%s (frame %llu)\n",v?"visible":"covered (or on another Space): no presents until it is visible again",when,(unsigned long long)dm_nvn_frame_count());}
+ fprintf(stderr,"[totk] window %s%s (frame %llu)\n",v?"visible":"covered (or on another Space): no presents until it is visible again",when,(unsigned long long)dm_nvn_frame_count());
+ front_sr_window();}
 -(void)windowDidChangeOcclusionState:(NSNotification *)n{(void)n;note_occlusion("");}
 -(void)windowDidChangeBackingProperties:(NSNotification *)n{(void)n;front_sync_drawable();}
--(void)windowDidChangeScreen:(NSNotification *)n{(void)n;note_screen("moved to another display");}
+-(void)windowDidChangeScreen:(NSNotification *)n{(void)n;note_screen("moved to another display");front_sr_view();}
 @end
 static TOTKWindowDelegate *windowDelegate;
 /* A save package (.totksave, runtime/save_package.h) opened while the game runs (a double-click, or AirDrop's Open): the
@@ -437,6 +461,11 @@ void runtime_front_run(void(*callback)(void)){
  @autoreleasepool{
   bootStartNS=runtime_now_ns();
   {const char *commit=getenv("TOTK_SOURCE_COMMIT");fprintf(stderr,"[totk] built from commit %s\n",commit&&*commit?commit:"(not recorded)");}
+#ifdef GAME_BOTW
+  if(totk_sr_start)totk_sr_start("botw",TOTK_GAME_VERSION);   /* TOTK_STATE_REPORTING=1: starting */
+#else
+  if(totk_sr_start)totk_sr_start("totk",TOTK_GAME_VERSION);
+#endif
   [NSApplication sharedApplication];[NSApp setActivationPolicy:background_run()?NSApplicationActivationPolicyAccessory:NSApplicationActivationPolicyRegular];
   appDelegate=[TOTKAppDelegate new];NSApp.delegate=appDelegate;
   [NSApplication sharedApplication];[NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
@@ -493,46 +522,8 @@ void runtime_front_run(void(*callback)(void)){
   [NSApp run];runtime_fail("native event loop returned unexpectedly");
  }
 }
-/* Text entry for the game (nn::swkbd::ShowKeyboard, runtime/swkbd_host.c; on the Switch a keyboard applet takes the screen).
-   User, 2026-10-17: no on-screen keyboard, just the Mac keyboard. A bar at the bottom of the game window shows the game's
-   prompt and one text field (input methods work); Return confirms, Escape cancels. Characters the game disallows and text
-   beyond its length limit are removed as they are typed (the caller checks again). The calling guest thread waits on a
-   semaphore; the game's keys are cleared while the bar has the keyboard. */
-@interface TOTKTextBar:NSView<NSTextFieldDelegate>
-@property(strong) NSTextField *field;
-@property int maxUnits,minUnits,digitsOnly;
-@property uint32_t disabled;
-@property(copy) void(^done)(NSString *text);   /* nil: cancelled */
--(void)refilter;
-@end
-@implementation TOTKTextBar
--(BOOL)allowed:(unichar)c{
- BOOL digit=c>='0'&&c<='9';uint32_t d=self.disabled;
- if(self.digitsOnly&&!digit)return NO;
- if(c<0x20||c==0x7f)return NO;
- if((d&1u<<1&&c==' ')||(d&1u<<2&&c=='@')||(d&1u<<3&&c=='%')||(d&1u<<4&&c=='/')||(d&1u<<5&&c=='\\')||(d&1u<<6&&digit))return NO;
- return YES;
-}
--(void)controlTextDidChange:(NSNotification *)n{(void)n;[self refilter];}
--(void)refilter{
- NSText *ed=self.field.currentEditor;if([ed isKindOfClass:NSTextView.class]&&((NSTextView *)ed).hasMarkedText)return;   /* still composing */
- NSString *s=self.field.stringValue;NSMutableString *t=[NSMutableString string];
- [s enumerateSubstringsInRange:NSMakeRange(0,s.length) options:NSStringEnumerationByComposedCharacterSequences usingBlock:^(NSString *sub,NSRange r,NSRange er,BOOL *stop){
-  (void)r;(void)er;
-  if(sub.length==1&&![self allowed:[sub characterAtIndex:0]])return;
-  if(self.maxUnits>0&&t.length+sub.length>(NSUInteger)self.maxUnits){*stop=YES;return;}
-  [t appendString:sub];}];
- if(![t isEqualToString:s]){self.field.stringValue=t;NSBeep();}
-}
--(void)finish:(NSString *)text{void(^d)(NSString *)=self.done;self.done=nil;if(d)d(text);}
--(BOOL)control:(NSControl *)c textView:(NSTextView *)tv doCommandBySelector:(SEL)sel{
- (void)c;(void)tv;
- if(sel==@selector(insertNewline:)){[self refilter];NSString *s=self.field.stringValue;
-  if((NSInteger)s.length<self.minUnits||!s.length){NSBeep();return YES;}[self finish:s];return YES;}
- if(sel==@selector(cancelOperation:)){[self finish:nil];return YES;}
- return NO;
-}
-@end
+/* AppKit text entry, including controller navigation; independent of the renderer. */
+#include "text_keyboard.h"
 static __weak TOTKTextBar *openBar;   /* main thread only */
 void runtime_front_text_test(const char *op,const char *text){
  NSString *o=[NSString stringWithUTF8String:op],*t=[NSString stringWithUTF8String:text?text:""]?:@"";
@@ -554,26 +545,22 @@ int runtime_front_text_input(const RuntimeTextRequest *req,char *out,size_t out_
  int maxU=req->max_units,minU=req->min_units,digits=req->digits_only,secure=req->secure;uint32_t dis=req->disabled;
  __block NSString *result=nil;dispatch_semaphore_t sem=dispatch_semaphore_create(0);
  dispatch_async(dispatch_get_main_queue(), ^{
-  NSView *cv=window.contentView;CGFloat w=fmin(720,cv.bounds.size.width-40),h=104;
-  TOTKTextBar *bar=[[TOTKTextBar alloc] initWithFrame:NSMakeRect(floor((cv.bounds.size.width-w)/2),48,w,h)];
-  bar.autoresizingMask=NSViewMinXMargin|NSViewMaxXMargin|NSViewMaxYMargin;bar.wantsLayer=YES;bar.layer.cornerRadius=12;
-  bar.layer.backgroundColor=[NSColor colorWithCalibratedRed:0.035 green:0.075 blue:0.09 alpha:0.92].CGColor;
+  if(openBar){dispatch_semaphore_signal(sem);return;}   /* do not strand an earlier guest request */
+  if(settingsPanel.superview)[TOTKSettingsPanel toggle];   /* the panel closes for text entry */
+  NSView *cv=window.contentView;
+  TOTKTextBar *bar=[[TOTKTextBar alloc] initWithFrame:cv.bounds];
   bar.maxUnits=maxU;bar.minUnits=minU;bar.digitsOnly=digits;bar.disabled=dis;
-  NSTextField *label=[NSTextField labelWithString:prompt];label.font=[NSFont systemFontOfSize:16 weight:NSFontWeightSemibold];
-  label.textColor=NSColor.whiteColor;label.frame=NSMakeRect(18,h-36,w-36,22);label.lineBreakMode=NSLineBreakByTruncatingTail;
-  NSString *limit=maxU>0?[NSString stringWithFormat:@"Up to %d characters · ",maxU]:@"";
-  NSTextField *hint=[NSTextField labelWithString:[NSString stringWithFormat:@"%@Type with the keyboard, Return to confirm, Esc to cancel",limit]];
-  hint.font=[NSFont systemFontOfSize:12];hint.textColor=[NSColor colorWithCalibratedWhite:0.72 alpha:1];hint.alignment=NSTextAlignmentRight;
-  hint.frame=NSMakeRect(18,h-36,w-36,20);hint.autoresizingMask=NSViewWidthSizable;
-  NSTextField *field=secure?[[NSSecureTextField alloc] initWithFrame:NSMakeRect(18,16,w-36,34)]:[[NSTextField alloc] initWithFrame:NSMakeRect(18,16,w-36,34)];
-  field.font=[NSFont systemFontOfSize:20];field.stringValue=initial;field.delegate=bar;field.bezelStyle=NSTextFieldRoundedBezel;bar.field=field;
+  [bar buildWithPrompt:prompt initial:initial secure:secure];
   __weak TOTKTextBar *weakBar=bar;
-  bar.done=^(NSString *text){result=[text copy];[weakBar removeFromSuperview];[window makeFirstResponder:window.contentView];textEntryOpen=0;front_mouse_update();dispatch_semaphore_signal(sem);};
-  [bar addSubview:label];[bar addSubview:hint];[bar addSubview:field];[cv addSubview:bar];openBar=bar;
+  bar.done=^(NSString *text){result=[text copy];[weakBar removeFromSuperview];openBar=nil;
+   runtime_gamepad_text_capture(0);[window makeFirstResponder:window.contentView];
+   textEntryOpen=0;front_mouse_update();dispatch_semaphore_signal(sem);};
+  [cv addSubview:bar];openBar=bar;
   runtime_input_clear();
   if(window.miniaturized)[window deminiaturize:nil];
   if(!assume_focus()){[NSApp activateIgnoringOtherApps:YES];[window makeKeyAndOrderFront:nil];}   /* test windows never take the keyboard */
-  [window makeFirstResponder:field];
+  [window makeFirstResponder:bar.field];
+  runtime_gamepad_text_capture(1);[bar startController];
   textEntryOpen=1;front_mouse_update();   /* the pointer is the player's while typing */
   fprintf(stderr,"[totk] keyboard: text entry bar shown (%s)\n",prompt.UTF8String);
  });
