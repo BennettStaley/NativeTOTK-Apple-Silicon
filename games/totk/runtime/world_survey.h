@@ -10,7 +10,8 @@ int runtime_survey_command(const char *line);
 void runtime_survey_tick(uint64_t frame);
 void runtime_survey_cancel_user(void);
 /* Noclip (the Cheats tab, Mac; 1.0.0 and 1.4.3): while on, the player is held each frame at a point the left stick moves
-   along his facing, X raises and B lowers, speed in metres a second; walls and the ground do not stop him. */
+   relative to the camera and the triggers (ZR / RT up, ZL / LT down) raise and lower, speed in metres a second; walls and
+   the ground do not stop him. */
 int runtime_noclip_available(void);
 void runtime_noclip_set(int on);
 int runtime_noclip_on(void);

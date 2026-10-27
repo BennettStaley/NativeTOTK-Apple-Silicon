@@ -210,7 +210,9 @@ static void (*noclip_force)(void *, const float *, uint32_t);
 static _Atomic int noclip_wanted;
 static _Atomic uint32_t noclip_speed_bits = 0x41400000;   /* 12.0f m/s */
 static struct { int holding; float xyz[3]; uint64_t at_ns; } noclip;   /* frame-end thread only */
-enum { NOCLIP_UP = 1 << 2, NOCLIP_DOWN = 1 << 1 };   /* npad X, B */
+enum { NOCLIP_UP = 1 << 9, NOCLIP_DOWN = 1 << 8 };   /* npad ZR, ZL: the triggers, the same on every controller layout */
+void dm_gfx_camera_want(int on);   /* nvn_mtl.m: the game camera of each frame, for flying relative to it */
+int dm_gfx_camera(float pos[3], float right[3], uint64_t *frame);
 
 static int read_mem(uintptr_t address, void *out, size_t size) {
     if (!address || address > UINTPTR_MAX - size) return 0;
@@ -336,6 +338,7 @@ int runtime_noclip_on(void) { return atomic_load(&noclip_wanted); }
 void runtime_noclip_set(int on) {
     if (on && !noclip_force) return;
     atomic_store(&noclip_wanted, !!on);
+    dm_gfx_camera_want(on);
     if (on) atomic_store_explicit(&runtime_survey_pending, 1, memory_order_release);   /* the tick runs every frame while on */
     fprintf(stderr, "[noclip] %s\n", on ? "on" : "off");
 }
@@ -345,8 +348,9 @@ void runtime_noclip_set_speed(float v) {
 }
 float runtime_noclip_speed(void) { uint32_t bits = atomic_load(&noclip_speed_bits); float v; memcpy(&v, &bits, 4); return v; }
 /* Frame-end thread: the first frame with a player takes his position; after that he is set to the held point, which the
-   left stick moves along his facing (he turns towards the stick, relative to the camera, as when running) and X / B
-   raise and lower. Gravity and collisions act between frames and are undone by the next hold. */
+   left stick moves relative to the camera (up: away from it, right: to the screen's right; level, whatever the camera's
+   pitch) and the triggers raise (ZR / RT) and lower (ZL / LT). Without a camera yet, his facing. Gravity and collisions
+   act between frames and are undone by the next hold. */
 static void noclip_tick(uintptr_t actor) {
     if (!atomic_load(&noclip_wanted) || !noclip_force || !actor) {
         if (noclip.holding) fprintf(stderr, "[noclip] released at %.1f,%.1f,%.1f\n", noclip.xyz[0], noclip.xyz[1], noclip.xyz[2]);
@@ -370,11 +374,25 @@ static void noclip_tick(uintptr_t actor) {
     runtime_input_left_stick(&sx, &sy);
     float push = sqrtf((float)sx * sx + (float)sy * sy) / 32767.0f;
     if (push < 0.15f) push = 0; else if (push > 1) push = 1;
-    float fx = rot[2], fz = rot[8], len = sqrtf(fx * fx + fz * fz), speed = runtime_noclip_speed();
-    if (len > 1e-3f) { fx /= len; fz /= len; } else fx = fz = 0;
+    float speed = runtime_noclip_speed(), mx = 0, mz = 0, cam[3], right[3];
+    uint64_t cam_frame = 0;
+    if (push > 0 && dm_gfx_camera(cam, right, &cam_frame)) {
+        float fx = noclip.xyz[0] - cam[0], fz = noclip.xyz[2] - cam[2], fl = sqrtf(fx * fx + fz * fz);
+        float rx = right[0], rz = right[2], rl = sqrtf(rx * rx + rz * rz);
+        if (fl > 1e-3f && rl > 1e-3f) {
+            fx /= fl; fz /= fl; rx /= rl; rz /= rl;
+            float k = push / (sqrtf((float)sx * sx + (float)sy * sy) / 32767.0f);   /* the stick's direction at the dead-zoned length */
+            mx = (fx * sy + rx * sx) / 32767.0f * k; mz = (fz * sy + rz * sx) / 32767.0f * k;
+            static int said;
+            if (!said++) fprintf(stderr, "[noclip] camera: forward %.2f,%.2f right %.2f,%.2f (cross %.2f: +1 when the right axis is forward x up)\n", fx, fz, rx, rz, -fz * rx + fx * rz);
+        }
+    } else if (push > 0) {   /* no camera yet: where he faces */
+        float fx = rot[2], fz = rot[8], len = sqrtf(fx * fx + fz * fz);
+        if (len > 1e-3f) { mx = fx / len * push; mz = fz / len * push; }
+    }
     uint64_t buttons = runtime_input_buttons();
     float up = (buttons & NOCLIP_UP ? 1.0f : 0.0f) - (buttons & NOCLIP_DOWN ? 1.0f : 0.0f);
-    float next[3] = {noclip.xyz[0] + fx * push * speed * dt, noclip.xyz[1] + up * speed * dt, noclip.xyz[2] + fz * push * speed * dt};
+    float next[3] = {noclip.xyz[0] + mx * speed * dt, noclip.xyz[1] + up * speed * dt, noclip.xyz[2] + mz * speed * dt};
     if (valid_xyz(next)) memcpy(noclip.xyz, next, sizeof next);   /* the map's edges stop it */
     for (unsigned row = 0; row < 3; row++) {
         for (unsigned col = 0; col < 3; col++) matrix[row * 4 + col] = rot[row * 3 + col];

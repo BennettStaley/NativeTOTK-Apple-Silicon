@@ -558,7 +558,7 @@ static int cheat_choice_members(int leader, int *all, int *usable, int max, int 
         NSSwitch *fly = [NSSwitch new]; fly.state = runtime_noclip_on() ? NSControlStateValueOn : NSControlStateValueOff;
         fly.target = self; fly.action = @selector(noclipSwitched:);
         [self addCheatsRow:[self cheatsRow:@"Noclip (fly through walls)"
-                                    about:@"Left stick moves Link the way he faces, X rises, B sinks. Save first: flying out of bounds can break events or drop you into unloaded ground."
+                                    about:@"Left stick flies Link relative to the camera; RT / ZR rises, LT / ZL sinks (keyboard: WASD, Shift, Option). Save first: flying out of bounds can break events or drop you into unloaded ground."
                                    detail:runtime_noclip_on() ? @"On: Link is held where you steer him" : @"Off at every start"
                                     color:runtime_noclip_on() ? NSColor.systemGreenColor : nil control:fly] id:CHEATS_NOCLIP_ROW];
         NSPopUpButton *speed = [NSPopUpButton new]; speed.controlSize = NSControlSizeSmall; speed.refusesFirstResponder = YES;

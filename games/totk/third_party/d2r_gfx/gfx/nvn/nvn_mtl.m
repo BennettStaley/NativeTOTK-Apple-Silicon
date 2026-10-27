@@ -5618,6 +5618,7 @@ static void mfx_snapshot_scene(void) {
     enc_b_end(g_blit); g_blit = nil;
     g_mfx.scene_done = 1; mfx_note_scene();
 }
+static void camfeed_pass(MTL4RenderPassDescriptor *pd);   // noclip's camera (below, by mfx_take_camera)
 static id<MTL4RenderCommandEncoder> rp_begin_ex(int clear_only);
 static id<MTL4RenderCommandEncoder> rp_begin(void) { return rp_begin_ex(0); }
 static int rt_none(void); static void noatt_dims(NSUInteger *w, NSUInteger *h);
@@ -5839,6 +5840,7 @@ static id<MTL4RenderCommandEncoder> rp_begin_ex(int clear_only) {
       void ts_note(id pd, NSUInteger nc); ts_note(pd, (NSUInteger)R.rt.n); }
     ser_gate();
     if (taa_pass(pd) == 2) g_mfx.want_cam = 1;   // TOTK_TAA: the G-buffer pass found; its first draw gives the camera
+    camfeed_pass(pd);   // noclip: the same camera, whatever else is on
     if (mfx_enabled()) mfx_pass_setup(pd, 1);   // TOTK: MetalFX scene / UI attachments, G-buffer depth
     else {
         if (mfx_debug_only()) mfx_pass_setup(pd, 0);   // the motion / depth debug view without interpolation: G-buffer depth, camera, per-object motion
@@ -12704,12 +12706,41 @@ static void prepare_draw_textures(NvProg *pr) {
 }
 /* TOTK_MFX: the camera of the G-buffer pass, from its first draw: vertex uniform 1, the 2368-byte block (view, view-projection,
    projection, inverse view, near / far, aspect, field of view; floats 84..167 hold the camera of two frames earlier). */
+/* Noclip (runtime/world_survey.c): the camera's position and its right axis (the view matrix's first row) for flying
+   relative to the camera. Taken from the same block as TOTK_MFX's camera, also while interpolation and TAA are off: a
+   G-buffer pass (32-bit float depth, three or more colours) of each frame while dm_gfx_camera_want is on. */
+static _Atomic int g_camfeed_want;
+static struct { pthread_mutex_t mu; float pos[3], right[3]; uint64_t frame; int ok, done, take; } g_camfeed = {PTHREAD_MUTEX_INITIALIZER};
+void dm_gfx_camera_want(int on) { atomic_store(&g_camfeed_want, on != 0); }
+int dm_gfx_camera(float pos[3], float right[3], uint64_t *frame) {
+    pthread_mutex_lock(&g_camfeed.mu);
+    int ok = g_camfeed.ok;
+    if (ok) { memcpy(pos, g_camfeed.pos, sizeof g_camfeed.pos); memcpy(right, g_camfeed.right, sizeof g_camfeed.right); *frame = g_camfeed.frame; }
+    pthread_mutex_unlock(&g_camfeed.mu);
+    return ok;
+}
+static void camfeed_pass(MTL4RenderPassDescriptor *pd) {
+    if (g_camfeed.done || !atomic_load_explicit(&g_camfeed_want, memory_order_relaxed)) return;
+    id<MTLTexture> c0 = R.rt.n > 0 && R.rt.color[0] ? pd.colorAttachments[0].texture : nil, dt = pd.depthAttachment.texture;
+    if (!c0 || !dt || dt.pixelFormat != MTLPixelFormatDepth32Float || dt.width != c0.width || dt.height != c0.height || dt.width < 320) return;
+    int nc = 0; for (int i = 0; i < R.rt.n && i < 8; i++) nc += pd.colorAttachments[i].texture != nil;
+    if (nc >= 3) { g_camfeed.done = 1; g_camfeed.take = 1; }
+}
+static void camfeed_note(const float *cam) {
+    if (!(cam[56] > 0 && cam[57] > cam[56]) || !isfinite(cam[47]) || !isfinite(cam[0])) return;
+    pthread_mutex_lock(&g_camfeed.mu);
+    g_camfeed.pos[0] = cam[47]; g_camfeed.pos[1] = cam[51]; g_camfeed.pos[2] = cam[55];
+    g_camfeed.right[0] = cam[0]; g_camfeed.right[1] = cam[1]; g_camfeed.right[2] = cam[2];
+    g_camfeed.frame = atomic_load(&g_cur_frame); g_camfeed.ok = 1;
+    pthread_mutex_unlock(&g_camfeed.mu);
+}
 static void mfx_take_camera(void) {
-    g_mfx.want_cam = 0;
+    g_mfx.want_cam = 0; g_camfeed.take = 0;
     const p_bind_buf *u = &S.ubo[0][MFX_CAM_SLOT]; float cam[84];
     if (u->addr && u->size == MFX_CAM_SIZE) {
         pend_materialize(u->addr, (uint8_t *)cam, sizeof cam, 0);   // the bytes this draw sees: memory plus pending inline updates
         mfx_note_camera(cam, 84);
+        camfeed_note(cam);
         if (taa_active()) taa_note_camera(cam, 84);
         /* TOTK_MFX_CAMLOG=<first>-<last frame>: every captured camera (diagnostic) */
         static long c0 = -2, c1; if (c0 == -2) { const char *e = getenv("TOTK_MFX_CAMLOG"); c0 = e ? atol(e) : -1; c1 = e && strchr(e, '-') ? atol(strchr(e, '-') + 1) : c0; }
@@ -13577,7 +13608,7 @@ frz_plain:;
         }
         if (r != g_mfx.role) { g_mfx.role = r; PSO_DIRTY(); }
     }
-    if (g_mfx.want_cam) mfx_take_camera();
+    if (g_mfx.want_cam || g_camfeed.take) mfx_take_camera();
     if (defer_q_draw) { en_keep = en; defer_replay(); }
     if (skip_d) { g_stat_ds_omit++; if (mode == 3) g_stat_s_only++; else if (mode == 4) g_stat_d_only++; }
     // The pipeline depends only on (program, render pass targets, blend / color / write mask / multisample state, vertex layout): if these did not change, reuse the previous one
@@ -16416,6 +16447,7 @@ static void mfx_debug_present(const tex_t *t, int discard, const int crop[4]) {
     }
 }
 uint64_t mtl_present(const tex_t *t, double period, const int crop[4]) {
+    g_camfeed.done = g_camfeed.take = 0;   // noclip's camera: next frame's G-buffer pass
     uil_frame_end();   // the UI-layer composite: next frame (before interpolation takes this one)
     taa_frame_end();   // TOTK_TAA: next frame's jitter, this frame's depth and camera forgotten (also while off: key 5)
     int discard = atomic_load(&g_present_discard), islot = mfx_enabled() && t ? mfx_present_frame(t, period, discard, crop) : -1;
