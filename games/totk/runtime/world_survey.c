@@ -181,6 +181,11 @@ void runtime_survey_init(Module *m) {
 }
 int runtime_survey_command(const char *line) { (void)line; return 0; }
 #endif
+int runtime_noclip_available(void) { return 0; }
+void runtime_noclip_set(int on) { (void)on; }
+int runtime_noclip_on(void) { return 0; }
+void runtime_noclip_set_speed(float v) { (void)v; }
+float runtime_noclip_speed(void) { return 0; }
 #else
 enum { SCENE_SLOT = GAME_ADDR(0x4663f08), FORCE_MATRIX = GAME_ADDR(0x69a18c), ACTOR_POS = GAME_ACTOR_POS, ACTOR_ROT = GAME_ACTOR_ROT };
 static uintptr_t survey_main;
@@ -200,6 +205,12 @@ static unsigned hold_left;
 static float hold_xyz[3];
 static char hold_tag[64];
 static _Thread_local int in_tick;
+/* Noclip: the same hold as "survey move", every frame while on, at a point the player steers (runtime_noclip_*). */
+static void (*noclip_force)(void *, const float *, uint32_t);
+static _Atomic int noclip_wanted;
+static _Atomic uint32_t noclip_speed_bits = 0x41400000;   /* 12.0f m/s */
+static struct { int holding; float xyz[3]; uint64_t at_ns; } noclip;   /* frame-end thread only */
+enum { NOCLIP_UP = 1 << 2, NOCLIP_DOWN = 1 << 1 };   /* npad X, B */
 
 static int read_mem(uintptr_t address, void *out, size_t size) {
     if (!address || address > UINTPTR_MAX - size) return 0;
@@ -256,9 +267,19 @@ static uintptr_t player_actor(void) {
     return 0;
 }
 void runtime_survey_init(Module *m) {
-    /* The actor spawner (actor_spawn.c, 1.4.3) uses this frame-end tick in every session: it needs the player, found
-       through the scene slot, and nothing else of the survey. pos / move stay behind TOTK_SURVEY below. */
-    if (!strcmp(m->name, "main") && SCENE_SLOT + 8u <= m->size && runtime_spawn_init(m)) survey_main = (uintptr_t)m->base;
+#if defined(TOTK_GAME_V143)
+    const uint32_t expected[] = {0xa9bc7bfd, 0xa9015ff8, 0xa90257f6, 0xa9034ff4};   // 1.4.3 inlines the physics call: larger frame
+#else
+    const uint32_t expected[] = {0xa9bd7bfd, 0xf9000bf5, 0x910003fd, 0xa9024ff4};
+#endif
+    int force_ok = !strcmp(m->name, "main") && FORCE_MATRIX + sizeof expected <= m->text_end && !memcmp(m->base + FORCE_MATRIX, expected, sizeof expected);
+    /* The actor spawner (actor_spawn.c, 1.4.3) and noclip use this frame-end tick in every session: they need the player,
+       found through the scene slot, and noclip the forceSetMatrix entry checked above. pos / move stay behind TOTK_SURVEY. */
+    if (!strcmp(m->name, "main") && SCENE_SLOT + 8u <= m->size && runtime_spawn_init(m)) {
+        survey_main = (uintptr_t)m->base;
+        if (force_ok) noclip_force = (void (*)(void *, const float *, uint32_t))(m->base + FORCE_MATRIX);
+        fprintf(stderr, "[noclip] %s\n", force_ok ? "available (Cheats tab)" : "[red] off: the forceSetMatrix entry differs from " TOTK_GAME_VERSION);
+    }
     const char *enabled = getenv("TOTK_SURVEY");
     if (!enabled || strcmp(enabled, "1")) return;
     const char *owner = getenv("TOTK_SLOT_OWNER"), *profile = getenv("TOTK_PROFILE_DIR");
@@ -266,13 +287,7 @@ void runtime_survey_init(Module *m) {
     if (!owner || !strcmp(owner, "user") || !profile || !realpath(profile, target) ||
         (realpath("analysis/phase6-profile", user) && !strcmp(target, user)))
         runtime_fail("TOTK_SURVEY requires an agent-owned session and a separate test profile");
-#if defined(TOTK_GAME_V143)
-    const uint32_t expected[] = {0xa9bc7bfd, 0xa9015ff8, 0xa90257f6, 0xa9034ff4};   // 1.4.3 inlines the physics call: larger frame
-#else
-    const uint32_t expected[] = {0xa9bd7bfd, 0xf9000bf5, 0x910003fd, 0xa9024ff4};
-#endif
-    if (strcmp(m->name, "main") || SCENE_SLOT + 8u > m->size || FORCE_MATRIX + sizeof expected > m->text_end ||
-        memcmp(m->base + FORCE_MATRIX, expected, sizeof expected))
+    if (strcmp(m->name, "main") || SCENE_SLOT + 8u > m->size || !force_ok)
         runtime_fail("survey requires verified game-version forceSetMatrix entry");
     survey_main = (uintptr_t)m->base;
     survey_force = (void (*)(void *, const float *, uint32_t))(m->base + FORCE_MATRIX);
@@ -312,9 +327,60 @@ void runtime_survey_cancel_user(void) {
     if (!atomic_load_explicit(&runtime_survey_pending, memory_order_relaxed)) return;
     pthread_mutex_lock(&survey_lock);
     request.kind = 0; hold_left = 0; atomic_store(&runtime_survey_pending, 0);
-    if (atomic_load(&runtime_spawn_waiting)) atomic_store(&runtime_survey_pending, 1);   /* spawns are not cancelled */
+    if (atomic_load(&runtime_spawn_waiting) || atomic_load(&noclip_wanted)) atomic_store(&runtime_survey_pending, 1);   /* spawns and noclip are not cancelled */
     fprintf(stderr, "[survey] cancelled: user input\n");
     pthread_mutex_unlock(&survey_lock);
+}
+int runtime_noclip_available(void) { return noclip_force != NULL; }
+int runtime_noclip_on(void) { return atomic_load(&noclip_wanted); }
+void runtime_noclip_set(int on) {
+    if (on && !noclip_force) return;
+    atomic_store(&noclip_wanted, !!on);
+    if (on) atomic_store_explicit(&runtime_survey_pending, 1, memory_order_release);   /* the tick runs every frame while on */
+    fprintf(stderr, "[noclip] %s\n", on ? "on" : "off");
+}
+void runtime_noclip_set_speed(float v) {
+    if (!(v >= 1 && v <= 200)) return;
+    uint32_t bits; memcpy(&bits, &v, 4); atomic_store(&noclip_speed_bits, bits);
+}
+float runtime_noclip_speed(void) { uint32_t bits = atomic_load(&noclip_speed_bits); float v; memcpy(&v, &bits, 4); return v; }
+/* Frame-end thread: the first frame with a player takes his position; after that he is set to the held point, which the
+   left stick moves along his facing (he turns towards the stick, relative to the camera, as when running) and X / B
+   raise and lower. Gravity and collisions act between frames and are undone by the next hold. */
+static void noclip_tick(uintptr_t actor) {
+    if (!atomic_load(&noclip_wanted) || !noclip_force || !actor) {
+        if (noclip.holding) fprintf(stderr, "[noclip] released at %.1f,%.1f,%.1f\n", noclip.xyz[0], noclip.xyz[1], noclip.xyz[2]);
+        noclip.holding = 0;
+        return;
+    }
+    float rot[9], matrix[12];
+    uint64_t now = runtime_now_ns();
+    if (!read_mem(actor + ACTOR_ROT, rot, sizeof rot)) return;
+    for (unsigned i = 0; i < 9; i++) if (!isfinite(rot[i]) || fabsf(rot[i]) > 2) return;
+    if (!noclip.holding) {
+        if (!read_mem(actor + ACTOR_POS, noclip.xyz, sizeof noclip.xyz) || !valid_xyz(noclip.xyz)) return;
+        noclip.holding = 1; noclip.at_ns = now;
+        fprintf(stderr, "[noclip] holding from %.1f,%.1f,%.1f\n", noclip.xyz[0], noclip.xyz[1], noclip.xyz[2]);
+    }
+    float dt = (float)(now - noclip.at_ns) * 1e-9f;
+    noclip.at_ns = now;
+    if (!(dt > 0)) dt = 0;
+    if (dt > 0.1f) dt = 0.1f;   /* a pause or a menu */
+    int32_t sx = 0, sy = 0;
+    runtime_input_left_stick(&sx, &sy);
+    float push = sqrtf((float)sx * sx + (float)sy * sy) / 32767.0f;
+    if (push < 0.15f) push = 0; else if (push > 1) push = 1;
+    float fx = rot[2], fz = rot[8], len = sqrtf(fx * fx + fz * fz), speed = runtime_noclip_speed();
+    if (len > 1e-3f) { fx /= len; fz /= len; } else fx = fz = 0;
+    uint64_t buttons = runtime_input_buttons();
+    float up = (buttons & NOCLIP_UP ? 1.0f : 0.0f) - (buttons & NOCLIP_DOWN ? 1.0f : 0.0f);
+    float next[3] = {noclip.xyz[0] + fx * push * speed * dt, noclip.xyz[1] + up * speed * dt, noclip.xyz[2] + fz * push * speed * dt};
+    if (valid_xyz(next)) memcpy(noclip.xyz, next, sizeof next);   /* the map's edges stop it */
+    for (unsigned row = 0; row < 3; row++) {
+        for (unsigned col = 0; col < 3; col++) matrix[row * 4 + col] = rot[row * 3 + col];
+        matrix[row * 4 + 3] = noclip.xyz[row];
+    }
+    noclip_force((void *)actor, matrix, 0);
 }
 void runtime_survey_tick(uint64_t frame) {
     if (in_tick || !atomic_load_explicit(&runtime_survey_pending, memory_order_acquire)) return;
@@ -350,11 +416,12 @@ void runtime_survey_tick(uint64_t frame) {
     }
     int survey_left = request.kind || hold_left;
     pthread_mutex_unlock(&survey_lock);
+    if (!survey_left) noclip_tick(actor);   /* a scripted move wins */
     runtime_spawn_tick(actor, frame);   /* outside the survey lock: it calls into the game */
     /* cleared before the spawn queue is looked at again, so a spawn queued meanwhile (it sets waiting, then pending) is
        never lost */
     atomic_store(&runtime_survey_pending, survey_left);
-    if (atomic_load(&runtime_spawn_waiting)) atomic_store(&runtime_survey_pending, 1);
+    if (atomic_load(&runtime_spawn_waiting) || atomic_load(&noclip_wanted)) atomic_store(&runtime_survey_pending, 1);
     in_tick = 0;
 }
 #endif   /* GAME_BOTW */

@@ -207,6 +207,8 @@ typedef struct { uint64_t buttons; int32_t lx,ly,rx,ry; int connected; } Runtime
 void runtime_gamepad_start(void);
 void runtime_gamepad_switch_left(void *controller, int x, int y);
 void runtime_gamepad_read(RuntimeGamepadState *out);
+void runtime_gamepad_left_stick(int32_t *x,int32_t *y);   /* the stick without taking the press edges */
+void runtime_input_left_stick(int32_t *x,int32_t *y);   /* runtime/input.c: keyboard WASD or the controller, the stronger, -32767..32767, y up */
 uint64_t runtime_gamepad_held(void);   /* held buttons, leaving the press edges for runtime_gamepad_read */
 /* Forget held buttons and sticks: macOS stops delivering controller events (including releases) while the app is in
    the background, so a button held at focus loss would otherwise stay pressed for the game. */

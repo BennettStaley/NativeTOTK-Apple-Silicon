@@ -30,6 +30,7 @@
 @end
 #include "mods_panel_mac.h"
 #include "spawn_panel_mac.h"
+#include "world_survey.h"
 
 @interface TOTKSettingsPanel : NSView
 + (void)toggle;
@@ -61,8 +62,11 @@ static NSWindow *settings_window(void);   /* frontend.m: the game window */
     BOOL cheatsUnavailableShown, cheatDbAsked;   /* the Cheats tab: the folded list is open; the list was checked this run */
 }
 static TOTKSettingsPanel *settingsPanel;
+static const int NOCLIP_SPEEDS[] = {5, 12, 25, 50, 100};   /* the Cheats tab's noclip speeds, metres a second (12 by default) */
+enum { NOCLIP_NSPEEDS = (int)(sizeof NOCLIP_SPEEDS / sizeof *NOCLIP_SPEEDS) };
 enum { PANEL_WIDTH = 480, PANEL_MARGIN = 16, PAGE_STEP = 8 /* rows per LT / RT on a pane without row frames */,
        SAVES_ROW = -1, CHEATS_FOLDER_ROW = -2, CHEATS_OFF_ROW = -3, CHEATS_RESTART_ROW = -4, CHEATS_DB_ROW = -5, CHEATS_UNAVAILABLE_ROW = -6,
+       CHEATS_NOCLIP_ROW = -7, CHEATS_NOCLIP_SPEED_ROW = -8,
        CHEAT_ROW = -1000 /* - k: cheat k, or the choice whose first variant is k */ };
 static NSString *const BAR_HINT = @"←→ sections   ↓ open   Q E tabs   R reset tab   ⇧R reset all   Esc close\n"
                                    "Controller: D-pad, A open, LB RB tabs, X reset tab, Y reset all, B close";
@@ -550,8 +554,21 @@ static int cheat_choice_members(int leader, int *all, int *usable, int max, int 
     NSString *file = [NSString stringWithFormat:@"%s.txt", *bid ? bid : "<build ID>"];
     BOOL hasFolder = folder && *folder && strcmp(folder, "0");
     NSString *where = hasFolder ? [@(folder) stringByAbbreviatingWithTildeInPath] : @"(off: TOTK_CHEATS_DIR=0)";
+    if (runtime_noclip_available()) {   /* world_survey.c: not a cheat file's code, so above the files' cheats */
+        NSSwitch *fly = [NSSwitch new]; fly.state = runtime_noclip_on() ? NSControlStateValueOn : NSControlStateValueOff;
+        fly.target = self; fly.action = @selector(noclipSwitched:);
+        [self addCheatsRow:[self cheatsRow:@"Noclip (fly through walls)"
+                                    about:@"Left stick moves Link the way he faces, X rises, B sinks. Save first: flying out of bounds can break events or drop you into unloaded ground."
+                                   detail:runtime_noclip_on() ? @"On: Link is held where you steer him" : @"Off at every start"
+                                    color:runtime_noclip_on() ? NSColor.systemGreenColor : nil control:fly] id:CHEATS_NOCLIP_ROW];
+        NSPopUpButton *speed = [NSPopUpButton new]; speed.controlSize = NSControlSizeSmall; speed.refusesFirstResponder = YES;
+        for (int i = 0; i < NOCLIP_NSPEEDS; i++) { [speed addItemWithTitle:[NSString stringWithFormat:@"%d m/s", NOCLIP_SPEEDS[i]]]; speed.lastItem.tag = NOCLIP_SPEEDS[i]; }
+        [speed selectItemWithTag:(NSInteger)lroundf(runtime_noclip_speed())];
+        speed.target = self; speed.action = @selector(noclipSpeedChosen:);
+        [self addCheatsRow:[self cheatsRow:@"Noclip speed" detail:@"How fast Link flies (← → change it)" color:nil control:speed] id:CHEATS_NOCLIP_SPEED_ROW];
+    }
     if (runtime_cheats_count()) {
-        NSButton *off = [self cheatsButton:@"Turn off" action:@selector(cheatsAllOff)]; off.enabled = cheats_any_on();
+        NSButton *off = [self cheatsButton:@"Turn off" action:@selector(cheatsAllOff)]; off.enabled = cheats_any_on() || runtime_noclip_on();
         NSString *how = runtime_cheats_live_code() ? @"All of them stop at once. " : @"Live cheats stop at once; code patches after a restart. ";
         [self addCheatsRow:[self cheatsRow:@"Turn off all cheats" detail:[how stringByAppendingString:
                             @"The first cheat you turn on backs up your saves (profile-before-cheats)."] color:nil control:off] id:CHEATS_OFF_ROW];
@@ -637,7 +654,15 @@ static int cheat_choice_members(int leader, int *all, int *usable, int max, int 
 }
 - (void)updateCheatList { [TOTKCheatDb update:YES]; }
 - (void)toggleCheatsUnavailable { cheatsUnavailableShown = !cheatsUnavailableShown; [self rebuildKeepingPlace]; }
+- (void)noclipSwitched:(NSSwitch *)s { runtime_noclip_set(s.state == NSControlStateValueOn); [self rebuildKeepingPlace]; }
+- (void)noclipSpeedChosen:(NSPopUpButton *)b { runtime_noclip_set_speed((float)b.selectedTag); [self.window makeFirstResponder:self]; }
+- (void)stepNoclipSpeed:(int)dir {
+    int at = 0; while (at < NOCLIP_NSPEEDS - 1 && NOCLIP_SPEEDS[at] < (int)lroundf(runtime_noclip_speed())) at++;
+    at = MAX(0, MIN(NOCLIP_NSPEEDS - 1, at + dir));
+    runtime_noclip_set_speed((float)NOCLIP_SPEEDS[at]); [self rebuildKeepingPlace];
+}
 - (void)cheatsAllOff {
+    runtime_noclip_set(0);
     for (int i = 0; i < runtime_cheats_count(); i++) if (runtime_cheats_state(i) & CHEAT_ON) runtime_cheats_set(i, 0);
     [self rebuildKeepingPlace];
 }
@@ -854,6 +879,8 @@ static NSTextField *settings_help_label(NSView *v) {   /* a setting row's help t
     if (i == SAVES_ROW) { if (!dir) [self sendSaves]; return; }
     if (i == CHEATS_FOLDER_ROW) { if (!dir) [self openCheatsFolder]; return; }
     if (i == CHEATS_OFF_ROW) { if (!dir) [self cheatsAllOff]; return; }
+    if (i == CHEATS_NOCLIP_ROW) { runtime_noclip_set(dir ? dir > 0 : !runtime_noclip_on()); [self rebuildKeepingPlace]; return; }
+    if (i == CHEATS_NOCLIP_SPEED_ROW) { if (dir) [self stepNoclipSpeed:dir]; return; }
     if (i == CHEATS_RESTART_ROW) { if (!dir && runtime_front_can_restart()) [self restartGame]; return; }
     if (i == CHEATS_DB_ROW) { if (!dir) [self updateCheatList]; return; }
     if (i == CHEATS_UNAVAILABLE_ROW) { if (!dir) [self toggleCheatsUnavailable]; return; }

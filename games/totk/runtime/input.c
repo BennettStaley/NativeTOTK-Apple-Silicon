@@ -62,6 +62,8 @@ void runtime_input_hold(int on){atomic_store(&inputHeld,on?1:0);if(on)runtime_in
 /* Cheats (cheats.c): the buttons held now (keyboard and controller), in the npad bit order. */
 uint64_t runtime_input_buttons(void){uint64_t b=0;pthread_mutex_lock(&inputLock);for(unsigned i=0;i<128;i++)if(keys[i])b|=button(i);pthread_mutex_unlock(&inputLock);
  return b|runtime_gamepad_held();}
+void runtime_input_left_stick(int32_t *x,int32_t *y){pthread_mutex_lock(&inputLock);int32_t kx=32767*((int)keys[2]-(int)keys[0]),ky=32767*((int)keys[13]-(int)keys[1]);int held=atomic_load(&inputHeld);pthread_mutex_unlock(&inputLock);
+ int32_t px=0,py=0;runtime_gamepad_left_stick(&px,&py);if(held){*x=*y=0;return;}*x=abs(px)>abs(kx)?px:kx;*y=abs(py)>abs(ky)?py:ky;}
 void runtime_input_clear(void){pthread_mutex_lock(&inputLock);memset(keys,0,sizeof(keys));pending=0;pthread_mutex_unlock(&inputLock);runtime_gamepad_clear();}
 static void initialize(void){pthread_mutex_lock(&inputLock);enabled=true;pthread_mutex_unlock(&inputLock);fprintf(stderr,"[totk] native keyboard controller initialized\n");}
 /* Docked: one full-key controller as player 1 (id 0, style bit 0). Handheld (TOTK_OPERATION_MODE=handheld, the iPhone):
@@ -201,6 +203,8 @@ static void *input_file(void *arg) {
             extern void dm_gfx_anomdump(void); dm_gfx_anomdump();
         } else if (sscanf(line, "querylog %u %n", &code, &used) == 1 && used && !line[used] && code > 0 && code <= 600) {
             extern void dm_gfx_querylog_next(long n); dm_gfx_querylog_next((long)code);   /* occlusion query results of the next n frames */
+        } else if (!strcmp(line, "noclip on\n") || !strcmp(line, "noclip off\n")) {   /* the Cheats tab's noclip switch (world_survey.c) */
+            runtime_noclip_set(line[8] == 'n');
         } else if (!strncmp(line, "flag ", 5)) {
             /* "flag <name> <0|1>": switch a graphics behaviour while the game runs (A/B without restarting); rumble / gyro mute and unmute those */
             char name[64]; int v; if (sscanf(line + 5, "%63s %d", name, &v) != 2) runtime_fail("diagnostic flag needs <name> <0|1>");

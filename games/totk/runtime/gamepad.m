@@ -638,6 +638,15 @@ uint64_t runtime_gamepad_held(void) {
     return b;
 }
 
+/* The left stick as runtime_gamepad_read gives it, leaving the press edges for the game (noclip, world_survey.c). */
+void runtime_gamepad_left_stick(int32_t *x, int32_t *y) {
+    pthread_mutex_lock(&gamepadLock);
+    int32_t lx = gamepadState.lx, ly = gamepadState.ly;
+    if (gamepadRawLeftAt && runtime_now_ns() - gamepadRawLeftAt > 250000000ULL) { lx = gamepadNativeLx; ly = gamepadNativeLy; }
+    *x = stronger_axis(lx, touchState.lx); *y = stronger_axis(ly, touchState.ly);
+    pthread_mutex_unlock(&gamepadLock);
+}
+
 void runtime_gamepad_read(RuntimeGamepadState *out) {
     pthread_mutex_lock(&gamepadLock);
     *out = gamepadState;
