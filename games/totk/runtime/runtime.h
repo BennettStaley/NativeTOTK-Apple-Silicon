@@ -143,7 +143,7 @@ void runtime_fog_set(int percent);   /* aspect_patch.h: fog density 0..100 % liv
 int runtime_shadow_res(void);        /* aspect_patch.h: the shadow map factor in force from the start (TOTK_SHADOW_RES): 0 = the game's own, 2 / 4, -2 / -4 = 0.5x / 0.25x */
 void runtime_fov_aspect(float k);   /* aspect_patch.h: the vertical angle's factor for a screen taller than 16:9 (Vert+), with the player's */  /* runtime/aspect_patch.h: field of view 70..140 % live (1.4.3, Mac and iOS), 100 = the game's own */
 void runtime_time_speed_set(int percent);       /* runtime/world_patch.h: time of day 0 (paused) .. 800 % live (1.4.3), 100 = the game's own */
-void runtime_render_distance_set(int percent);   /* runtime/world_patch.h: the camera's far clip 50..300 % live (1.4.3), 100 = the game's own */
+void runtime_render_distance_set(int percent);   /* runtime/world_patch.h: the camera's far clip 10..100 % live (1.4.3), 100 = the game's own */
 void runtime_front_resize_aspect(double ratio);   /* Mac: resize the window to a selected picture ratio */
 int hud_compact(void);   /* gfx/nvn/fps_overlay.c: the overlay lines go to the window's corner panel (TOTK_HUD=corners: in the picture) */
 enum { HUD_LINE_COUNT = 5 };   /* fps_overlay.h HUD_LINES */

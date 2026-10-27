@@ -147,8 +147,8 @@ static const SettingDef SETTINGS[] = {
      NULL, SET_RANGE, SET_LIVE, SET_ALL, 100, 100, 0, 100, 10, "%", NULL, 0, NULL, NULL, 0},
     {"graphics.lens_flare", "Effects", "Lens flare", "The game's rings and glints across the picture when the sun is in view (version 1.4.3).",
      NULL, SET_BOOL, SET_LIVE, SET_ALL, 1, 1, 0, 1, 1, NULL, NULL, 0, NULL, NULL, 0},
-    {"graphics.render_distance", "World detail", "Render distance", "How far the camera draws before distant land is cut off, against the game's own 25 km (version 1.4.3); below 50% is below the game's own quality: far land is cut off visibly, in exchange for fewer things drawn. It does not change the detail of distant land.",
-     "TOTK_RENDER_DISTANCE", SET_RANGE, SET_LIVE, SET_ALL, 100, 100, 10, 300, 10, "%", NULL, 0, NULL, NULL, 0},
+    {"graphics.render_distance", "World detail", "Render distance", "How far the camera draws before distant land is cut off, against the game's own 25 km (version 1.4.3); below 50% is below the game's own quality: far land is cut off visibly, in exchange for fewer things drawn. The game's own is the most: farther breaks the horizon seen from high in the sky.",
+     "TOTK_RENDER_DISTANCE", SET_RANGE, SET_LIVE, SET_ALL, 100, 100, 10, 100, 10, "%", NULL, 0, NULL, NULL, 0},
     {"graphics.dynamic_res", "World detail", "Dynamic resolution", "The game lowers the 3D world to 90 or 80 % of the render resolution when frames run long; Off keeps it at 100 %, sharper but slower in busy places (version 1.4.3).",
      "TOTK_FIXED_RES", SET_CHOICE, SET_RESTART, SET_MAC, 0, 0, 0, 0, 0, NULL, SET_DYNRES, SET_N(SET_DYNRES), "Not on iPhone and iPad: their game code is fixed when the app is built.", NULL, 0},
     {"framerate.cap", "Frame rate", "Frame rate limit", "How many frames a second the game draws. Auto picks the fastest rate the game holds steadily: with variable refresh (below) 120, 80, 60 or 48 on the built-in display; without it 120, 60, 40 or 30 on a 120 Hz display, so frames never alternate between one and two refreshes. 80 fps is even only with variable refresh. Unlimited draws as fast as it can (uneven on a fixed-refresh display). With frame interpolation the limit is what you see: the game runs at half of it.",
@@ -227,7 +227,7 @@ static const SettingPresetMember SETTINGS_PRESET_MEMBERS[] = {
     {"graphics.sharpen", {0, 0, 20}},
     {"graphics.aniso", {0, 0, 16}},
     {"graphics.shadow_res", {0, 0, 2}},
-    {"graphics.render_distance", {100, 100, 150}},
+    {"graphics.render_distance", {100, 100, 100}},
     {"framerate.cap", {30, SET_PRESET_DEFAULT, SET_PRESET_DEFAULT}},
 };
 enum { SETTINGS_PRESET_NMEMBERS = sizeof SETTINGS_PRESET_MEMBERS / sizeof *SETTINGS_PRESET_MEMBERS };

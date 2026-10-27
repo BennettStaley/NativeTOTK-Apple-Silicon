@@ -179,8 +179,10 @@ def world_checks(out, raw, data, layout):
         results[hex(site)] = [own, scaled]
     paused = run_site(img, 0x68c15c, 0x80000000)
     assert paused == 0.0, 'paused (-0.0) did not give a zero step'
-    code, start = image({'TOTK_TIME_SPEED': '0', 'TOTK_RENDER_DISTANCE': '250'})
-    assert code == 0 and struct.unpack('<If', start[data + 72:data + 80]) == (0x80000000, 2.5), 'the start values are not on the data page'
+    code, start = image({'TOTK_TIME_SPEED': '0', 'TOTK_RENDER_DISTANCE': '50'})
+    assert code == 0 and struct.unpack('<If', start[data + 72:data + 80]) == (0x80000000, 0.5), 'the start values are not on the data page'
+    code, start = image({'TOTK_RENDER_DISTANCE': '250'})
+    assert code == 0 and struct.unpack('<I', start[data + 76:data + 80]) == (0,), 'a render distance above 100 is not the game\'s own'
     code, start = image({'TOTK_TIME_SPEED': '800', 'TOTK_RENDER_DISTANCE': '100'})
     assert code == 0 and struct.unpack('<fI', start[data + 72:data + 80]) == (8.0, 0)
     code, _ = image({'TOTK_TIME_SPEED': '300'})
