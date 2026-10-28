@@ -236,7 +236,7 @@ def walk_until_prompt(g, target, look=None, limit=20):
             d = xz(st['pos'], target)
             if d > last + 0.5 or (d < 0.4 and last < 0.4): face(g, look); return prompt_visible(g)   # at or past it
             last = min(last, d)
-            g.send('ctl stick l 0 1 %d' % (200 if d > 4 else 20)); time.sleep(0.3)
+            g.send('ctl stick l 0 1 %d' % (200 if d > 4 else 40)); time.sleep(0.3)
     return False
 
 
