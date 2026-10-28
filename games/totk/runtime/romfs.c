@@ -5,6 +5,7 @@
 #include "fs_host.h"
 #include "romfs_path.h"
 #include "mods.h"
+#include "world_survey.h"
 #include "../third_party/zstd/zstd.h"
 #include <CommonCrypto/CommonDigest.h>
 #include <TargetConditionals.h>
@@ -593,6 +594,7 @@ void runtime_fs_log(const char *what,const char *path){fs_log(what,path);}
 unsigned runtime_romfs_open(uint64_t *out,const char *path,int mode) {
  fs_log("rom",path?path:"(null)");
  if(!out||mode!=1)return UNSUPPORTED;const char *p=rom_path(path);if(!p)return NOT_FOUND;uint64_t i=file_index(p);if(i==UINT64_MAX)return NOT_FOUND;
+ runtime_autoshrine_romfs(p);   /* auto shrine watches which map loads (world_survey.c) */
  uint32_t ov=overlay_slot(i);int fd=-1;
  if(ov){const Overlay *o=&overlays[ov-1];fd=open(o->path,O_RDONLY|O_CLOEXEC);struct stat st;
   if(fd<0||fstat(fd,&st)!=0||(uint64_t)st.st_size!=o->size||st.st_dev!=o->dev||st.st_ino!=o->ino||st.st_mtimespec.tv_sec!=o->mtime.tv_sec||st.st_mtimespec.tv_nsec!=o->mtime.tv_nsec){

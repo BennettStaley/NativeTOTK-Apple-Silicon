@@ -1,11 +1,14 @@
 /* Unit test for runtime/dish_give.h and the Dishes parts of runtime/spawn_list.h: the GameData name hash against values
    the game and the save editors use, request limits, the change-queue room check, and the actor list's dishes and
    @effect lines (a menu that cannot give dishes leaves them out). Also map_pins.h and landmarks.h (towers, shrines and
-   the story's places: a small map file, place list, message file and save made here; the story flags and the lock). Prints one JSON line; exit 1 on failure. */
+   the story's places: a small map file, place list, message file and save made here; the story flags and the lock), and
+   shrine_auto.h (a shrine's outside and inside map files, its kind, the save's DungeonState, which shrines a run does and
+   in which order, where Link stands). Prints one JSON line; exit 1 on failure. */
 #include "dish_give.h"
 #include "spawn_list.h"
 #include "map_pins.h"
 #include "landmarks.h"
+#include "shrine_auto.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -13,7 +16,7 @@ static int failures, checks;
 #define CHECK(cond, ...) do { checks++; if (!(cond)) { failures++; fprintf(stderr, "FAIL: " __VA_ARGS__); fputc('\n', stderr); } } while (0)
 
 /* A little-endian BYML / MSBT / SARC made here, as the game's files are laid out. */
-static uint8_t buf[0x800]; static size_t at;
+static uint8_t buf[0x2000]; static size_t at;
 static uint32_t put(const void *p, size_t n) { uint32_t o = (uint32_t)at; memcpy(buf + at, p, n); at += n; return o; }
 static uint32_t put32(uint32_t v) { return put(&v, 4); }
 static void align(size_t a) { while (at % a) buf[at++] = 0; }
@@ -33,6 +36,39 @@ static uint32_t byml_array(int n, const uint8_t *type, const uint32_t *value) {
     return a;
 }
 static uint32_t f32(float f) { uint32_t w; memcpy(&w, &f, 4); return w; }
+/* A map file of actors for shrine_auto.h: keys and strings below; each actor a Gyaml, a Translate, and optionally a Name,
+   a Rotate and up to two Dynamic entries (a string or a bool). */
+enum { K_ACTORS, K_DYNAMIC, K_INDEX, K_GYAML, K_TRANSLATE, K_NAME, K_EVENT, K_CRYSTAL, K_HIDDEN, K_ROTATE, K_TYPE, NKEYS };
+static const char *const shrine_keys[NKEYS] = {"Actors", "Dynamic", "DungeonIndexStr", "Gyaml", "Translate", "Name", "RequestEventName",
+                                               "IsKeyCrystalAuthSmallDungeon", "IsHiddenSmallDungeon", "Rotate", "Type"};
+enum { S_ENTRANCE, S_LIFT, S_ANCHOR, S_WARP, S_D7, S_GO, S_ENTER_POS, S_START, S_ON_ELEVATOR, S_GOAL, S_GOAL_EXIT, S_EXIT_POS, S_TBOX, S_RETURN, S_LEAVE_POS, S_ENEMY, S_D200, NSTRS };
+static const char *const shrine_strs[NSTRS] = {"DgnObj_ZonauShrineEntrance_A_01", "FldObj_EnterAttetionActor", "DestinationAnchor", "DgnObj_WarpPoint_Zonau_A_01",
+                                               "Dungeon007", "DmF_SY_SmallDungeon2Go", "EnterSmallDungeonPos", "StartPos", "OnElevator", "DgnObj_Hrl_GoalSystem_B_01",
+                                               "DgnObj_GoalExit", "SmallDungeonExit", "TBox_Dungeon_Stone", "DmF_SY_SmallDungeon4Return", "LeaveSmallDungeonPos", "Enemy", "Dungeon200"};
+typedef struct { int gyaml; float pos[3]; int name, ndyn, rotate; int dkey[2]; uint8_t dtype[2]; uint32_t dval[2]; float rot[3]; } TestActor;
+static uint32_t vec3(const float *v) { const uint8_t ft[3] = {0xD2, 0xD2, 0xD2}; const uint32_t fv[3] = {f32(v[0]), f32(v[1]), f32(v[2])}; return byml_array(3, ft, fv); }
+static size_t shrine_map(const TestActor *a, int n) {
+    at = 16; memset(buf, 0, sizeof buf); memcpy(buf, "YB\x07\0", 4);
+    uint32_t kt = byml_table(shrine_keys, NKEYS), st = byml_table(shrine_strs, NSTRS), actor[16];
+    for (int i = 0; i < n; i++) {
+        uint32_t k[5], v[5]; uint8_t t[5]; int m = 0;
+        k[m] = K_GYAML; t[m] = 0xA0; v[m++] = (uint32_t)a[i].gyaml;
+        k[m] = K_TRANSLATE; t[m] = 0xC0; v[m++] = vec3(a[i].pos);
+        if (a[i].name >= 0) { k[m] = K_NAME; t[m] = 0xA0; v[m++] = (uint32_t)a[i].name; }
+        if (a[i].rotate) { k[m] = K_ROTATE; t[m] = 0xC0; v[m++] = vec3(a[i].rot); }
+        if (a[i].ndyn) {
+            uint32_t dk[2] = {(uint32_t)a[i].dkey[0], (uint32_t)a[i].dkey[1]};
+            k[m] = K_DYNAMIC; t[m] = 0xC1; v[m++] = byml_dict(a[i].ndyn, dk, a[i].dtype, a[i].dval);
+        }
+        actor[i] = byml_dict(m, k, t, v);
+    }
+    uint8_t types[16]; memset(types, 0xC1, sizeof types);
+    uint32_t list = byml_array(n, types, actor);
+    const uint32_t rk[] = {K_ACTORS}, rv[] = {list}; const uint8_t rt[] = {0xC0};
+    uint32_t root = byml_dict(1, rk, rt, rv);
+    memcpy(buf + 4, &kt, 4); memcpy(buf + 8, &st, 4); memcpy(buf + 12, &root, 4);
+    return at;
+}
 
 int main(void) {
     static const struct { const char *name; uint32_t hash; } known[] = {
@@ -240,6 +276,83 @@ int main(void) {
                           && lm[LOOKOUT].lock == LANDMARK_LOCK_ISLAND && lm[WIND].lock == LANDMARK_LOCK_ISLAND, "on the island: only its places");
         if (c == 2) CHECK(pr.island_done && lm[0].lock == LANDMARK_OPEN, "the paraglider: off the island");
     }
+
+    /* shrine_auto.h: Dungeon007 outside (a crystal shrine): its entrance at the origin, the travel point 2 m out (+z), the lift
+       12 m in (-z) with its floor 1 m below it, and a second shrine's lift that is not this one's */
+    static ShrineScan sc;
+    const TestActor field[] = {
+        {S_ENTRANCE, {0, 100, 0}, -1, 2, 0, {K_INDEX, K_CRYSTAL}, {0xA0, 0xD0}, {S_D7, 1}, {0}},
+        {S_WARP, {0, 100.4f, 2}, -1, 0, 0, {0}, {0}, {0}, {0}},
+        {S_LIFT, {0, 102, -12}, -1, 2, 0, {K_INDEX, K_EVENT}, {0xA0, 0xA0}, {S_D7, S_GO}, {0}},
+        {S_ANCHOR, {0, 101, -13}, S_ENTER_POS, 0, 0, {0}, {0}, {0}, {0}},
+        {S_LIFT, {50, 102, -12}, -1, 2, 0, {K_INDEX, K_EVENT}, {0xA0, 0xA0}, {S_D200, S_GO}, {0}},   /* Dungeon200: no such shrine */
+    };
+    size_t fn = shrine_map(field, 5);
+    CHECK(shrine_scan_field(buf, fn, 1, &sc) == 4, "outside: entrance, lift, floor, travel point (Dungeon200 left out)");
+    CHECK(shrine_place_field(&sc) == 1 && sc.s[7].outside && sc.s[7].has_warp && sc.s[7].has_lift && sc.s[7].crystal && !sc.s[7].hidden && sc.s[7].cave,
+          "Dungeon007 placed: a crystal shrine, in a cave");
+    CHECK(sc.s[7].lift_floor[1] == 101 && sc.s[7].warp[2] == 2, "its lift floor and travel point");
+    CHECK(shrine_scan_field(buf, 8, 0, &sc) == -1, "not a map file");
+    /* inside: the start (in _Dynamic), then the goal, its prompt and floor and a chest turned a quarter (in _Static) */
+    const TestActor dyn[] = {{S_START, {0, -2, 30}, S_ON_ELEVATOR, 0, 0, {0}, {0}, {0}, {0}}};
+    const TestActor sta[] = {
+        {S_GOAL, {0, 26, -282}, -1, 0, 0, {0}, {0}, {0}, {0}},
+        {S_GOAL_EXIT, {0, 28.2f, -275}, -1, 0, 0, {0}, {0}, {0}, {0}},
+        {S_ANCHOR, {0, 27.2f, -274.25f}, S_EXIT_POS, 0, 0, {0}, {0}, {0}, {0}},
+        {S_LIFT, {0, -1, 44}, -1, 1, 0, {K_EVENT}, {0xA0}, {S_RETURN}, {0}},
+        {S_ANCHOR, {0, -2, 41.15f}, S_LEAVE_POS, 0, 0, {0}, {0}, {0}, {0}},
+        {S_TBOX, {-58, 26, -238}, -1, 0, 1, {0}, {0}, {0}, {0, 1.5707964f, 0}},
+        {S_TBOX, {10, 0, 0}, -1, 0, 1, {0}, {0}, {0}, {3.1415927f, 0.5f, 3.1415927f}},
+    };
+    ShrineInfo *s7 = &sc.s[7];
+    fn = shrine_map(dyn, 1);
+    CHECK(shrine_scan_inside(buf, fn, s7) == 1 && !s7->inside, "the start alone: not enough");
+    fn = shrine_map(sta, 7);
+    CHECK(shrine_scan_inside(buf, fn, s7) == 7 && s7->inside && s7->nchests == 2, "inside: goal, prompt, floors, start lift, two chests");
+    CHECK(s7->start[2] == 30 && s7->goal[2] == -282 && s7->goal_floor[2] == -274.25f && s7->back[2] == 44, "inside places");
+    CHECK(fabsf(s7->chest_front[0][0] - 1) < 1e-4f && fabsf(s7->chest_front[0][1]) < 1e-4f, "a chest turned 90 degrees faces +x");
+    CHECK(fabsf(s7->chest_front[1][0] - sinf(0.5f)) < 1e-4f && fabsf(s7->chest_front[1][1] + cosf(0.5f)) < 1e-4f, "x and z turned half round: yaw pi - y");
+    /* where Link stands */
+    float stand[3], face[3];
+    shrine_stand(s7, SHRINE_AT_LIFT, 0, stand, face);
+    CHECK(stand[0] == 0 && fabsf(stand[1] - 101.3f) < 1e-4f && stand[2] == -11 && face[2] == -12, "the lift: 1 m out from its prompt, on its floor");
+    shrine_stand(s7, SHRINE_AT_GOAL, 0, stand, face);
+    CHECK(stand[2] == -274.25f && fabsf(stand[1] - 27.5f) < 1e-4f && face[2] == -282, "the goal: on SmallDungeonExit facing the altar");
+    shrine_stand(s7, SHRINE_AT_CHEST, 0, stand, face);
+    CHECK(fabsf(stand[0] + 56.7f) < 1e-4f && stand[2] == -238 && face[0] == -58, "a chest: 1.3 m in front of it");
+    shrine_stand(s7, SHRINE_AT_GATE, 0, stand, face);
+    CHECK(stand[2] == 2 && face[1] == 100, "the gate: on the travel point facing the entrance");
+    /* the kind */
+    at = 16; memset(buf, 0, sizeof buf); memcpy(buf, "YB\x07\0", 4);
+    { uint32_t kt2 = byml_table(shrine_keys, NKEYS), st2 = byml_table(shrine_strs, NSTRS); const uint32_t k[] = {K_TYPE}, v[] = {S_ENEMY}; const uint8_t t[] = {0xA0};
+      uint32_t root2 = byml_dict(1, k, t, v); memcpy(buf + 4, &kt2, 4); memcpy(buf + 8, &st2, 4); memcpy(buf + 12, &root2, 4); }
+    CHECK(shrine_kind_parse(buf, at) == SHRINE_PROVING, "Type Enemy: Proving Grounds");
+    CHECK(shrine_kind_parse(buf, 4) == SHRINE_PUZZLE, "no file: a puzzle");
+    /* which shrines a run does */
+    ShrineInfo plain = *s7; plain.crystal = 0; plain.cave = 0;
+    CHECK(shrine_skip(s7, SHRINE_STATE_UNKNOWN, LANDMARK_OPEN, 0) == SHRINE_SKIP_CRYSTAL, "a crystal shrine the save does not mention starts Hidden");
+    CHECK(shrine_skip(s7, SHRINE_STATE_OPEN, LANDMARK_OPEN, 0) == SHRINE_SKIP_CAVE, "its crystal brought, but in a cave");
+    CHECK(shrine_skip(&plain, SHRINE_STATE_APPEAR, LANDMARK_OPEN, 0) == SHRINE_GO, "a shrine found or not: done");
+    CHECK(shrine_skip(&plain, SHRINE_STATE_HIDDEN, LANDMARK_OPEN, 0) == SHRINE_SKIP_HIDDEN, "Hidden: not raised yet");
+    CHECK(shrine_skip(&plain, SHRINE_STATE_CLEAR, LANDMARK_OPEN, 0) == SHRINE_SKIP_CLEAR, "completed");
+    CHECK(shrine_skip(&plain, SHRINE_STATE_APPEAR, LANDMARK_LOCK_ISLAND, 0) == SHRINE_SKIP_LOCKED, "the story lock");
+    CHECK(shrine_skip(&plain, SHRINE_STATE_ENTER, LANDMARK_OPEN, SHRINE_SKIP_FAILED) == SHRINE_SKIP_FAILED, "failed in this run");
+    ShrineInfo none = {0};
+    CHECK(shrine_skip(&none, SHRINE_STATE_APPEAR, LANDMARK_OPEN, 0) == SHRINE_SKIP_NO_DATA, "no map data");
+    /* nearest first, from where Link is, then from each shrine done */
+    static ShrineInfo row[SHRINES]; int skip[SHRINES];
+    for (int k = 0; k < SHRINES; k++) { row[k] = plain; skip[k] = SHRINE_SKIP_LOCKED; row[k].entrance[0] = 1000.0f * k; row[k].entrance[1] = 0; row[k].entrance[2] = 0; }
+    skip[3] = skip[10] = skip[11] = SHRINE_GO; row[10].entrance[0] = 2500; row[11].entrance[0] = 9000;
+    float from[3] = {2600, 0, 0}; int order[3];
+    for (int i = 0; i < 3; i++) { order[i] = shrine_next(row, skip, from); memcpy(from, row[order[i]].entrance, 12); skip[order[i]] = SHRINE_SKIP_DONE; }
+    CHECK(order[0] == 10 && order[1] == 3 && order[2] == 11 && shrine_next(row, skip, from) == -1, "nearest next: %d %d %d", order[0], order[1], order[2]);
+    /* the save's DungeonState */
+    static uint8_t save4[0x200], state[SHRINES]; memcpy(save4, w, 4); size_t ds = 0x28;
+    const struct { int k; const char *v; } dstate[] = {{0, "Clear"}, {7, "Hidden"}, {60, "Appear"}, {151, "Enter"}};
+    for (size_t i = 0; i < 4; i++, ds += 8) { char nm[40]; snprintf(nm, sizeof nm, "DungeonState.Dungeon%03d", dstate[i].k); uint32_t h = dish_murmur3(nm), v = dish_murmur3(dstate[i].v); memcpy(save4 + ds, &h, 4); memcpy(save4 + ds + 4, &v, 4); }
+    memcpy(save4 + ds, &end, 4);
+    CHECK(shrine_states_parse(save4, sizeof save4, state) == 4 && state[0] == SHRINE_STATE_CLEAR && state[7] == SHRINE_STATE_HIDDEN && state[60] == SHRINE_STATE_APPEAR
+          && state[151] == SHRINE_STATE_ENTER && state[1] == SHRINE_STATE_UNKNOWN, "DungeonState from the save");
 
     printf("{\"status\":\"%s\",\"probe\":\"probe-dish\",\"checked\":%d,\"failures\":%d}\n", failures ? "fail" : "pass", checks, failures);
     return failures != 0;

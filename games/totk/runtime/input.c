@@ -205,7 +205,7 @@ static void *input_file(void *arg) {
             }
             continue;
         }
-        if (runtime_survey_command(line) || runtime_spawn_command(line)) continue;
+        if (runtime_survey_command(line) || runtime_spawn_command(line) || runtime_autoshrine_command(line)) continue;   /* "autoshrine ...": Tools › Teleport's auto shrine */
         unsigned code, ms; int used = 0;
         if (sscanf(line, "down %u %n", &code, &used) == 1 && used && !line[used] && code < 128) {
             fprintf(stderr,"[totk-input] file: key %u down\n",code);runtime_input_key_synthetic(code,1);

@@ -6,6 +6,7 @@
 #include "world_survey.h"
 #include "actor_spawn.h"
 #include "game_version.h"
+#include "shrine_auto.h"
 #include <ctype.h>
 #include <limits.h>
 #include <mach/mach.h>
@@ -188,6 +189,14 @@ int runtime_noclip_on(void) { return 0; }
 void runtime_noclip_set_speed(float v) { (void)v; }
 int runtime_noclip_goto(const float xyz[3]) { (void)xyz; return 0; }
 float runtime_noclip_speed(void) { return 0; }
+int runtime_autoshrine_available(void) { return 0; }   /* auto shrine: the TOTK shrines only */
+int runtime_autoshrine_start(int one) { (void)one; return 0; }
+void runtime_autoshrine_stop(void) { }
+void runtime_autoshrine_set_chests(int on) { (void)on; }
+int runtime_autoshrine_chests(void) { return 0; }
+int runtime_autoshrine_status(char *text, size_t size) { if (size) snprintf(text, size, "Not available in this game"); return 0; }
+int runtime_autoshrine_command(const char *line) { (void)line; return 0; }
+void runtime_autoshrine_romfs(const char *path) { (void)path; }
 #else
 enum { SCENE_SLOT = GAME_ADDR(0x4663f08), FORCE_MATRIX = GAME_ADDR(0x69a18c), ACTOR_POS = GAME_ACTOR_POS, ACTOR_ROT = GAME_ACTOR_ROT };
 static uintptr_t survey_main;
@@ -217,6 +226,7 @@ static _Atomic uint32_t noclip_speed_bits = 0x41400000;   /* 12.0f m/s */
 static struct { int holding; float xyz[3]; uint64_t at_ns; } noclip;   /* frame-end thread only */
 static pthread_mutex_t noclip_goto_lock = PTHREAD_MUTEX_INITIALIZER;
 static struct { int pending; float xyz[3]; } noclip_goto;   /* a teleport for the next tick (runtime_noclip_goto) */
+static _Atomic int as_active;   /* auto shrine is running (below, before runtime_survey_tick) */
 /* A teleport is a flight: a far place is not loaded, and a player held there is treated as fallen out of the world (the
    game fades out and puts him back where he last stood, 1.4.3, 2026-10-26). Flying there at a speed the streaming keeps
    up with loads the world on the way, as for a fast glide. Frame-end thread.
@@ -591,11 +601,13 @@ int runtime_survey_command(const char *line) {
     pthread_mutex_unlock(&survey_lock);
     return 1;
 }
+void runtime_autoshrine_cancel_user(void);
 void runtime_survey_cancel_user(void) {
+    runtime_autoshrine_cancel_user();   /* a run of auto shrine stops too (world_survey.c, below) */
     if (!atomic_load_explicit(&runtime_survey_pending, memory_order_relaxed)) return;
     pthread_mutex_lock(&survey_lock);
     request.kind = 0; hold_left = 0; route_on = 0; cam_off(); atomic_store(&runtime_survey_pending, 0);
-    if (atomic_load(&runtime_spawn_waiting) || atomic_load(&noclip_wanted)) atomic_store(&runtime_survey_pending, 1);   /* spawns and noclip are not cancelled */
+    if (atomic_load(&runtime_spawn_waiting) || atomic_load(&noclip_wanted) || atomic_load(&as_active)) atomic_store(&runtime_survey_pending, 1);   /* spawns, noclip and auto shrine (its own stop) are not cancelled here */
     fprintf(stderr, "[survey] cancelled: user input\n");
     pthread_mutex_unlock(&survey_lock);
 }
@@ -722,6 +734,410 @@ static int force_at(uintptr_t actor, const float xyz[3]) {
     survey_force((void *)actor, matrix, 0);
     return 1;
 }
+
+/* ---- Auto shrine (Tools › Teleport; shrine_auto.h has what the game's files say): one shrine after another, the nearest
+   first. For each: noclip to the shrine (the gate's A first while it has never been opened), A on the entrance lift, the
+   game's own entry; then optionally each chest (A in front of it), then A at the altar: the game plays the blessing,
+   marks the shrine Clear and leaves it by itself. If it does not, the start lift (A) leaves. Back outside, the autosave
+   that follows must say Clear. Every press is a synthetic key (input.c), so the game does everything a player's press
+   would. Readiness: the shrine's map files opening (romfs.c calls runtime_autoshrine_romfs) say which map is loading;
+   the player actor present, near the step's place and still for some seconds says it has settled; the newest save's
+   time and DungeonState say the shrine was completed. Each step has a time limit; on any miss the run stops with Link set
+   down where he last stood. A press of the player's own (input.c user_input) stops it at once. Frame-end thread. ---- */
+size_t runtime_romfs_file_count(void);
+const char *runtime_romfs_file_name(size_t i);
+uint8_t *runtime_romfs_host_read(const char *path, size_t *n);
+uint8_t *runtime_romfs_zs_decompress(const uint8_t *src, size_t n, size_t *out);
+void runtime_input_key_synthetic(unsigned code, int down);
+int settings_get(const char *key);
+enum { AS_KEY_A = 38, AS_KEY_B = 40, AS_KEY_ZL = 58, AS_KEY_UP = 13, AS_KEY_DOWN = 1, AS_KEY_LEFT = 0, AS_KEY_RIGHT = 2 };   /* Mac key codes (input.c button(); WASD is the left stick) */
+static ShrineInfo as_shrine[SHRINES];
+static Landmark as_mark[LANDMARKS];   /* names, Great Sky Island and the Depths for the story lock (landmarks.h) */
+static _Atomic int as_loaded;         /* 0 not read, 1 reading, 2 read, 3 not this game */
+static _Atomic int as_request;        /* 1 run, 2 one shrine, 3 stop: for the frame-end thread */
+static _Atomic int as_chests, as_cancel;
+static _Atomic uint32_t as_seq_inside, as_seq_field, as_seq_goal;   /* RomFS opens: a shrine's map, the surface's map, the goal's event */
+static _Atomic int as_inside_index = -1, as_watch_field;   /* watch_field: log the next surface map file */
+static pthread_mutex_t as_status_lock = PTHREAD_MUTEX_INITIALIZER;
+static char as_status[600] = "Not started";
+enum { AS_OFF, AS_PICK, AS_MOVE, AS_GATE, AS_ENTER, AS_INSIDE, AS_CHEST, AS_GOAL, AS_BACK, AS_SURFACE, AS_SAVED, AS_STOPPING };
+static const char *const AS_STEP_TEXT[] = {"stopped", "choosing the next shrine", "flying", "opening the gate", "entering", "waiting for the shrine to load",
+                                           "opening a chest", "at the altar", "leaving by the start lift", "back outside", "waiting for the autosave", "setting Link down"};
+static struct {
+    int step, one, k, chest, done, after, tries, event, back, flight, phase, have_last, have_safe, keyn, inside;   /* inside: in the shrine's own map */
+    double started, t0, phase_t, last_tick, still_since, save_time;
+    float stand[3], face[3], last[3], safe[3];
+    uint32_t seq_inside, seq_field, seq_goal;
+    uint8_t state[SHRINES], run[SHRINES];
+    char left_out[200], why[200];
+    struct { unsigned code; double up; } key[4];
+} as;
+static void as_say(void) {
+    char line[600]; const char *name = as.k >= 0 ? as_mark[LANDMARK_FIRST_SHRINE + as.k].name : "";
+    if (as.step != AS_OFF) snprintf(line, sizeof line, "Running: %s%s%s · %d done%s%s", name, *name ? " · " : "", AS_STEP_TEXT[as.step], as.done,
+                                    as.left_out[0] ? " · left out: " : "", as.left_out);
+    else snprintf(line, sizeof line, "%s · %d done%s%s", as.why[0] ? as.why : "Stopped", as.done, as.left_out[0] ? " · left out: " : "", as.left_out);
+    pthread_mutex_lock(&as_status_lock); snprintf(as_status, sizeof as_status, "%s", line); pthread_mutex_unlock(&as_status_lock);
+}
+static void as_key(unsigned code, double now, double seconds) {
+    if (as.keyn >= 4) return;
+    runtime_input_key_synthetic(code, 1); as.key[as.keyn].code = code; as.key[as.keyn++].up = now + seconds;
+}
+static void as_keys_tick(double now, int all) {
+    for (int i = 0; i < as.keyn;)
+        if (all || now >= as.key[i].up) { runtime_input_key_synthetic(as.key[i].code, 0); as.key[i] = as.key[--as.keyn]; }
+        else i++;
+}
+static int as_pos(uintptr_t actor, float xyz[3]) { return actor && read_mem(actor + ACTOR_POS, xyz, 12) && valid_xyz(xyz); }
+/* Seconds Link has stood within tol metres of one place (0 while he moves or is not there). */
+static double as_still(uintptr_t actor, double now, float tol) {
+    float at[3];
+    if (!as_pos(actor, at)) { as.have_last = 0; return 0; }
+    if (!as.have_last || landmark_distance(at, as.last) > tol) { memcpy(as.last, at, 12); as.have_last = 1; as.still_since = now; }
+    return now - as.still_since;
+}
+/* Link at xyz facing face (level): forceSetMatrix with a turn about the vertical; his local +z (the matrix's third column) is
+   where he faces, as noclip reads it. */
+static void as_force_facing(uintptr_t actor, const float xyz[3], const float face[3]) {
+    float dx = face[0] - xyz[0], dz = face[2] - xyz[2], l = sqrtf(dx * dx + dz * dz), s = l > 1e-3f ? dx / l : 0, c = l > 1e-3f ? dz / l : 1;
+    float m[12] = {c, 0, s, xyz[0], 0, 1, 0, xyz[1], -s, 0, c, xyz[2]};
+    if (noclip_force && actor) noclip_force((void *)actor, m, 0);
+}
+/* A short push of the left stick (WASD) toward to, picked from the camera's view: he steps toward the prompt and faces it. */
+static void as_nudge(uintptr_t actor, const float to[3], double now) {
+    float cam[3], right[3], at[3]; uint64_t frame;
+    if (!as_pos(actor, at) || !dm_gfx_camera(cam, right, &frame)) return;
+    float fx = at[0] - cam[0], fz = at[2] - cam[2], fl = sqrtf(fx * fx + fz * fz), rl = sqrtf(right[0] * right[0] + right[2] * right[2]);
+    float dx = to[0] - at[0], dz = to[2] - at[2], dl = sqrtf(dx * dx + dz * dz);
+    if (fl < 1e-3f || rl < 1e-3f || dl < 1e-3f) return;
+    float y = (dx * fx + dz * fz) / (dl * fl), x = (dx * right[0] + dz * right[2]) / (dl * rl);
+    if (y > 0.38f) as_key(AS_KEY_UP, now, 0.3); else if (y < -0.38f) as_key(AS_KEY_DOWN, now, 0.3);
+    if (x > 0.38f) as_key(AS_KEY_RIGHT, now, 0.3); else if (x < -0.38f) as_key(AS_KEY_LEFT, now, 0.3);
+    fprintf(stderr, "[autoshrine] nudge toward %.1f,%.1f,%.1f (stick %.2f across, %.2f ahead)\n", to[0], to[1], to[2], x, y);
+}
+static double as_save_time(void) {
+    const char *profile = getenv("TOTK_PROFILE_DIR"); char path[1800]; struct stat st;
+    if (!profile) return 0;
+    map_pins_newest_save(profile, path, sizeof path);
+    return path[0] && !stat(path, &st) ? st.st_mtimespec.tv_sec + st.st_mtimespec.tv_nsec * 1e-9 : 0;
+}
+/* Each shrine's DungeonState from the newest save, and the story lock into lm; 0 when there is no save. */
+static int as_read_save(Landmark *lm) {
+    const char *profile = getenv("TOTK_PROFILE_DIR"); char path[1800]; int got = 0;
+    memset(as.state, SHRINE_STATE_UNKNOWN, sizeof as.state);
+    memcpy(lm, as_mark, sizeof as_mark);
+    LandmarkProgress progress = {0, 0, 0};
+    if (profile && landmarks_state_read(profile, lm, &progress) >= 0) {
+        map_pins_newest_save(profile, path, sizeof path);
+        FILE *f = path[0] ? fopen(path, "rb") : NULL;
+        uint8_t *b = f ? malloc(4 << 20) : NULL; size_t n = b ? fread(b, 1, 4 << 20, f) : 0;
+        if (f) fclose(f);
+        got = b ? shrine_states_parse(b, n, as.state) : 0;
+        free(b);
+    }
+    int lock = settings_get("teleport.story_lock");
+    landmarks_lock(lm, &progress, lock != 0);   /* on unless switched off (-1: no such setting) */
+    return got;
+}
+static void as_step(int step, double now) {
+    as.step = step; as.t0 = now; as.phase = 0; as.tries = 0; as.have_last = 0; as.event = 0;
+    as.seq_inside = atomic_load(&as_seq_inside); as.seq_field = atomic_load(&as_seq_field); as.seq_goal = atomic_load(&as_seq_goal);
+    atomic_store(&as_watch_field, step == AS_GOAL || step == AS_BACK);
+    if (step != AS_OFF && step != AS_STOPPING)
+        fprintf(stderr, "[autoshrine] %s%s%s\n", as.k >= 0 ? as_mark[LANDMARK_FIRST_SHRINE + as.k].name : "", as.k >= 0 ? ": " : "", AS_STEP_TEXT[step]);
+    as_say();
+}
+static void as_move(const float stand[3], const float face[3], int after, double now) {
+    memcpy(as.stand, stand, 12); memcpy(as.face, face, 12); as.after = after; as.flight = 0;
+    as_step(AS_MOVE, now);
+}
+/* The run ends: ok (the last one done, or nothing left) or why it stopped. Link is set down where he last stood, unless
+   the player stopped it (then noclip stays as it is, for him to steer). */
+static void as_end(int ok, const char *why, double now, int by_player) {
+    as_keys_tick(now, 1);
+    snprintf(as.why, sizeof as.why, "%s%s", ok ? "Finished: " : "Stopped: ", why);
+    fprintf(stderr, "[autoshrine] %s (%d done)\n", as.why, as.done);
+    if (!ok && as.k >= 0) as.run[as.k] = SHRINE_SKIP_FAILED;
+    if (!by_player && atomic_load(&noclip_wanted) && as.have_safe) {   /* back to where he last stood: a flight outside, a straight line inside */
+        float at[3] = {as.safe[0], as.safe[1] + 0.5f, as.safe[2]};
+        if (!as.inside && noclip.holding && landmark_distance(noclip.xyz, at) > 40) runtime_noclip_goto(at);
+        memcpy(as.stand, at, 12); as_step(AS_STOPPING, now); return;
+    }
+    if (!by_player && atomic_load(&noclip_wanted)) runtime_noclip_set(0);
+    if (!atomic_load(&noclip_wanted)) dm_gfx_camera_want(0);
+    as.step = AS_OFF; atomic_store(&as_active, 0); as_say();
+}
+static void as_fail(const char *what, double now) {
+    char why[200]; const char *name = as.k >= 0 ? as_mark[LANDMARK_FIRST_SHRINE + as.k].name : "";
+    snprintf(why, sizeof why, "%s%s%s", name, *name ? ": " : "", what);
+    as_end(0, why, now, 0);
+}
+/* A press cycle at a prompt (every period seconds, at most tries cycles): a nudge toward the prompt from the second cycle,
+   ZL (the camera behind Link), then A. Returns 0 once the cycles are used up. */
+static int as_press_cycle(uintptr_t actor, const float prompt[3], double now, double period, int tries) {
+    double t = now - as.t0 - as.tries * period;
+    if (as.tries >= tries) return 0;
+    if (as.phase == 0) { if (as.tries) as_nudge(actor, prompt, now); as.phase = 1; }
+    else if (as.phase == 1 && t >= 0.6) { as_key(AS_KEY_ZL, now, 0.15); as.phase = 2; }
+    else if (as.phase == 2 && t >= 1.1) { as_key(AS_KEY_A, now, 0.15); fprintf(stderr, "[autoshrine] A (try %d)\n", as.tries + 1); as.phase = 3; }
+    else if (as.phase == 3 && t >= period) { as.tries++; as.phase = 0; }
+    return 1;
+}
+static void as_pick(uintptr_t actor, double now) {
+    float at[3];
+    if (!as_pos(actor, at)) { if (now - as.t0 > 30) as_end(0, "no player to start from", now, 0); return; }
+    static Landmark lm[LANDMARKS]; int skip[SHRINES], count[SHRINE_SKIPS] = {0};
+    int found = as_read_save(lm);
+    for (int k = 0; k < SHRINES; k++) count[skip[k] = shrine_skip(&as_shrine[k], as.state[k], lm[LANDMARK_FIRST_SHRINE + k].lock, as.run[k])]++;
+    size_t o = 0; as.left_out[0] = 0;
+    for (int r = 1; r < SHRINE_SKIPS && o < sizeof as.left_out - 1; r++)
+        if (count[r]) o += (size_t)snprintf(as.left_out + o, sizeof as.left_out - o, "%s%d %s", o ? ", " : "", count[r], SHRINE_SKIP_TEXT[r]);
+    fprintf(stderr, "[autoshrine] %d shrines to do; %d DungeonState flags in the save; left out: %s\n", count[SHRINE_GO], found, as.left_out[0] ? as.left_out : "none");
+    if (as.one && as.done) { as_end(1, "the shrine is done", now, 0); return; }
+    int k = shrine_next(as_shrine, skip, at);
+    if (k < 0) { as.k = -1; as_end(1, "no shrine left to do", now, 0); return; }
+    as.k = k;
+    const ShrineInfo *s = &as_shrine[k];
+    fprintf(stderr, "[autoshrine] next: %s (Dungeon%03d, %s, %.0f m away, save says %s, %d chest%s)\n", as_mark[LANDMARK_FIRST_SHRINE + k].name, k,
+            SHRINE_KIND_TEXT[s->kind], landmark_distance(s->entrance, at), as.state[k] ? SHRINE_STATE_NAMES[as.state[k]] : "nothing", s->nchests, s->nchests == 1 ? "" : "s");
+    float stand[3], face[3];
+    int gate = as.state[k] == SHRINE_STATE_APPEAR || as.state[k] == SHRINE_STATE_UNKNOWN;   /* never opened: its gate's A first */
+    shrine_stand(s, gate ? SHRINE_AT_GATE : SHRINE_AT_LIFT, 0, stand, face);
+    as_move(stand, face, gate ? AS_GATE : AS_ENTER, now);
+}
+static void as_after_inside(double now) {
+    const ShrineInfo *s = &as_shrine[as.k]; float stand[3], face[3];
+    if (atomic_load(&as_chests) && as.chest < s->nchests) { shrine_stand(s, SHRINE_AT_CHEST, as.chest, stand, face); as_move(stand, face, AS_CHEST, now); return; }
+    shrine_stand(s, SHRINE_AT_GOAL, 0, stand, face); as_move(stand, face, AS_GOAL, now);
+}
+static void as_tick_move(uintptr_t actor, double now, double dt) {
+    float at[3] = {0, 0, 0}; int have = as_pos(actor, at);
+    if (as.phase == 0) {   /* noclip on: on the surface a flight (up, across, down) when far, else (and inside a shrine) a straight line */
+        if (!have) { if (now - as.t0 > 20) as_fail("no player to move", now); return; }
+        as_keys_tick(now, 1);   /* no key of ours held: noclip reads WASD and ZL as the player steering */
+        float d = landmark_distance(at, as.stand); as.flight = d > 40 && !as.inside;
+        if (as.flight) runtime_noclip_goto(as.stand); else runtime_noclip_set(1);
+        as.phase_t = now + d / 100 + 30; as.phase = 1;   /* phase_t: the flight's time limit */
+        fprintf(stderr, "[autoshrine] %s to %.1f,%.1f,%.1f (%.0f m)\n", as.flight ? "flight" : "straight", as.stand[0], as.stand[1], as.stand[2], d);
+        return;
+    }
+    if (as.phase == 1) {
+        if (now > as.phase_t) { as_fail("the flight did not arrive in time", now); return; }
+        if (!noclip.holding) return;
+        if (as.flight) {
+            pthread_mutex_lock(&noclip_goto_lock); int pending = noclip_goto.pending; pthread_mutex_unlock(&noclip_goto_lock);
+            if (pending || noclip_flight.on) return;
+            if (landmark_distance(noclip.xyz, as.stand) > 1.5f) { as_fail("the flight stopped short", now); return; }
+        } else {
+            float d = landmark_distance(noclip.xyz, as.stand), step = 30 * (float)dt;
+            if (d > step) { for (int c = 0; c < 3; c++) noclip.xyz[c] += (as.stand[c] - noclip.xyz[c]) * step / d; return; }
+        }
+        memcpy(noclip.xyz, as.stand, 12); as.phase = 2; as.phase_t = now;
+        return;
+    }
+    if (as.phase == 2) {   /* held there half a second, turned to face the prompt, then set down */
+        memcpy(noclip.xyz, as.stand, 12); as_force_facing(actor, as.stand, as.face);
+        if (now - as.phase_t >= 0.6) { runtime_noclip_set(0); dm_gfx_camera_want(1); as.phase = 3; as.phase_t = now; }
+        return;
+    }
+    if (as.phase == 3) {   /* landed: on his feet near the place */
+        if (now - as.phase_t < 1.5) return;
+        float dx = have ? at[0] - as.stand[0] : 99, dz = have ? at[2] - as.stand[2] : 99;
+        if (!have || dx * dx + dz * dz > 16 || at[1] < as.stand[1] - 6) {
+            fprintf(stderr, "[autoshrine] landed at %.1f,%.1f,%.1f, wanted %.1f,%.1f,%.1f\n", at[0], at[1], at[2], as.stand[0], as.stand[1], as.stand[2]);
+            as_fail("Link did not land where he was set down", now); return;
+        }
+        memcpy(as.safe, at, 12); as.have_safe = 1;
+        as_key(AS_KEY_ZL, now, 0.15);   /* the camera behind him, toward the prompt */
+        as.phase = 4; as.phase_t = now;
+        return;
+    }
+    if (now - as.phase_t >= 0.5) as_step(as.after, now);
+}
+static void autoshrine_tick(uintptr_t actor, double now) {
+    int req = atomic_exchange(&as_request, 0);
+    if (req == 3 && as.step != AS_OFF && as.step != AS_STOPPING) { as_end(0, "stopped from the menu or the input file", now, 0); return; }
+    if ((req == 1 || req == 2) && as.step == AS_OFF) {
+        int chests = atomic_load(&as_chests); memset(&as, 0, sizeof as); as.k = -1; as.one = req == 2; as.started = now; as.last_tick = now;
+        atomic_store(&as_cancel, 0); dm_gfx_camera_want(1);
+        fprintf(stderr, "[autoshrine] start: %s, chests %s\n", as.one ? "the nearest shrine" : "every shrine it can do, nearest first", chests ? "on" : "off");
+        as_step(AS_PICK, now);
+    }
+    if (as.step == AS_OFF) return;
+    double dt = now - as.last_tick; as.last_tick = now;
+    if (dt > 0.1) dt = 0.1;
+    as_keys_tick(now, 0);
+    if (atomic_exchange(&as_cancel, 0) && now - as.started > 2 && as.step != AS_STOPPING) { as_end(0, "your own input (a key, a button or the stick)", now, 1); return; }
+    double t = now - as.t0;
+    const ShrineInfo *s = as.k >= 0 ? &as_shrine[as.k] : NULL;
+    float at[3]; int have = as_pos(actor, at);
+    switch (as.step) {
+    case AS_PICK: as_pick(actor, now); return;
+    case AS_MOVE: as_tick_move(actor, now, dt); return;
+    case AS_GATE:   /* the gate's A: DmF_SY_SmallDungeon1Open (Link authenticates, about 10 s), then the lift */
+        if (as_press_cycle(actor, s->entrance, now, 4, 2) || t < 22) return;   /* then the opening scene and its autosave */
+        { float stand[3], face[3]; shrine_stand(s, SHRINE_AT_LIFT, 0, stand, face); as_move(stand, face, AS_ENTER, now); }
+        return;
+    case AS_ENTER:   /* the lift's A: DmF_SY_SmallDungeon2Go, then the shrine's map */
+        if (atomic_load(&as_seq_inside) != as.seq_inside) {
+            int got = atomic_load(&as_inside_index);
+            if (got != as.k) { char why[80]; snprintf(why, sizeof why, "the game loaded Dungeon%03d instead", got); as_fail(why, now); return; }
+            as.have_safe = 0; as.inside = 1; as_step(AS_INSIDE, now); return;
+        }
+        if (have && landmark_distance(at, s->start) < 60) {   /* the map files were not seen: his place says it (444 m or more from any entrance) */
+            fprintf(stderr, "[autoshrine] inside by position (no map file seen)\n"); as.have_safe = 0; as.inside = 1; as_step(AS_INSIDE, now); return;
+        }
+        if (!as_press_cycle(actor, s->lift, now, 6, 4) && t > 30) as_fail("the entrance lift did not take Link in", now);
+        return;
+    case AS_INSIDE: {   /* the arrival scene (and on Great Sky Island the ability's), B for any message */
+        double least = as.k >= 60 && as.k <= 62 ? 30 : 8;
+        if (fmod(t, 2.0) < dt) as_key(AS_KEY_B, now, 0.1);
+        double still = as_still(actor, now, 0.25);
+        if (have && t >= least && still >= 3 && landmark_distance(at, s->start) < 80) {
+            fprintf(stderr, "[autoshrine] inside at %.1f,%.1f,%.1f (start %.1f,%.1f,%.1f), still for %.1f s\n", at[0], at[1], at[2], s->start[0], s->start[1], s->start[2], still);
+            memcpy(as.safe, at, 12); as.have_safe = 1; as.chest = 0; as_after_inside(now); return;
+        }
+        if (t > 180) as_fail("the shrine did not settle after it loaded (3 minutes)", now);
+        return;
+    }
+    case AS_CHEST:   /* A, then B for the item's screen; no signal says it opened: best effort */
+        if (as.phase == 0) { as_key(AS_KEY_A, now, 0.15); fprintf(stderr, "[autoshrine] chest %d of %d: A\n", as.chest + 1, s->nchests); as.phase = 1; }
+        else if (as.phase < 4 && t >= 3.5 + (as.phase - 1) * 1.5) { as_key(AS_KEY_B, now, 0.1); as.phase++; }
+        else if (as.phase == 4 && t >= 8) { as.chest++; as_after_inside(now); }
+        return;
+    case AS_GOAL:   /* A at the altar: DmF_SY_SmallDungeonGoal, then the game leaves the shrine (the surface's map opens) */
+        if (as.phase == 0 && !as.tries) as.save_time = as_save_time();
+        if (atomic_load(&as_seq_field) != as.seq_field || (have && landmark_distance(at, s->entrance) < 200)) { as.back = 0; as.have_safe = 0; as.inside = 0; as_step(AS_SURFACE, now); return; }
+        if (!as.event && atomic_load(&as_seq_goal) != as.seq_goal) { as.event = 1; fprintf(stderr, "[autoshrine] the goal's event started\n"); }
+        if (as.event || !as_press_cycle(actor, s->goal_exit, now, 8, 5)) {
+            if (fmod(t, 2.0) < dt) as_key(AS_KEY_B, now, 0.1);   /* the Light of Blessing's screen, messages */
+            if (!as.event && t > 60 && as_still(actor, now, 0.25) >= 5) {   /* no blessing: leave by the start lift */
+                float stand[3], face[3]; shrine_stand(s, SHRINE_AT_BACK, 0, stand, face);
+                fprintf(stderr, "[autoshrine] the altar did not answer in 60 s; taking the start lift\n");
+                as_move(stand, face, AS_BACK, now);
+            } else if (t > 150) as_fail("the blessing did not end in leaving the shrine (150 s)", now);
+        }
+        return;
+    case AS_BACK:
+        if (atomic_load(&as_seq_field) != as.seq_field || (have && landmark_distance(at, s->entrance) < 200)) { as.back = 1; as.have_safe = 0; as.inside = 0; as_step(AS_SURFACE, now); return; }
+        if (!as_press_cycle(actor, s->back, now, 6, 4) && t > 40) as_fail("the start lift did not take Link out", now);
+        return;
+    case AS_SURFACE: {   /* DmF_SY_SmallDungeon5Out (or the island's story scenes): B for messages until Link stands */
+        if (fmod(t, 1.5) < dt) as_key(AS_KEY_B, now, 0.1);
+        double still = as_still(actor, now, 0.25);
+        /* by the entrance, or somewhere far from the shrine's own coordinates (an island story scene may move him) */
+        if (have && t >= 6 && still >= 4 && (landmark_distance(at, s->entrance) < 200 || landmark_distance(at, s->start) > 1000)) {
+            fprintf(stderr, "[autoshrine] outside at %.1f,%.1f,%.1f, %.0f m from the entrance\n", at[0], at[1], at[2], landmark_distance(at, s->entrance));
+            memcpy(as.safe, at, 12); as.have_safe = 1; as_step(AS_SAVED, now); return;
+        }
+        if (t > 180) as_fail("Link did not stand outside the shrine within 3 minutes", now);
+        return;
+    }
+    case AS_SAVED: {   /* the autosave after leaving: it must say Clear (a save from before the goal may still come first) */
+        if (fmod(t, 1.0) >= dt && t < 40) return;
+        double saved = as_save_time();
+        const char *name = as_mark[LANDMARK_FIRST_SHRINE + as.k].name;
+        if (saved > as.save_time) {
+            static Landmark lm[LANDMARKS]; as_read_save(lm); as.save_time = saved;
+            fprintf(stderr, "[autoshrine] autosave: DungeonState.Dungeon%03d = %s\n", as.k, as.state[as.k] ? SHRINE_STATE_NAMES[as.state[as.k]] : "(not in it)");
+            as.event = as.state[as.k] ? as.state[as.k] : -1;   /* event: the last save's state of this shrine */
+            if (as.state[as.k] == SHRINE_STATE_CLEAR) fprintf(stderr, "[autoshrine] done: %s (Dungeon%03d): the autosave says Clear\n", name, as.k);
+            else if (t < 40) return;
+        }
+        if (as.event != SHRINE_STATE_CLEAR) {
+            if (t < 40) return;
+            if (as.event) {
+                char why[120]; snprintf(why, sizeof why, "the autosave says %s, not Clear%s", as.event > 0 ? SHRINE_STATE_NAMES[as.event] : "nothing", as.back ? " (left by the start lift)" : "");
+                as_fail(why, now); return;
+            }
+            if (as.back) { as_fail("left by the start lift and no autosave followed", now); return; }
+            fprintf(stderr, "[autoshrine] done: %s (Dungeon%03d): no autosave within 40 s, so not confirmed\n", name, as.k);
+        }
+        as.run[as.k] = SHRINE_SKIP_DONE; as.done++;
+        as_step(AS_PICK, now);
+        return;
+    }
+    case AS_STOPPING:   /* back to where he last stood, then down */
+        if (t < 60 && atomic_load(&noclip_wanted)) {
+            pthread_mutex_lock(&noclip_goto_lock); int pending = noclip_goto.pending; pthread_mutex_unlock(&noclip_goto_lock);
+            if (pending || noclip_flight.on || !noclip.holding) return;
+            float d = landmark_distance(noclip.xyz, as.stand), step = 30 * (float)dt;
+            if (d > step) { for (int c = 0; c < 3; c++) noclip.xyz[c] += (as.stand[c] - noclip.xyz[c]) * step / d; return; }
+        }
+        if (atomic_load(&noclip_wanted)) runtime_noclip_set(0);
+        dm_gfx_camera_want(0);
+        fprintf(stderr, "[autoshrine] set down\n");
+        as.step = AS_OFF; atomic_store(&as_active, 0); as_say();
+        return;
+    }
+}
+/* Reads the shrines (and their names and story places) from the RomFS once, then asks the frame-end thread to start. */
+static void *as_start_thread(void *arg) {
+    int one = (int)(intptr_t)arg, expected = 0;
+    if (atomic_compare_exchange_strong(&as_loaded, &expected, 1)) {
+        LandmarkRomfs rom = {runtime_romfs_file_count, runtime_romfs_file_name, runtime_romfs_host_read, runtime_romfs_zs_decompress};
+        double t0 = now_seconds();
+        int places = landmarks_load(&rom, as_mark), ready = places ? shrines_load(&rom, as_shrine) : 0;
+        fprintf(stderr, "[autoshrine] read %d shrines from the game's files (%.2f s)\n", ready, now_seconds() - t0);
+        atomic_store(&as_loaded, ready ? 2 : 3);
+    }
+    while (atomic_load(&as_loaded) == 1) usleep(50000);
+    if (atomic_load(&as_loaded) != 2) {
+        fprintf(stderr, "[autoshrine] not started: the shrines are not in this game's files\n");
+        pthread_mutex_lock(&as_status_lock); snprintf(as_status, sizeof as_status, "Not available: the shrines are not in this game's files"); pthread_mutex_unlock(&as_status_lock);
+        atomic_store(&as_active, 0); return NULL;
+    }
+    atomic_store(&as_request, one ? 2 : 1);
+    atomic_store_explicit(&runtime_survey_pending, 1, memory_order_release);
+    return NULL;
+}
+int runtime_autoshrine_start(int one) {
+    if (!noclip_force) { fprintf(stderr, "[autoshrine] not started: needs noclip (1.0.0 or 1.4.3)\n"); return 0; }
+    int idle = 0;
+    if (!atomic_compare_exchange_strong(&as_active, &idle, 1)) { fprintf(stderr, "[autoshrine] already running\n"); return 0; }
+    pthread_mutex_lock(&as_status_lock); snprintf(as_status, sizeof as_status, "Starting: reading the shrines…"); pthread_mutex_unlock(&as_status_lock);
+    pthread_t t;
+    if (pthread_create(&t, NULL, as_start_thread, (void *)(intptr_t)one)) { atomic_store(&as_active, 0); return 0; }
+    pthread_detach(t);
+    return 1;
+}
+void runtime_autoshrine_stop(void) {
+    if (!atomic_load(&as_active)) return;
+    atomic_store(&as_request, 3); atomic_store_explicit(&runtime_survey_pending, 1, memory_order_release);
+}
+void runtime_autoshrine_set_chests(int on) { atomic_store(&as_chests, !!on); fprintf(stderr, "[autoshrine] chests %s\n", on ? "on" : "off"); }
+int runtime_autoshrine_chests(void) { return atomic_load(&as_chests); }
+int runtime_autoshrine_available(void) { return noclip_force != NULL; }
+int runtime_autoshrine_status(char *text, size_t size) {
+    pthread_mutex_lock(&as_status_lock); snprintf(text, size, "%s", as_status); pthread_mutex_unlock(&as_status_lock);
+    return atomic_load(&as_active);
+}
+int runtime_autoshrine_command(const char *line) {
+    if (strncmp(line, "autoshrine ", 11)) return 0;
+    char word[16] = "", arg[8] = ""; sscanf(line + 11, "%15s %7s", word, arg);
+    if (!strcmp(word, "start")) runtime_autoshrine_start(0);
+    else if (!strcmp(word, "one")) runtime_autoshrine_start(1);
+    else if (!strcmp(word, "stop")) runtime_autoshrine_stop();
+    else if (!strcmp(word, "chests") && (!strcmp(arg, "on") || !strcmp(arg, "off"))) runtime_autoshrine_set_chests(arg[1] == 'n');
+    else if (!strcmp(word, "status")) { char s[600]; runtime_autoshrine_status(s, sizeof s); fprintf(stderr, "[autoshrine] status: %s\n", s); }
+    else fprintf(stderr, "[autoshrine] rejected: expected start, one, stop, status or chests on|off\n");
+    return 1;
+}
+/* romfs.c, every file the game opens (path relative to the RomFS): which map is loading, and the goal's event. */
+void runtime_autoshrine_romfs(const char *path) {
+    if (!atomic_load_explicit(&as_active, memory_order_relaxed) || !path) return;
+    if (!strncmp(path, "Banc/SmallDungeon/Dungeon", 25) && landmark_ends(path, "_Static.bcett.byml.zs")) {
+        atomic_store(&as_inside_index, atoi(path + 25)); atomic_fetch_add(&as_seq_inside, 1);
+        fprintf(stderr, "[autoshrine] the game opens %s\n", path);
+    } else if (!strncmp(path, "Banc/MainField/", 15)) {
+        atomic_fetch_add(&as_seq_field, 1);
+        if (atomic_exchange(&as_watch_field, 0)) fprintf(stderr, "[autoshrine] the game opens %s (the first of the surface's map)\n", path);
+    } else if (!strncmp(path, "Event/EventFlow/DmF_SY_SmallDungeon", 35)) {
+        if (!strncmp(path + 35, "Goal", 4)) atomic_fetch_add(&as_seq_goal, 1);
+        fprintf(stderr, "[autoshrine] the game opens %s\n", path);
+    }
+}
+void runtime_autoshrine_cancel_user(void) { if (atomic_load(&as_active)) atomic_store(&as_cancel, 1); }
 void runtime_survey_tick(uint64_t frame) {
     if (in_tick || !atomic_load_explicit(&runtime_survey_pending, memory_order_acquire)) return;
     in_tick = 1;
@@ -799,12 +1215,12 @@ void runtime_survey_tick(uint64_t frame) {
     }
     int survey_left = request.kind || hold_left || route_on;
     pthread_mutex_unlock(&survey_lock);
-    if (!survey_left) noclip_tick(actor);   /* a scripted move wins */
+    if (!survey_left) { noclip_tick(actor); autoshrine_tick(actor, now_seconds()); }   /* a scripted move wins */
     runtime_spawn_tick(actor, frame);   /* outside the survey lock: it calls into the game */
     /* cleared before the spawn queue is looked at again, so a spawn queued meanwhile (it sets waiting, then pending) is
        never lost */
     atomic_store(&runtime_survey_pending, survey_left);
-    if (atomic_load(&runtime_spawn_waiting) || atomic_load(&noclip_wanted)) atomic_store(&runtime_survey_pending, 1);
+    if (atomic_load(&runtime_spawn_waiting) || atomic_load(&noclip_wanted) || atomic_load(&as_active)) atomic_store(&runtime_survey_pending, 1);
     in_tick = 0;
 }
 #endif   /* GAME_BOTW */

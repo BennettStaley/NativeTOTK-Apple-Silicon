@@ -69,6 +69,7 @@ static NSWindow *settings_window(void);   /* frontend.m: the game window */
     BOOL cheatsUnavailableShown, cheatDbAsked, groupShown[LANDMARK_NGROUPS];   /* groupShown: a Teleport category's folded list is open */
     Landmark marks[LANDMARKS];   /* the places with the last save's state and the story lock (landmarks.h), when the tab is built */
     MapPin pins[MAP_PINS_MAX]; int npins;   /* the Teleport tab's map pin rows (map_pins.h), read when the tab is built */
+    NSString *autoShrineShown;   /* the auto shrine status the Teleport tab shows (rebuilt when it changes) */
 }
 static TOTKSettingsPanel *settingsPanel;
 /* The towers', shrines' and story places' names and places (landmarks.h), read from the RomFS once a run, off the main thread. */
@@ -76,7 +77,7 @@ static Landmark landmark_places[LANDMARKS];
 static int landmarks_read;   /* 0 not yet, 1 reading, 2 read, 3 none in this game; main thread */
 enum { PANEL_WIDTH = 480, PANEL_MARGIN = 16, PAGE_STEP = 8 /* rows per LT / RT on a pane without row frames */,
        SAVES_ROW = -1, CHEATS_FOLDER_ROW = -2, CHEATS_OFF_ROW = -3, CHEATS_RESTART_ROW = -4, CHEATS_DB_ROW = -5, CHEATS_UNAVAILABLE_ROW = -6,
-       CHEATS_NOCLIP_ROW = -7, CHEATS_NOCLIP_SPEED_ROW = -8, CHEATS_GROUP_ROW = -20 /* - g: Teleport category g's Show / Hide */,
+       CHEATS_NOCLIP_ROW = -7, CHEATS_NOCLIP_SPEED_ROW = -8, CHEATS_AUTOSHRINE_ROW = -9, CHEATS_AUTOSHRINE_CHESTS_ROW = -10, CHEATS_GROUP_ROW = -20 /* - g: Teleport category g's Show / Hide */,
        CHEATS_PIN_ROW = -100 /* - k: map pin k */, CHEATS_LANDMARK_ROW = -200 /* - k: place k (landmarks.h) */,
        CHEAT_ROW = -1000 /* - k: cheat k, or the choice whose first variant is k */ };
 static NSString *const BAR_HINT = @"←→ sections   ↓ open   Q E tabs   R reset tab   ⇧R reset all   Esc close\n"
@@ -631,6 +632,7 @@ static int cheat_choice_members(int leader, int *all, int *usable, int max, int 
     int lock = settings_index("teleport.story_lock");
     if (lock >= 0) { NSView *row = [self rowFor:&SETTINGS[lock] index:lock]; [list addArrangedSubview:row]; [rows addObject:row]; [rowSetting addObject:@(lock)]; }
     [self addNoclipRows];
+    if (runtime_autoshrine_available()) [self addAutoShrineRows];
     const char *profile = getenv("TOTK_PROFILE_DIR");
     [self cheatsHeading:@"Map pins" detail:@"Never locked: you placed them." problem:nil big:YES];
     npins = profile ? map_pins_read(profile, pins, MAP_PINS_MAX, NULL, 0) : -1;
@@ -645,6 +647,27 @@ static int cheat_choice_members(int leader, int *all, int *usable, int max, int 
                              @"No map pins in the last save: place a pin on the map, then save (or wait for an autosave)." color:nil control:nil] id:CHEATS_PIN_ROW - MAP_PINS_MAX];
     [self buildLandmarks:profile lock:lock >= 0 && settings_get("teleport.story_lock")];
 }
+/* Auto shrine (world_survey.c, shrine_auto.h): Start / Stop, the chests switch, and the run's status under them. */
+- (void)addAutoShrineRows {
+    char line[600]; int running = runtime_autoshrine_status(line, sizeof line);
+    autoShrineShown = @(line);
+    [self cheatsHeading:@"Auto shrine" detail:@"Completes shrines one after another, nearest first: the game itself gives each Light of Blessing." problem:nil big:YES];
+    NSButton *go = [self cheatsButton:running ? @"Stop" : @"Start" action:@selector(autoShrineStartStop)];
+    if (running) go.bezelColor = NSColor.systemOrangeColor;
+    [self addCheatsRow:[self cheatsRow:@"Complete shrines automatically"
+                                 about:@"Flies Link with noclip to the nearest shrine not completed yet, presses A at its gate and lift, takes him to the altar for the Light of Blessing (the game completes the shrine and takes him out, as if you had walked there), then on to the next. Leaves out shrines the story lock greys, hidden and crystal shrines not open yet, and shrines in caves. Any key, button or stick of yours stops it. Save first."
+                                detail:autoShrineShown color:running ? NSColor.systemGreenColor : nil control:go] id:CHEATS_AUTOSHRINE_ROW];
+    NSSwitch *chests = [NSSwitch new]; chests.state = runtime_autoshrine_chests() ? NSControlStateValueOn : NSControlStateValueOff;
+    chests.target = self; chests.action = @selector(autoShrineChestsSwitched:); chests.refusesFirstResponder = YES;
+    [self addCheatsRow:[self cheatsRow:@"Open chests too" detail:@"Stops at each chest in the shrine on the way to the altar and presses A in front of it (best effort: some chests sit behind walls or under water)."
+                                 color:nil control:chests] id:CHEATS_AUTOSHRINE_CHESTS_ROW];
+}
+- (void)autoShrineStartStop {
+    char line[600];
+    if (runtime_autoshrine_status(line, sizeof line)) { runtime_autoshrine_stop(); [self rebuildKeepingPlace]; return; }
+    if (runtime_autoshrine_start(0)) [self hide];
+}
+- (void)autoShrineChestsSwitched:(NSSwitch *)s { runtime_autoshrine_set_chests(s.state == NSControlStateValueOn); [self.window makeFirstResponder:self]; }
 /* A category's rows: the story's places as they are; the long lists folded behind a Show / Hide row, what the newest save
    has not done yet first, by name. Locked places (the story lock) stay listed, greyed with the reason and no Go. */
 - (void)buildLandmarks:(const char *)profile lock:(BOOL)lockOn {
@@ -922,7 +945,14 @@ static NSPopUpButton *settings_find_popup(NSView *v) {
     }
 }
 - (void)restartGame { [self hide]; runtime_front_restart(); }
-- (void)meterTick { if (self.superview) [self refreshStatus]; }   /* the memory meter, once a second while the menu shows */
+- (void)meterTick {
+    if (!self.superview) return;
+    [self refreshStatus];
+    if (self.kind == MENU_TELEPORT && autoShrineShown) {   /* the auto shrine status line follows the run */
+        char line[600]; runtime_autoshrine_status(line, sizeof line);
+        if (![autoShrineShown isEqualToString:@(line)]) [self rebuildKeepingPlace];
+    }
+}   /* the memory meter, once a second while the menu shows */
 
 - (void)focusFind { [self.window makeFirstResponder:find]; }
 - (void)searched:(NSSearchField *)f {
@@ -1010,6 +1040,8 @@ static NSTextField *settings_help_label(NSView *v) {   /* a setting row's help t
     if (i == CHEATS_OFF_ROW) { if (!dir) [self cheatsAllOff]; return; }
     if (i == CHEATS_NOCLIP_ROW) { runtime_noclip_set(dir ? dir > 0 : !runtime_noclip_on()); [self rebuildKeepingPlace]; return; }
     if (i == CHEATS_NOCLIP_SPEED_ROW) { if (dir) [self stepNoclipSpeed:dir]; return; }
+    if (i == CHEATS_AUTOSHRINE_ROW) { if (!dir) [self autoShrineStartStop]; return; }
+    if (i == CHEATS_AUTOSHRINE_CHESTS_ROW) { runtime_autoshrine_set_chests(dir ? dir > 0 : !runtime_autoshrine_chests()); [self rebuildKeepingPlace]; return; }
     if (i <= CHEATS_PIN_ROW && i > CHEATS_PIN_ROW - MAP_PINS_MAX - 1) { if (!dir) [self goToPin:CHEATS_PIN_ROW - i]; return; }
     if (i <= CHEATS_GROUP_ROW && i > CHEATS_GROUP_ROW - LANDMARK_NGROUPS) { if (!dir) [self toggleLandmarkGroup:CHEATS_GROUP_ROW - i]; return; }
     if (i <= CHEATS_LANDMARK_ROW && i > CHEATS_LANDMARK_ROW - LANDMARKS) { if (!dir) [self goToLandmark:CHEATS_LANDMARK_ROW - i]; return; }

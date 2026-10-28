@@ -28,3 +28,13 @@ uint64_t runtime_noclip_taken(void);
 int runtime_noclip_goto(const float xyz[3]);
 /* Set by the 1.4.3 patches in survey sessions: the benchmark camera block (world_survey.c). */
 extern uint8_t *runtime_bench_cam;
+/* Auto shrine (Tools › Teleport, TOTK; world_survey.c, shrine_auto.h): completes shrines one after another, the nearest
+   first, by flying Link with noclip and pressing A where a player would; the game does the rest. */
+int runtime_autoshrine_available(void);
+int runtime_autoshrine_start(int one);              /* one: only the nearest shrine; 0 when refused (no noclip, running) */
+void runtime_autoshrine_stop(void);
+void runtime_autoshrine_set_chests(int on);         /* open each shrine's chests on the way (off at every start) */
+int runtime_autoshrine_chests(void);
+int runtime_autoshrine_status(char *text, size_t size);   /* the status line; 1 while a run is on */
+int runtime_autoshrine_command(const char *line);   /* the input file's "autoshrine start | one | stop | status | chests on|off" */
+void runtime_autoshrine_romfs(const char *path);    /* romfs.c: each file the game opens, relative to the RomFS */
