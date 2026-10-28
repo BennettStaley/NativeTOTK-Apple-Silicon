@@ -7,6 +7,7 @@
 #include "settings.h"
 #include "gamepad_layout.h"
 #include <dispatch/dispatch.h>
+#include <math.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -54,11 +55,20 @@ void runtime_input_key_synthetic(unsigned code,int down){if(code>=128)return;pth
  if(press&&code==KEY_TAA_TOGGLE)key_taa_cycle();
  if(press&&code==KEY_PAD_TYPE_CYCLE)key_pad_type_cycle();
  if(press&&code==KEY_MOUSE_TOGGLE)key_mouse_toggle();}
+/* Scripted pad ("ctl press | hold | release | stick" lines of the input file, ctl_command below): npad buttons and exact
+   analog sticks for a script that plays the game, in sys-botbase's vocabulary (olliz0r/sys-botbase: click / press /
+   release / setStick). A button or stick given a time lets go by itself then; a press is seen by the game at least once,
+   however short. A scripted stick replaces the keyboard's (a controller pushed further still wins) and is not scaled by
+   the camera-speed setting. Not the user's input: it never stops auto-load. Under inputLock. */
+static uint64_t ctl_held,ctl_pending,ctl_until[16];
+static struct{int on;int32_t x,y;uint64_t until;} ctl_stick[2];
+static void ctl_expire_locked(void){uint64_t now=runtime_now_ns();for(int i=0;i<16;i++)if(ctl_until[i]&&now>=ctl_until[i]){ctl_until[i]=0;ctl_held&=~(1ull<<i);}
+ for(int s=0;s<2;s++)if(ctl_stick[s].on&&ctl_stick[s].until&&now>=ctl_stick[s].until)ctl_stick[s].on=0;}
 /* Leased keys (auto shrine, world_survey.c): a synthetic press that lets go by itself at its deadline, checked wherever
    the game or noclip reads input, so a key can never stay held when the code that pressed it stops running. ms 0 lets
    go at once. A key the player presses himself is his: its lease ends. */
 static uint64_t lease_until[128];
-static void lease_expire_locked(void){uint64_t now=0;for(unsigned i=0;i<128;i++)if(lease_until[i]){if(!now)now=runtime_now_ns();if(now>=lease_until[i]){lease_until[i]=0;keys[i]=0;}}}
+static void lease_expire_locked(void){ctl_expire_locked();uint64_t now=0;for(unsigned i=0;i<128;i++)if(lease_until[i]){if(!now)now=runtime_now_ns();if(now>=lease_until[i]){lease_until[i]=0;keys[i]=0;}}}
 void runtime_input_lease(unsigned code,unsigned ms){if(code>=128)return;pthread_mutex_lock(&inputLock);
  if(!ms){if(lease_until[code]){lease_until[code]=0;keys[code]=0;}}
  else{if(!keys[code])pending|=button(code);keys[code]=1;lease_until[code]=runtime_now_ns()+(uint64_t)ms*1000000ull;}
@@ -71,11 +81,12 @@ void runtime_input_key(unsigned code,int down){if(down&&code<128)user_input("key
 static _Atomic int inputHeld;
 void runtime_input_hold(int on){atomic_store(&inputHeld,on?1:0);if(on)runtime_input_clear();}
 /* Cheats (cheats.c): the buttons held now (keyboard and controller), in the npad bit order. */
-uint64_t runtime_input_buttons(void){uint64_t b=0;pthread_mutex_lock(&inputLock);lease_expire_locked();for(unsigned i=0;i<128;i++)if(keys[i])b|=button(i);pthread_mutex_unlock(&inputLock);
+uint64_t runtime_input_buttons(void){uint64_t b=0;pthread_mutex_lock(&inputLock);lease_expire_locked();for(unsigned i=0;i<128;i++)if(keys[i])b|=button(i);b|=ctl_held;pthread_mutex_unlock(&inputLock);
  return b|runtime_gamepad_held();}
-void runtime_input_left_stick(int32_t *x,int32_t *y){pthread_mutex_lock(&inputLock);lease_expire_locked();int32_t kx=32767*((int)keys[2]-(int)keys[0]),ky=32767*((int)keys[13]-(int)keys[1]);int held=atomic_load(&inputHeld);pthread_mutex_unlock(&inputLock);
+void runtime_input_left_stick(int32_t *x,int32_t *y){pthread_mutex_lock(&inputLock);lease_expire_locked();int32_t kx=32767*((int)keys[2]-(int)keys[0]),ky=32767*((int)keys[13]-(int)keys[1]);if(ctl_stick[0].on){kx=ctl_stick[0].x;ky=ctl_stick[0].y;}int held=atomic_load(&inputHeld);pthread_mutex_unlock(&inputLock);
  int32_t px=0,py=0;runtime_gamepad_left_stick(&px,&py);if(held){*x=*y=0;return;}*x=abs(px)>abs(kx)?px:kx;*y=abs(py)>abs(ky)?py:ky;}
-void runtime_input_clear(void){pthread_mutex_lock(&inputLock);memset(keys,0,sizeof(keys));memset(lease_until,0,sizeof(lease_until));pending=0;pthread_mutex_unlock(&inputLock);runtime_gamepad_clear();}
+void runtime_input_clear(void){pthread_mutex_lock(&inputLock);memset(keys,0,sizeof(keys));memset(lease_until,0,sizeof(lease_until));pending=0;
+ ctl_held=ctl_pending=0;memset(ctl_until,0,sizeof(ctl_until));memset(ctl_stick,0,sizeof(ctl_stick));pthread_mutex_unlock(&inputLock);runtime_gamepad_clear();}
 static void initialize(void){pthread_mutex_lock(&inputLock);enabled=true;pthread_mutex_unlock(&inputLock);fprintf(stderr,"[totk] native keyboard controller initialized\n");}
 /* Docked: one full-key controller as player 1 (id 0, style bit 0). Handheld (TOTK_OPERATION_MODE=handheld, the iPhone):
    the same input is the handheld controller (id 0x20, style bit 1, joy-cons attached) and player 1 is not connected;
@@ -100,13 +111,14 @@ static int pad_states(NpadState *out,int max,const uint32_t *id,uint32_t want_st
 static int full_states(NpadState *out,int max,const uint32_t *id){return pad_states(out,max,id,1);}
 static int handheld_states(NpadState *out,int max,const uint32_t *id){return pad_states(out,max,id,2);}
 static int pad_states(NpadState *out,int max,const uint32_t *id,uint32_t want_style){if(max<=0)return 0;if(id)input_log(want_style==2?"handheld state":"full-key state",*id);if(!out||!id)runtime_fail("controller output pointer");pthread_mutex_lock(&inputLock);NpadState state={.sampling=++sample};lease_expire_locked();if(enabled&&allowed&&*id==pad_id()&&want_style==pad_style()&&(styles&want_style)){
- state.attributes=1;for(unsigned i=0;i<128;i++)if(keys[i])state.buttons|=button(i);state.buttons|=pending;pending=0;
+ state.attributes=1;for(unsigned i=0;i<128;i++)if(keys[i])state.buttons|=button(i);state.buttons|=pending;pending=0;state.buttons|=ctl_held|ctl_pending;ctl_pending=0;
  state.lx=32767*((int)keys[2]-(int)keys[0]);state.ly=32767*((int)keys[13]-(int)keys[1]);state.rx=32767*((int)keys[124]-(int)keys[123]);state.ry=32767*((int)keys[126]-(int)keys[125]);
+ if(ctl_stick[0].on){state.lx=ctl_stick[0].x;state.ly=ctl_stick[0].y;}int ctl_camera=ctl_stick[1].on;if(ctl_camera){state.rx=ctl_stick[1].x;state.ry=ctl_stick[1].y;}
  RuntimeGamepadState pad;runtime_gamepad_read(&pad);if(atomic_load(&inputHeld)){pad.buttons=0;state.buttons=0;state.lx=state.ly=state.rx=state.ry=0;}state.buttons|=pad.buttons;state.buttons&=~runtime_noclip_taken();
  if(pad.buttons&~padSeen||abs(pad.lx)>16384||abs(pad.ly)>16384||abs(pad.rx)>16384||abs(pad.ry)>16384)user_input("controller");padSeen=pad.buttons;
  if(abs(pad.lx)>abs(state.lx))state.lx=pad.lx;if(abs(pad.ly)>abs(state.ly))state.ly=pad.ly;
  if(abs(pad.rx)>abs(state.rx))state.rx=pad.rx;if(abs(pad.ry)>abs(state.ry))state.ry=pad.ry;
- state.rx=camera_scale(state.rx,atomic_load(&cameraX));state.ry=camera_scale(state.ry,atomic_load(&cameraY));
+ if(!ctl_camera||abs(pad.rx)>abs(ctl_stick[1].x)||abs(pad.ry)>abs(ctl_stick[1].y)){state.rx=camera_scale(state.rx,atomic_load(&cameraX));state.ry=camera_scale(state.ry,atomic_load(&cameraY));}
  }*out=state;pthread_mutex_unlock(&inputLock);return 1;}
 static int disconnected_states(NpadState *out,int max,const uint32_t *id){if(id)input_log("joy-con state",*id);if(max<=0)return 0;if(!out)runtime_fail("controller output pointer");pthread_mutex_lock(&inputLock);*out=(NpadState){.sampling=++sample};pthread_mutex_unlock(&inputLock);return 1;}
 static void hold_type(int type){if(type<0||type>1)runtime_fail("invalid joy hold type");holdType=type;(void)holdType;}
@@ -191,12 +203,44 @@ __attribute__((constructor)) static void input_script_start(void) {
 /* Optional local integration-test command stream. Appending complete lines lets tests inspect each
    actual frame before choosing the next input, instead of guessing load/menu timings. Disabled normally.
    Commands: key <Mac keycode> <milliseconds>, down/up <Mac keycode>, shot <path>, wshot <path>, passdump <frames>, querylog <frames>, anomdump,
-   kbtest / kbtype <text> / kbenter / kbesc / kbshot <path> (the text entry bar), threads (dump every guest thread's wait), hletrace <0|1|2> (host calls the game makes), framestep <ms> (pin the frame step), render <w>x<h> (live scene size), mscan ... (memory scan and write watch, runtime/mem_scan.h), close. */
+   kbtest / kbtype <text> / kbenter / kbesc / kbshot <path> (the text entry bar), threads (dump every guest thread's wait), hletrace <0|1|2> (host calls the game makes), framestep <ms> (pin the frame step), render <w>x<h> (live scene size), mscan ... (memory scan and write watch, runtime/mem_scan.h), close;
+   ctl ... (the scripted pad below; game state and control in world_survey.c). */
 extern void dm_gfx_shot_at(long frames, const char *path);
 extern void runtime_front_request_close(void);
 /* "mscan ...": memory scan and write watch (runtime/mem_scan.h, in services.c); this default answers in the probes that
    link input.c alone, which have no game memory. */
 __attribute__((weak)) int runtime_mem_scan_command(const char *line) { (void)line; return 0; }
+/* "ctl press <buttons> [ms]" (down for ms, 100 by default, then up by itself), "ctl hold <buttons>" (down until released),
+   "ctl release <buttons>|all", "ctl stick l|r <x> <y> [ms]" (x, y from -1 to 1, y up; for ms, or until the next stick
+   line for that stick when absent or 0; "ctl stick l 0 0" without ms hands the stick back). Buttons: a b x y l r zl zr
+   plus minus lstick rstick dleft dup dright ddown, several joined with '+' ("ctl press zl+a 300"). The other "ctl ..."
+   lines (state, peek, face, walk, noclip, goto: world_survey.c) fall through. "[ctl-done] ..." when taken. */
+static uint64_t ctl_buttons(const char *text){
+ static const char *const names[16]={"a","b","x","y","lstick","rstick","l","r","zl","zr","plus","minus","dleft","dup","dright","ddown"};
+ uint64_t mask=0;char word[16];
+ while(*text){size_t n=strcspn(text,"+");if(!n||n>=sizeof word)return 0;memcpy(word,text,n);word[n]=0;text+=n+(text[n]=='+');
+  int found=0;for(int i=0;i<16;i++)if(!strcmp(word,names[i])){mask|=1ull<<i;found=1;}if(!found)return 0;}
+ return mask;}
+static int ctl_command(const char *line){
+ char op[16]="",what[96]="";int used=0;
+ if(strncmp(line,"ctl ",4)||sscanf(line+4,"%15s %95s %n",op,what,&used)<2)return 0;
+ const char *rest=line+4+used;
+ if(!strcmp(op,"press")||!strcmp(op,"hold")||!strcmp(op,"release")){
+  uint64_t mask=!strcmp(what,"all")&&op[0]=='r'?0xffffull:ctl_buttons(what);unsigned ms=op[0]=='p'?100:0;
+  if(op[0]=='p'&&*rest&&(sscanf(rest,"%u",&ms)!=1||ms>60000))mask=0;
+  if(!mask){fprintf(stderr,"[ctl] rejected: %s",line);return 1;}
+  pthread_mutex_lock(&inputLock);uint64_t until=ms?runtime_now_ns()+(uint64_t)ms*1000000ull:0;
+  for(int i=0;i<16;i++)if(mask>>i&1)ctl_until[i]=op[0]=='p'?until:0;
+  if(op[0]=='r')ctl_held&=~mask;else{ctl_held|=mask;ctl_pending|=mask;}
+  pthread_mutex_unlock(&inputLock);fprintf(stderr,"[ctl-done] %s %s %u\n",op,what,ms);return 1;}
+ if(!strcmp(op,"stick")&&(!strcmp(what,"l")||!strcmp(what,"r"))){
+  float x,y;unsigned ms=0;int n=sscanf(rest,"%f %f %u",&x,&y,&ms);
+  if(n<2||!(x>=-1&&x<=1&&y>=-1&&y<=1)||ms>60000){fprintf(stderr,"[ctl] rejected: %s",line);return 1;}
+  int s=what[0]=='r';pthread_mutex_lock(&inputLock);
+  ctl_stick[s].x=(int32_t)lroundf(x*32767);ctl_stick[s].y=(int32_t)lroundf(y*32767);ctl_stick[s].until=ms?runtime_now_ns()+(uint64_t)ms*1000000ull:0;
+  ctl_stick[s].on=ms||x!=0||y!=0;pthread_mutex_unlock(&inputLock);
+  fprintf(stderr,"[ctl-done] stick %s %.3f %.3f %u\n",what,x,y,ms);return 1;}
+ return 0;}
 static void *input_file(void *arg) {
     FILE *f = fopen((const char *)arg, "r"); if (!f) runtime_fail("cannot open TOTK_INPUT_FILE");
     char line[1200];
@@ -215,7 +259,8 @@ static void *input_file(void *arg) {
             }
             continue;
         }
-        if (runtime_survey_command(line) || runtime_spawn_command(line) || runtime_autoshrine_command(line)) continue;   /* "autoshrine ...": Tools › Shrines's auto shrine */
+        if (ctl_command(line)) continue;   /* "ctl press | hold | release | stick": the scripted pad */
+        if (runtime_survey_command(line) || runtime_spawn_command(line) || runtime_autoshrine_command(line)) continue;   /* "autoshrine ..." / "ctl ...": world_survey.c */
         unsigned code, ms; int used = 0;
         if (sscanf(line, "down %u %n", &code, &used) == 1 && used && !line[used] && code < 128) {
             fprintf(stderr,"[totk-input] file: key %u down\n",code);runtime_input_key_synthetic(code,1);

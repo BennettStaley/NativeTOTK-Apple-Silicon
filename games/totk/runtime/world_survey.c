@@ -199,7 +199,10 @@ void runtime_autoshrine_stop(void) { }
 void runtime_autoshrine_set_chests(int on) { (void)on; }
 int runtime_autoshrine_chests(void) { return 0; }
 int runtime_autoshrine_status(char *text, size_t size) { if (size) snprintf(text, size, "Not available in this game"); return 0; }
-int runtime_autoshrine_command(const char *line) { (void)line; return 0; }
+int runtime_autoshrine_command(const char *line) {   /* "ctl state | peek | ...": TOTK only; the scripted pad (input.c) works here */
+    if (strncmp(line, "ctl ", 4)) return 0;
+    fprintf(stderr, "[ctl] rejected: game state and movement commands are TOTK only: %s", line); return 1;
+}
 void runtime_autoshrine_romfs(const char *path) { (void)path; }
 #else
 enum { SCENE_SLOT = GAME_ADDR(0x4663f08), FORCE_MATRIX = GAME_ADDR(0x69a18c), ACTOR_POS = GAME_ACTOR_POS, ACTOR_ROT = GAME_ACTOR_ROT };
@@ -1530,8 +1533,178 @@ int runtime_autoshrine_status(char *text, size_t size) {
     pthread_mutex_lock(&as_status_lock); snprintf(text, size, "%s", as_status); pthread_mutex_unlock(&as_status_lock);
     return atomic_load(&as_active);
 }
+/* Game control for scripts (the input file; scripts/autoshrine.py is one user, any task can be driven the same way). Every
+   line also works as "autoshrine <rest>"; answers carry [ctl-...] (or [as-...] for the autoshrine spelling).
+     input   ctl press <buttons> [ms] | hold <buttons> | release <buttons>|all | stick l|r <x> <y> [ms]   (input.c)
+     move    ctl face X Y Z | walk X Y Z MS (Link turned / walked toward a point) | noclip on|off | goto X Y Z (teleport)
+     read    ctl state (one line, below) | peek <base> <offsets...> <len> | info N | watch on|off (shrine data, files)
+   "ctl state" (1.4.3): [ctl-state] event=0|1|? evname=<name>|- map=<current map>|? stable=0|1|? hp=<cur>/<max>|?
+   prompt=<type>:<actor>|none|? attn=<state>/<count> pos=x,y,z face=x,z cam=x,y,z camright=x,z|cam=?
+   Where each value comes from (1.4.3 main, static analysis; the tag after it says how sure):
+     event   [EventMgr::sInstance]+0x58 != 0: exactly what the AI query QueryIsPlayingMainEvent returns (its doQuery
+             0x2686e10; 1.0.0's 0x29555e4 reads 0x464a988 = totk-lotuskit's EventMgr::sInstance). Certain.
+     evname  EventMgr+0xb0, a FixedSafeString<128> (mCurrentEventName in totk-lotuskit's EventMgr layout); printed only
+             when its text pointer (+0xb8) points at its own buffer (+0xc4), so a moved field shows "-". Candidate.
+     map     QueryGetCurrentNormalizedBancName's reader (0x1995210): o = [[banc]+0x28], i = [o+0x150], ready when byte
+             i+0x224 bit 0 is set, the name at [i+0x158] ("MainField", "MinusField", "SmallDungeon/Dungeon009"-like); the
+             game falls back to the path at [banc]+0x30, printed as-is. Static, verify.
+     stable  QueryBancLoadMgrIsStable (0x25e18b4): bit 2 of u32 +0xed30 in scene component 6 (scene as for the player:
+             [[main+SCENE_SLOT]+0x1e8], components [scene+0x58]). 0 while the map streams in. Static, verify.
+     hp      Life component: [[player+0x228]+0x2f8] (component 0x5f, the game's own getter 0x4f8d78), current life at
+             [life+0x1830]+0x8 (QueryGetLife 0x2659c7c); max at +0x18 of that object (the cheat list's Inf. Health copies
+             +0x18 into +0x8). Quarter hearts. Current certain, max candidate.
+     prompt  the player's attention component [[player+0x228]+0x128] (0x194f714, AttentionReceiverRef 0x25 in lotuskit's
+             enum) as the DoAction lookup 0x5e2d54 reads it: state u32 +0xe8 (2 or 3: picking), u32 +0x58 entries,
+             entry [[+0x60]] -> client [entry]: action type u32 +0x34, actor [client+0x8]. Printed as type:actor name.
+             Candidate: which type is Examine / Talk / Open is to be learnt live.
+     face    the actor's rotation (ACTOR_ROT) third column, as noclip walks; cam: the G-buffer pass's camera
+             (dm_gfx_camera, turned on at the first state line, so the first one may say cam=?).
+   "ctl peek <base> <off>... <len>": base main | player | event | banc | a hex address; every offset but the last is added
+   and then read as a pointer, the last only added; up to 256 bytes printed as hex, u32 and float (and the text). A chain
+   that breaks says where. Reads only (mach_vm_read): a bad address is reported, never touched. */
+#if defined(TOTK_GAME_V143)
+enum { STATE_EVENT_MGR = GAME_STATE_EVENT_MGR, STATE_BANC = GAME_STATE_BANC };
+#endif
+enum { ACTOR_COMPONENTS = 0x228, COMPONENT_LIFE = 0x5f, COMPONENT_ATTENTION = 0x25, SCENE_BANC_LOAD = 6 };
+/* A C string at p (up to size - 1 bytes, read in pieces so a string near the end of a mapping still reads); 0 if none. */
+static int ctl_text(uintptr_t p, char *out, size_t size) {
+    size_t n = 0;
+    out[0] = 0;
+    while (p && n + 1 < size) {
+        char piece[16]; size_t want = sizeof piece < size - 1 - n ? sizeof piece : size - 1 - n;
+        if (!read_mem(p + n, piece, want)) break;
+        size_t k = 0;
+        while (k < want && piece[k]) k++;
+        memcpy(out + n, piece, k); n += k; out[n] = 0;
+        if (k < want) break;
+    }
+    for (size_t i = 0; i < n; i++) if ((unsigned char)out[i] < 0x21 || (unsigned char)out[i] > 0x7e) out[i] = '_';   /* one word in the line */
+    return n > 0;
+}
+static uintptr_t ctl_component(uintptr_t actor, unsigned index) {
+    uintptr_t list = actor ? read_ptr(actor + ACTOR_COMPONENTS) : 0;
+    return list ? read_ptr(list + index * 8u) : 0;
+}
+static void ctl_state(const char *tag) {
+    char line[900]; size_t o = 0;
+    #define CTL_ADD(...) do { if (o < sizeof line) o += (size_t)snprintf(line + o, sizeof line - o, __VA_ARGS__); } while (0)
+    uintptr_t actor = survey_main ? player_actor() : 0;
+#if defined(TOTK_GAME_V143)
+    uintptr_t mgr = survey_main ? read_ptr(survey_main + STATE_EVENT_MGR) : 0, current = 0;
+    if (mgr && read_mem(mgr + 0x58, &current, sizeof current)) {
+        char name[132] = "-";
+        if (current && read_ptr(mgr + 0xb8) == mgr + 0xc4 && !ctl_text(mgr + 0xc4, name, sizeof name)) snprintf(name, sizeof name, "-");
+        CTL_ADD(" event=%d evname=%s", current != 0, name);
+    } else CTL_ADD(" event=? evname=-");
+    uintptr_t banc = survey_main ? read_ptr(survey_main + STATE_BANC) : 0, holder = banc ? read_ptr(banc + 0x28) : 0;
+    uintptr_t info = holder ? read_ptr(holder + 0x150) : 0;
+    uint8_t ready = 0; char map[160] = "";
+    if (info && read_mem(info + 0x224, &ready, 1) && (ready & 1)) ctl_text(read_ptr(info + 0x158), map, sizeof map);
+    if (!map[0] && banc) ctl_text(read_ptr(banc + 0x30), map, sizeof map);
+    CTL_ADD(" map=%s", map[0] ? map : "?");
+    uintptr_t module = survey_main ? read_ptr(survey_main + SCENE_SLOT) : 0, scene = module ? read_ptr(module + 0x1e8) : 0;
+    int count = 0; uint32_t flags = 0; uintptr_t loader = 0;
+    uintptr_t components = scene && read_mem(scene + 0x50, &count, 4) && count > SCENE_BANC_LOAD && count <= 256 ? read_ptr(scene + 0x58) : 0;
+    if (components) loader = read_ptr(components + SCENE_BANC_LOAD * 8u);
+    if (loader && read_mem(loader + 0xed30, &flags, 4)) CTL_ADD(" stable=%u", flags >> 2 & 1); else CTL_ADD(" stable=?");
+#else
+    CTL_ADD(" event=? evname=- map=? stable=?");
+#endif
+    uintptr_t life_component = ctl_component(actor, COMPONENT_LIFE), life = life_component ? read_ptr(life_component + 0x1830) : 0;
+    int32_t hp[2] = {0, 0};   /* life object +0x8 and +0x18 */
+    if (life && read_mem(life + 0x8, &hp[0], 4) && read_mem(life + 0x18, &hp[1], 4)) CTL_ADD(" hp=%d/%d", hp[0], hp[1]); else CTL_ADD(" hp=?");
+    uintptr_t attention = ctl_component(actor, COMPONENT_ATTENTION);
+    uint32_t attn = 0, entries = 0;
+    if (attention && read_mem(attention + 0xe8, &attn, 4) && read_mem(attention + 0x58, &entries, 4)) {
+        uintptr_t first = (attn & ~1u) == 2 && entries ? read_ptr(attention + 0x60) : 0;
+        uintptr_t entry = first ? read_ptr(first) : 0, client = entry ? read_ptr(entry) : 0;
+        uint32_t type = 0; char who[80] = "";
+        if (client && read_mem(client + 0x34, &type, 4) && type) {
+            uintptr_t target = read_ptr(client + 0x8);
+            if (!target || !ctl_text(read_ptr(target + GAME_ACTOR_NAME), who, sizeof who)) snprintf(who, sizeof who, "?");
+            CTL_ADD(" prompt=%u:%s", type, who);
+        } else CTL_ADD(" prompt=none");
+        CTL_ADD(" attn=%u/%u", attn, entries);
+    } else CTL_ADD(" prompt=? attn=?");
+    float xyz[3], rot[9];
+    if (actor && read_mem(actor + ACTOR_POS, xyz, sizeof xyz) && valid_xyz(xyz)) {
+        CTL_ADD(" pos=%.2f,%.2f,%.2f", xyz[0], xyz[1], xyz[2]);
+        if (read_mem(actor + ACTOR_ROT, rot, sizeof rot)) CTL_ADD(" face=%.3f,%.3f", rot[2], rot[8]);
+    } else CTL_ADD(" pos=?");
+    float cam[3], right[3]; uint64_t frame = 0;
+    dm_gfx_camera_want(1);
+    if (dm_gfx_camera(cam, right, &frame)) CTL_ADD(" cam=%.2f,%.2f,%.2f camright=%.3f,%.3f", cam[0], cam[1], cam[2], right[0], right[2]);
+    else CTL_ADD(" cam=?");
+    #undef CTL_ADD
+    fprintf(stderr, "[%s-state]%s\n", tag, line);
+}
+static void ctl_peek(const char *tag, const char *args) {
+    char word[40]; int used = 0; uintptr_t at = 0;
+    unsigned long long steps[16]; int n = 0;
+    if (sscanf(args, "%39s %n", word, &used) != 1) { fprintf(stderr, "[%s-peek] rejected: peek <main|player|event|banc|hex> <offsets...> <len>\n", tag); return; }
+    if (!strcmp(word, "main")) at = survey_main;
+    else if (!strcmp(word, "player")) at = survey_main ? player_actor() : 0;
+#if defined(TOTK_GAME_V143)
+    else if (!strcmp(word, "event")) at = survey_main ? read_ptr(survey_main + STATE_EVENT_MGR) : 0;
+    else if (!strcmp(word, "banc")) at = survey_main ? read_ptr(survey_main + STATE_BANC) : 0;
+#endif
+    else { char *end; at = (uintptr_t)strtoull(word, &end, 16); if (*end) at = 0; }
+    if (!at) { fprintf(stderr, "[%s-peek] base %s: none\n", tag, word); return; }
+    const char *last = NULL;   /* offsets are hex (0x optional, a leading '-' subtracts), the length decimal */
+    for (const char *p = args + used; n < 16;) {
+        while (*p == ' ' || *p == '\t') p++;
+        if (!*p || *p == '\n' || *p == '\r') break;
+        char *end; int neg = *p == '-';
+        unsigned long long v = strtoull(p + neg, &end, 16);
+        if (end == p + neg || (*end && *end != ' ' && *end != '\t' && *end != '\n' && *end != '\r')) {
+            fprintf(stderr, "[%s-peek] rejected: bad number at \"%.20s\"\n", tag, p); return;
+        }
+        last = p; steps[n++] = neg ? (unsigned long long)-(long long)v : v; p = end;
+    }
+    if (n < 2) { fprintf(stderr, "[%s-peek] rejected: needs at least one offset and a length\n", tag); return; }
+    n--;
+    unsigned len = (unsigned)strtoul(last, NULL, 10);
+    if (!len || len > 256) { fprintf(stderr, "[%s-peek] rejected: length 1..256 bytes\n", tag); return; }
+    for (int i = 0; i < n; i++) {
+        at += (uintptr_t)steps[i];
+        if (i == n - 1) break;
+        uintptr_t next = read_ptr(at);
+        if (!next) { fprintf(stderr, "[%s-peek] chain broken at step %d: [%#llx] unreadable or null\n", tag, i + 1, (unsigned long long)at); return; }
+        at = next;
+    }
+    uint8_t buf[256];
+    if (!read_mem(at, buf, len)) { fprintf(stderr, "[%s-peek] %#llx: unreadable\n", tag, (unsigned long long)at); return; }
+    char line[2200]; size_t o = 0;
+    o += (size_t)snprintf(line + o, sizeof line - o, "[%s-peek] %#llx len=%u hex=", tag, (unsigned long long)at, len);
+    for (unsigned i = 0; i < len && o < sizeof line; i++) o += (size_t)snprintf(line + o, sizeof line - o, "%02x", buf[i]);
+    if (o < sizeof line) o += (size_t)snprintf(line + o, sizeof line - o, " u32=");
+    for (unsigned i = 0; i + 4 <= len && o < sizeof line; i += 4) { uint32_t v; memcpy(&v, buf + i, 4); o += (size_t)snprintf(line + o, sizeof line - o, "%s%u", i ? "," : "", v); }
+    if (o < sizeof line) o += (size_t)snprintf(line + o, sizeof line - o, " f32=");
+    for (unsigned i = 0; i + 4 <= len && o < sizeof line; i += 4) { float v; memcpy(&v, buf + i, 4); o += (size_t)snprintf(line + o, sizeof line - o, "%s%g", i ? "," : "", v); }
+    if (o < sizeof line) o += (size_t)snprintf(line + o, sizeof line - o, " text=");
+    for (unsigned i = 0; i < len && o + 1 < sizeof line; i++) line[o++] = buf[i] >= 0x21 && buf[i] <= 0x7e ? (char)buf[i] : '.';
+    if (o >= sizeof line) o = sizeof line - 1;
+    line[o] = 0;
+    fprintf(stderr, "%s\n", line);
+}
 int runtime_autoshrine_command(const char *line) {
-    if (strncmp(line, "autoshrine ", 11)) return 0;
+    int ctl = !strncmp(line, "ctl ", 4);
+    if (!ctl && strncmp(line, "autoshrine ", 11)) return 0;
+    const char *tag = ctl ? "ctl" : "as", *rest = line + (ctl ? 4 : 11);
+    if (!strncmp(rest, "state", 5) && (!rest[5] || rest[5] == '\n' || rest[5] == '\r' || rest[5] == ' ')) { ctl_state(tag); return 1; }
+    if (!strncmp(rest, "peek ", 5)) { ctl_peek(tag, rest + 5); return 1; }
+    if (ctl && !strncmp(rest, "noclip ", 7) && (!strncmp(rest + 7, "on", 2) || !strncmp(rest + 7, "off", 3))) {
+        runtime_noclip_set(rest[8] == 'n'); fprintf(stderr, "[ctl-done] noclip %s\n", rest[8] == 'n' ? "on" : "off"); return 1;
+    }
+    if (ctl && !strncmp(rest, "goto ", 5)) {
+        float xyz[3];
+        if (sscanf(rest + 5, "%f %f %f", &xyz[0], &xyz[1], &xyz[2]) != 3) { fprintf(stderr, "[ctl] rejected: goto X Y Z\n"); return 1; }
+        fprintf(stderr, "[ctl-done] goto %s\n", runtime_noclip_goto(xyz) ? "flying" : "refused"); return 1;
+    }
+    if (ctl) {   /* the rest as "autoshrine <rest>": face, walk, info, watch, start, stop, ... */
+        char as_line[1200]; snprintf(as_line, sizeof as_line, "autoshrine %s", rest);
+        return runtime_autoshrine_command(as_line);
+    }
     char word[16] = "", arg[8] = ""; sscanf(line + 11, "%15s %7s", word, arg);
     if (!strcmp(word, "start")) runtime_autoshrine_start(0);
     else if (!strcmp(word, "one")) runtime_autoshrine_start(1);
@@ -1570,7 +1743,7 @@ int runtime_autoshrine_command(const char *line) {
         pthread_mutex_unlock(&as_cmd_lock);
         atomic_store_explicit(&runtime_survey_pending, 1, memory_order_release);
     }
-    else fprintf(stderr, "[autoshrine] rejected: expected start, one, finish N, stop, status, chests on|off or skip x|b|none\n");
+    else fprintf(stderr, "[autoshrine] rejected: expected state, peek, face, walk, info, watch, start, one, finish N, stop, status, chests on|off or skip x|b|none\n");
     return 1;
 }
 /* romfs.c, every file the game opens (path relative to the RomFS): which map is loading, and the goal's event. */
