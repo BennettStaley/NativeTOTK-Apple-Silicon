@@ -338,9 +338,16 @@ def do_inside(g, s):   # inside: the altar (its floor point, facing it), its sce
         if st and st['event']:
             say('  the blessing started (event)')
             outside = lambda st: st.get('map', '').startswith('MainField')
-            if skip_scenes(g, until=outside, limit=90) == 'until':
+            r = skip_scenes(g, until=outside, limit=90)
+            end = time.time() + 30   # between the blessing and the exit no scene plays while the surface loads (Apogek)
+            while r != 'until' and time.time() < end:
+                st = g.state()
+                if st and outside(st): r = 'until'; break
+                if st and st['event']: g.key('X', 1000)
+                time.sleep(0.5)
+            if r == 'until':
                 say('  outside'); skip_scenes(g, limit=15); return 'done'
-            say('  the event did not take Link out; the altar instead')
+            say('  the event did not take Link out in 30 s; the altar instead')
         else: say('  no event; the altar instead')
     return do_altar(g, s)
 
