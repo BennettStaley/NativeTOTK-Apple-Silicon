@@ -191,18 +191,37 @@ def walk_to_spot(g, spot, near=0.5, limit=15, stop=None):
     return 'timeout'
 
 
+PROMPT_REFS = os.path.expanduser('~/Library/Application Support/MacNativeGames/TOTK/tools')   # 40x12 crops of the "(B) Examine"
+_refs = None                                                                                       # bubble (half size), kept out of the repo
+
+
+def _norm(vals):
+    m = sum(vals) / len(vals); s = math.sqrt(sum((v - m) ** 2 for v in vals))
+    return [(v - m) / s for v in vals] if s >= 1 else None
+
+
 def prompt_visible(g):
-    """An A prompt ("Examine" etc.) on screen: its button circle and word, just below and right of Link, at x 545-625,
-    y 423-446 of the 960x540 game frame: 367-450 bright pixels (r+g+b > 600) with it, 0-2 without, a white lantern
-    beside it included (checked on 40 shots, 2026-10-28)."""
+    """An A prompt on screen: the shot (half size) matched against the saved prompt crops near where the bubble shows
+    (x 272, y 211 at half size, searched +-15 / +-7 px); correlation >= 0.75 (prompts 0.82-1.0, none 0.62 at most, over
+    the shots of 2026-10-28)."""
+    global _refs
     from PIL import Image
+    if _refs is None:
+        _refs = [r for r in (_norm(list(Image.open(f).convert('L').getdata())) for f in sorted(glob.glob(os.path.join(PROMPT_REFS, 'autoshrine-prompt-*.png')))) if r]
     path = g.shot('p'); time.sleep(0.05)
-    try: im = Image.open(path).convert('RGB').crop((545, 423, 625, 446))
+    try: im = Image.open(path).convert('L').resize((480, 270))
     except Exception: return False
     finally:
         try: os.remove(path)
         except OSError: pass
-    return sum(1 for px in im.getdata() if sum(px) > 600) >= 150
+    best = -1
+    for dy in range(-7, 8, 1):
+        for dx in range(-15, 16, 2):
+            w = _norm(list(im.crop((272 + dx, 211 + dy, 312 + dx, 223 + dy)).getdata()))
+            if w:
+                for r in _refs: best = max(best, sum(a * b for a, b in zip(w, r)))
+                if best >= 0.75: return True
+    return False
 
 
 def walk_until_prompt(g, target, look=None, limit=20):
