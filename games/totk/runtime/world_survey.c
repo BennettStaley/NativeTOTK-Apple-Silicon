@@ -234,6 +234,9 @@ static struct { int holding; float xyz[3]; uint64_t at_ns; } noclip;   /* frame-
 static pthread_mutex_t noclip_goto_lock = PTHREAD_MUTEX_INITIALIZER;
 static struct { int pending; float xyz[3]; } noclip_goto;   /* a teleport for the next tick (runtime_noclip_goto) */
 static _Atomic int as_active;   /* auto shrine is running (below, before runtime_survey_tick) */
+#if defined(TOTK_GAME_V143)
+static void event_init(Module *m);   /* "ctl event" (below, by the other game-control commands) */
+#endif
 /* A teleport is a flight: a far place is not loaded, and a player held there is treated as fallen out of the world (the
    game fades out and puts him back where he last stood, 1.4.3, 2026-10-26). Flying there at a speed the streaming keeps
    up with loads the world on the way, as for a fast glide. Frame-end thread.
@@ -429,6 +432,9 @@ void runtime_survey_init(Module *m) {
     if (!strcmp(m->name, "main") && SCENE_SLOT + 8u <= m->size && runtime_spawn_init(m)) {
         survey_main = (uintptr_t)m->base;
         if (force_ok) noclip_force = (void (*)(void *, const float *, uint32_t))(m->base + FORCE_MATRIX);
+#if defined(TOTK_GAME_V143)
+        event_init(m);
+#endif
         fprintf(stderr, "[noclip] %s\n", force_ok ? "available (Cheats tab)" : "[red] off: the forceSetMatrix entry differs from " TOTK_GAME_VERSION);
     }
     const char *enabled = getenv("TOTK_SURVEY");
@@ -1538,13 +1544,15 @@ int runtime_autoshrine_status(char *text, size_t size) {
      input   ctl press <buttons> [ms] | hold <buttons> | release <buttons>|all | stick l|r <x> <y> [ms]   (input.c)
      move    ctl face X Y Z | walk X Y Z MS (Link turned / walked toward a point) | noclip on|off | goto X Y Z (teleport)
      read    ctl state (one line, below) | peek <base> <offsets...> <len> | info N | watch on|off (shrine data, files)
+     game    ctl event <EventName> (1.4.3: the game's EventMgr::requestEvent, see ctl_event below)
    "ctl state" (1.4.3): [ctl-state] event=0|1|? evname=<name>|- map=<current map>|? stable=0|1|? hp=<cur>/<max>|?
    prompt=<type>:<actor>|none|? attn=<state>/<count> pos=x,y,z face=x,z cam=x,y,z camright=x,z|cam=?
    Where each value comes from (1.4.3 main, static analysis; the tag after it says how sure):
      event   [EventMgr::sInstance]+0x58 != 0: exactly what the AI query QueryIsPlayingMainEvent returns (its doQuery
              0x2686e10; 1.0.0's 0x29555e4 reads 0x464a988 = totk-lotuskit's EventMgr::sInstance). Certain.
-     evname  EventMgr+0xb0, a FixedSafeString<128> (mCurrentEventName in totk-lotuskit's EventMgr layout); printed only
-             when its text pointer (+0xb8) points at its own buffer (+0xc4), so a moved field shows "-". Candidate.
+     evname  EventMgr+0xb0, a FixedSafeString<128> (mCurrentEventName in totk-lotuskit's EventMgr layout). TOTK's sead
+             strings have no vtable: requestEvent's worker 0xcac698 reads the text pointer at +0xb0 and the buffer size
+             at +0xb8, so the text is at +0xbc; printed only when the pointer points there ("-" otherwise). Candidate.
      map     QueryGetCurrentNormalizedBancName's reader (0x1995210): o = [[banc]+0x28], i = [o+0x150], ready when byte
              i+0x224 bit 0 is set, the name at [i+0x158] ("MainField", "MinusField", "SmallDungeon/Dungeon009"-like); the
              game falls back to the path at [banc]+0x30, printed as-is. Static, verify.
@@ -1593,7 +1601,7 @@ static void ctl_state(const char *tag) {
     uintptr_t mgr = survey_main ? read_ptr(survey_main + STATE_EVENT_MGR) : 0, current = 0;
     if (mgr && read_mem(mgr + 0x58, &current, sizeof current)) {
         char name[132] = "-";
-        if (current && read_ptr(mgr + 0xb8) == mgr + 0xc4 && !ctl_text(mgr + 0xc4, name, sizeof name)) snprintf(name, sizeof name, "-");
+        if (current && read_ptr(mgr + 0xb0) == mgr + 0xbc && !ctl_text(mgr + 0xbc, name, sizeof name)) snprintf(name, sizeof name, "-");
         CTL_ADD(" event=%d evname=%s", current != 0, name);
     } else CTL_ADD(" event=? evname=-");
     uintptr_t banc = survey_main ? read_ptr(survey_main + STATE_BANC) : 0, holder = banc ? read_ptr(banc + 0x28) : 0;
@@ -1687,6 +1695,103 @@ static void ctl_peek(const char *tag, const char *args) {
     line[o] = 0;
     fprintf(stderr, "%s\n", line);
 }
+/* "ctl event <EventName>": asks the game to start an event by name, as totk-lotuskit's event::requestSimple(name) does
+   (aquacluck/totk-lotuskit 59dcfcc, src/program/util/event.cpp: an EventRequestArg with only its name set, then
+   engine::event::EventMgr::requestEvent(EventMgr::sInstance, arg); lotuskit runs it from its Framework::procDraw_ hook, on
+   the game's main loop). Here it runs on the frame-end thread, where forceSetMatrix and the spawner already call game code.
+   1.4.3 addresses (game_version.h GAME_EVENT_*), found through the game's own routine that requests "DmF_SY_WorldReset" or
+   "DmF_SY_WorldResetForMemoryShortage" (1.0.0 0x1b05d58, 1.4.3 0x21c66fc, each the one function that builds a request from
+   those strings): EventRequestArg's constructor, the name copied into it, requestEvent([EventMgr::sInstance], arg), then
+   both actor links torn down. Static analysis of both mains:
+     requestEvent       1.0.0 0x11e5300 (lotuskit's symbol) -> 0xcac4cc: the same body (false when EventMgr+0xa8 bit 11 is
+                        set; the no-starter path when arg+0x1960 == -1; bit 0x4000 of +0xa8 set on success), 11 direct
+                        callers in both mains, x0 loaded from 0x3ada558 (the EventMgr::sInstance "ctl state" reads); its
+                        worker 0xcac698 builds "Event/EventSetting/<name>" as 1.0.0's 0x11e5468 does.
+     EventRequestArg()  1.0.0 0x101419c -> 0xce1108, called before each of 1.4.3's requestEvent calls: blackboard
+                        InitInfo<32>, identity matrix, start frame -1, both links unbound (+0x1960 = -1), the strings. The
+                        name is a FixedSafeString<128> without vtable: text pointer +0x1a90, size +0x1a98, text +0x1a9c.
+     link teardown      [GOT 0x395d8d0] + 0x10 into +0x1968 and +0x1950, each then passed to 0x1aff9c (5004 callers).
+   No entry point: lotuskit's EventRequestArg and every 1.4.3 caller set only the name; the game takes the rest from the
+   event's EventSetting. No starter actor (lotuskit's optional one needs BaseProcLink::setProc, which does not map to 1.4.3
+   reliably). true from requestEvent means accepted, not started: "ctl state" shows event=1 evname=<name> once it plays. */
+#if defined(TOTK_GAME_V143)
+enum { EVENT_ARG_SIZE = 0x1b20, EVENT_ARG_NAME = 0x1a90, EVENT_ARG_LINK1 = 0x1950, EVENT_ARG_LINK2 = 0x1968, EVENT_NAME_MAX = 127 };
+static _Bool (*event_request)(void *mgr, const void *arg);
+static void (*event_arg_init)(void *arg);
+static void (*event_link_fini)(void *link);
+static uintptr_t event_link_vtable;
+static pthread_mutex_t event_lock = PTHREAD_MUTEX_INITIALIZER;
+static char event_want[EVENT_NAME_MAX + 1];
+static _Atomic int event_waiting;
+static void event_init(Module *m) {
+    static const uint32_t request[] = {0xb940a808, 0x37580388, 0xd10103ff, 0xa9017bfd};
+    static const uint32_t arg_init[] = {0xa9bc7bfd, 0xf9000bf7, 0xa90257f6, 0xa9034ff4};
+    static const uint32_t link_fini[] = {0xa9bb7bfd, 0xf9000bf9, 0xa9025ff8, 0xa90357f6};
+    const char *why = NULL; uintptr_t slot = 0;
+    if (GAME_EVENT_REQUEST + sizeof request > m->text_end || memcmp(m->base + GAME_EVENT_REQUEST, request, sizeof request)) why = "requestEvent's entry differs";
+    else if (GAME_EVENT_ARG_INIT + sizeof arg_init > m->text_end || memcmp(m->base + GAME_EVENT_ARG_INIT, arg_init, sizeof arg_init)) why = "EventRequestArg's constructor differs";
+    else if (GAME_EVENT_LINK_FINI + sizeof link_fini > m->text_end || memcmp(m->base + GAME_EVENT_LINK_FINI, link_fini, sizeof link_fini)) why = "the link teardown differs";
+    else if (GAME_EVENT_LINK_VTABLE_GOT + 8u > m->size || (memcpy(&slot, m->base + GAME_EVENT_LINK_VTABLE_GOT, sizeof slot), slot != (uintptr_t)(m->base + GAME_EVENT_LINK_VTABLE)))
+        why = "the link vtable's GOT slot differs";
+    if (why) { fprintf(stderr, "[event] off: %s from " TOTK_GAME_VERSION "\n", why); return; }
+    event_request = (_Bool (*)(void *, const void *))(void *)(m->base + GAME_EVENT_REQUEST);
+    event_arg_init = (void (*)(void *))(void *)(m->base + GAME_EVENT_ARG_INIT);
+    event_link_fini = (void (*)(void *))(void *)(m->base + GAME_EVENT_LINK_FINI);
+    event_link_vtable = slot + 0x10;
+}
+/* Frame-end thread (runtime_survey_tick). */
+static void event_tick(void) {
+    if (!atomic_load(&event_waiting)) return;
+    static _Alignas(16) uint8_t arg[EVENT_ARG_SIZE];   /* 7 KB: the game keeps it on its stack; frame-end thread only */
+    char name[EVENT_NAME_MAX + 1];
+    pthread_mutex_lock(&event_lock); memcpy(name, event_want, sizeof name); pthread_mutex_unlock(&event_lock);
+    void *mgr = (void *)read_ptr(survey_main + STATE_EVENT_MGR);
+    uint32_t flags = 0; uintptr_t playing = 0;
+    if (!mgr) fprintf(stderr, "[ctl-done] event %s refused: the game's EventMgr is not up yet\n", name);
+    else {
+        read_mem((uintptr_t)mgr + 0xa8, &flags, sizeof flags); read_mem((uintptr_t)mgr + 0x58, &playing, sizeof playing);
+        event_arg_init(arg);
+        char *text; int32_t size;
+        memcpy(&text, arg + EVENT_ARG_NAME, sizeof text); memcpy(&size, arg + EVENT_ARG_NAME + 8, sizeof size);
+        _Bool ok = 0; int laid_out = text == (char *)arg + EVENT_ARG_NAME + 0xc && size == EVENT_NAME_MAX + 1;
+        if (laid_out) { memcpy(text, name, strlen(name) + 1); ok = event_request(mgr, arg); }
+        const unsigned links[2] = {EVENT_ARG_LINK2, EVENT_ARG_LINK1};
+        for (int i = 0; i < 2; i++) { memcpy(arg + links[i], &event_link_vtable, sizeof event_link_vtable); event_link_fini(arg + links[i]); }
+        if (!laid_out) fprintf(stderr, "[ctl-done] event %s refused: the request's name field is not where 1.4.3 has it\n", name);
+        else if (ok) fprintf(stderr, "[ctl-done] event %s\n", name);
+        else fprintf(stderr, "[ctl-done] event %s refused: requestEvent returned false (EventMgr flags=%#x%s, main event playing=%d; "
+                     "an unknown name, another event holding the manager, or a state that takes no requests)\n",
+                     name, flags, flags & 0x801 ? ": bit 0 or 11, the ones it refuses on" : "", playing != 0);
+    }
+    atomic_store(&event_waiting, 0);
+}
+#endif
+static void ctl_event(const char *args) {
+    char name[160] = "", extra[64] = "";
+    int n = sscanf(args, "%159s %63s", name, extra);
+    if (n < 1) { fprintf(stderr, "[ctl] rejected: event <EventName>\n"); return; }
+    if (n == 2) {
+        fprintf(stderr, "[ctl-done] event %s refused: no entry point in TOTK's request (it carries only the name; the event's "
+                "EventSetting picks the rest)\n", name);
+        return;
+    }
+#if defined(TOTK_GAME_V143)
+    size_t len = strlen(name); int valid = len <= EVENT_NAME_MAX;
+    for (size_t i = 0; valid && i < len; i++) valid = isalnum((unsigned char)name[i]) || name[i] == '_' || name[i] == '.' || name[i] == '-';
+    if (!valid) { fprintf(stderr, "[ctl-done] event %.40s refused: a name is up to %d letters, digits, _ . -\n", name, EVENT_NAME_MAX); return; }
+    if (!event_request || !survey_main) { fprintf(stderr, "[ctl-done] event %s refused: not available (see the [event] line at startup)\n", name); return; }
+    /* the frame-end tick runs when the spawner is on or with TOTK_SURVEY=1 (loader.c runtime_frame_controller_return_pc) */
+    if (runtime_spawn_available() != SPAWN_OK && !survey_enabled) { fprintf(stderr, "[ctl-done] event %s refused: the frame-end tick is off\n", name); return; }
+    pthread_mutex_lock(&event_lock);
+    int busy = atomic_load(&event_waiting);
+    if (!busy) { snprintf(event_want, sizeof event_want, "%s", name); atomic_store(&event_waiting, 1); }
+    pthread_mutex_unlock(&event_lock);
+    atomic_store_explicit(&runtime_survey_pending, 1, memory_order_release);   /* also wakes a waiting one a cancel left behind */
+    if (busy) fprintf(stderr, "[ctl-done] event %s refused: another request is still waiting for the frame end\n", name);
+#else
+    fprintf(stderr, "[ctl-done] event %s refused: not available in " TOTK_GAME_VERSION " (1.4.3 only)\n", name);
+#endif
+}
 int runtime_autoshrine_command(const char *line) {
     int ctl = !strncmp(line, "ctl ", 4);
     if (!ctl && strncmp(line, "autoshrine ", 11)) return 0;
@@ -1701,6 +1806,7 @@ int runtime_autoshrine_command(const char *line) {
         if (sscanf(rest + 5, "%f %f %f", &xyz[0], &xyz[1], &xyz[2]) != 3) { fprintf(stderr, "[ctl] rejected: goto X Y Z\n"); return 1; }
         fprintf(stderr, "[ctl-done] goto %s\n", runtime_noclip_goto(xyz) ? "flying" : "refused"); return 1;
     }
+    if (ctl && !strncmp(rest, "event", 5) && (!rest[5] || isspace((unsigned char)rest[5]))) { ctl_event(rest + 5); return 1; }
     if (ctl) {   /* the rest as "autoshrine <rest>": face, walk, info, watch, start, stop, ... */
         char as_line[1200]; snprintf(as_line, sizeof as_line, "autoshrine %s", rest);
         return runtime_autoshrine_command(as_line);
@@ -1850,11 +1956,17 @@ void runtime_survey_tick(uint64_t frame) {
     int survey_left = request.kind || hold_left || route_on;
     pthread_mutex_unlock(&survey_lock);
     if (!survey_left) { noclip_tick(actor); autoshrine_tick(actor, now_seconds()); }   /* a scripted move wins */
+#if defined(TOTK_GAME_V143)
+    event_tick();   /* "ctl event": outside the survey lock, it calls into the game */
+#endif
     runtime_spawn_tick(actor, frame);   /* outside the survey lock: it calls into the game */
     /* cleared before the spawn queue is looked at again, so a spawn queued meanwhile (it sets waiting, then pending) is
        never lost */
     atomic_store(&runtime_survey_pending, survey_left);
     if (atomic_load(&runtime_spawn_waiting) || atomic_load(&noclip_wanted) || atomic_load(&as_active)) atomic_store(&runtime_survey_pending, 1);
+#if defined(TOTK_GAME_V143)
+    if (atomic_load(&event_waiting)) atomic_store(&runtime_survey_pending, 1);   /* queued while this tick ran */
+#endif
     in_tick = 0;
 }
 #endif   /* GAME_BOTW */
