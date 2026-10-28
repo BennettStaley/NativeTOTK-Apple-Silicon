@@ -21,6 +21,15 @@
    The kind: Scene/Component/SmallDungeonParam/DungeonNNN.game__scene__SmallDungeonParam.bgyml Type (none: puzzle;
    Gimmick: puzzle; EnemyWithCombine: a fight; Enemy: Proving Grounds, the gear taken at the door and given back by the
    goal; Treasure: the reward of a challenge outside, Rauru's Blessing).
+   How a player gets in (field test, 2026-10-27): the lift's 2Go starts when Link walks in through the doorway; set down
+   there by noclip he does not trigger it. The start lift inside (the same actor class) is walked into the same way.
+   Skipping (the flows' EventTriggerSkipAcceptStart / SkipEnd marks; MrCheeze/totk-tools has the same flows as
+   text): a case 0 of a yes / no query is "yes" (3Arrive plays Dm_OP_0011 only on the case "Ultrahand not in the pouch").
+   1Open is skippable only when the player has seen it before (HavePlayedEvent); 3Arrive's walk-in always; the goal
+   (Animation_04, every shrine but Great Sky Island's 060-062, whose Animation_01 is skippable once the goal has been
+   seen) always from the touch on. 2Go, 4Return and 5Out have no skippable part. A skip only jumps to SkipEnd: the gate's
+   SetOpenOwnGameData and autosave, SetDungeonEnter, the Light of Blessing (GetUI on both branches), SetDungeonClear and
+   the exit all come after it on every branch.
    The save: DungeonState.DungeonNNN (Enum Hidden, Appear, Open, Enter, Clear); GameData/GameDataList.Product.140 gives 119
    shrines Appear and 33 Hidden (the 8 hidden and the 25 crystal shrines) at the start. Plain C, header only
    (tests/dish/probe.c checks it). */
@@ -206,8 +215,15 @@ static inline int shrine_states_parse(const uint8_t *b, size_t n, uint8_t *state
 /* Where Link lands for each step and what he faces (stand, 0.3 m above the floor; face: the A prompt's actor).
    The gate: on the travel point, facing the entrance. The lift: 1 m out from its prompt toward the travel point, on the
    lift's floor, facing the prompt. The goal: on SmallDungeonExit (where the goal event wants him), facing the altar. The
-   start lift: on LeaveSmallDungeonPos, facing its prompt. A chest: 1.3 m in front of it, facing it. */
-enum { SHRINE_AT_GATE, SHRINE_AT_LIFT, SHRINE_AT_GOAL, SHRINE_AT_BACK, SHRINE_AT_CHEST };
+   start lift: on LeaveSmallDungeonPos, facing its prompt. A chest: 1.3 m in front of it, facing it.
+   The approach (walking in): 1 m further out than the travel point on the line from the lift out through the entrance,
+   facing the lift (face is where he walks to). The start lift's approach: 3 m back from its floor toward the shrine's
+   start, facing the lift's prompt. */
+enum { SHRINE_AT_GATE, SHRINE_AT_LIFT, SHRINE_AT_GOAL, SHRINE_AT_BACK, SHRINE_AT_CHEST, SHRINE_AT_APPROACH, SHRINE_AT_BACK_APPROACH };
+static inline void shrine_unit_xz(const float from[3], const float to[3], float out[2]) {
+    float dx = to[0] - from[0], dz = to[2] - from[2], l = sqrtf(dx * dx + dz * dz);
+    out[0] = l > 1e-3f ? dx / l : 0; out[1] = l > 1e-3f ? dz / l : 1;
+}
 static inline void shrine_stand(const ShrineInfo *s, int where, int chest, float stand[3], float face[3]) {
     switch (where) {
     case SHRINE_AT_GATE:
@@ -223,6 +239,16 @@ static inline void shrine_stand(const ShrineInfo *s, int where, int chest, float
     }
     case SHRINE_AT_GOAL: memcpy(stand, s->goal_floor, 12); memcpy(face, s->goal, 12); break;
     case SHRINE_AT_BACK: memcpy(stand, s->back_floor, 12); memcpy(face, s->back, 12); break;
+    case SHRINE_AT_APPROACH: {
+        const float *out = s->has_warp ? s->warp : s->entrance; float in[2]; shrine_unit_xz(s->entrance, s->lift, in);
+        stand[0] = out[0] - in[0]; stand[1] = out[1]; stand[2] = out[2] - in[1]; memcpy(face, s->lift_floor, 12);
+        break;
+    }
+    case SHRINE_AT_BACK_APPROACH: {
+        float in[2]; shrine_unit_xz(s->start, s->back, in);
+        stand[0] = s->back_floor[0] - 3 * in[0]; stand[1] = s->back_floor[1]; stand[2] = s->back_floor[2] - 3 * in[1]; memcpy(face, s->back, 12);
+        break;
+    }
     default: {
         const float *c = s->chest[chest], *f = s->chest_front[chest];
         stand[0] = c[0] + 1.3f * f[0]; stand[1] = c[1]; stand[2] = c[2] + 1.3f * f[1]; memcpy(face, c, 12);
@@ -231,6 +257,15 @@ static inline void shrine_stand(const ShrineInfo *s, int where, int chest, float
     stand[1] += 0.3f;
 }
 
+/* The left stick as the keyboard gives it (W A S D, eight directions): the keys that walk Link toward dir, given the
+   camera's forward and right (all unit x, z). SHRINE_STICK_... bits; 0 when dir is unknown. */
+enum { SHRINE_STICK_UP = 1, SHRINE_STICK_DOWN = 2, SHRINE_STICK_LEFT = 4, SHRINE_STICK_RIGHT = 8 };
+static inline int shrine_stick(const float fwd[2], const float right[2], const float dir[2]) {
+    float y = dir[0] * fwd[0] + dir[1] * fwd[1], x = dir[0] * right[0] + dir[1] * right[1]; int k = 0;
+    if (y > 0.38f) k |= SHRINE_STICK_UP; else if (y < -0.38f) k |= SHRINE_STICK_DOWN;
+    if (x > 0.38f) k |= SHRINE_STICK_RIGHT; else if (x < -0.38f) k |= SHRINE_STICK_LEFT;
+    return k;
+}
 /* The RomFS's shrine data: the map's static files (entrances, lifts, travel points), each shrine's own two map files and
    its kind. Returns how many shrines have everything (152 in 1.4.3), 0 when this is not the game. About as long as
    landmarks_load: a few hundred files. */

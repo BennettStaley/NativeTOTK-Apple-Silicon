@@ -670,7 +670,7 @@ static int cheat_choice_members(int leader, int *all, int *usable, int max, int 
     NSButton *go = [self cheatsButton:running ? @"Stop" : @"Start" action:@selector(autoShrineStartStop)];
     if (running) go.bezelColor = NSColor.systemOrangeColor;
     [self addCheatsRow:[self cheatsRow:@"Complete shrines automatically"
-                                 about:@"Flies Link with noclip to the nearest shrine not completed yet, presses A at its gate and lift, takes him to the altar for the Light of Blessing (the game completes the shrine and takes him out, as if you had walked there), then on to the next. Leaves out shrines the story lock greys, hidden and crystal shrines not open yet, and shrines in caves. Any key, button or stick of yours stops it. Save first."
+                                 about:@"Flies Link with noclip to the nearest shrine not completed yet, opens its gate (A) and walks him in, skips the cutscenes the game lets you skip, takes him to the altar for the Light of Blessing (the game completes the shrine and takes him out, as if you had walked there), then on to the next. Leaves out shrines the story lock greys, hidden and crystal shrines not open yet, and shrines in caves. Any key, button or stick of yours stops it. Save first."
                                 detail:autoShrineShown color:running ? NSColor.systemGreenColor : nil control:go] id:CHEATS_AUTOSHRINE_ROW];
     NSSwitch *chests = [NSSwitch new]; chests.state = runtime_autoshrine_chests() ? NSControlStateValueOn : NSControlStateValueOff;
     chests.target = self; chests.action = @selector(autoShrineChestsSwitched:); chests.refusesFirstResponder = YES;

@@ -3,7 +3,7 @@
    @effect lines (a menu that cannot give dishes leaves them out). Also map_pins.h and landmarks.h (towers, shrines and
    the story's places: a small map file, place list, message file and save made here; the story flags and the lock), and
    shrine_auto.h (a shrine's outside and inside map files, its kind, the save's DungeonState, which shrines a run does and
-   in which order, where Link stands). Prints one JSON line; exit 1 on failure. */
+   in which order, where Link stands and walks). Prints one JSON line; exit 1 on failure. */
 #include "dish_give.h"
 #include "spawn_list.h"
 #include "map_pins.h"
@@ -322,6 +322,13 @@ int main(void) {
     CHECK(fabsf(stand[0] + 56.7f) < 1e-4f && stand[2] == -238 && face[0] == -58, "a chest: 1.3 m in front of it");
     shrine_stand(s7, SHRINE_AT_GATE, 0, stand, face);
     CHECK(stand[2] == 2 && face[1] == 100, "the gate: on the travel point facing the entrance");
+    shrine_stand(s7, SHRINE_AT_APPROACH, 0, stand, face);
+    CHECK(stand[0] == 0 && fabsf(stand[1] - 100.7f) < 1e-4f && stand[2] == 3 && face[2] == -13, "walking in: 1 m out past the travel point, toward the lift floor");
+    shrine_stand(s7, SHRINE_AT_BACK_APPROACH, 0, stand, face);
+    CHECK(fabsf(stand[2] - 38.15f) < 1e-4f && fabsf(stand[1] + 1.7f) < 1e-4f && face[2] == 44, "the start lift: 3 m back from its floor toward the start");
+    const float fwd[2] = {0, 1}, rgt[2] = {1, 0}, d1[2] = {0.7071f, 0.7071f}, d2[2] = {0, -1}, d3[2] = {-0.995f, 0.0995f};
+    CHECK(shrine_stick(fwd, rgt, d1) == (SHRINE_STICK_UP | SHRINE_STICK_RIGHT) && shrine_stick(fwd, rgt, d2) == SHRINE_STICK_DOWN
+          && shrine_stick(fwd, rgt, d3) == SHRINE_STICK_LEFT, "WASD toward a direction, from the camera's view");
     /* the kind */
     at = 16; memset(buf, 0, sizeof buf); memcpy(buf, "YB\x07\0", 4);
     { uint32_t kt2 = byml_table(shrine_keys, NKEYS), st2 = byml_table(shrine_strs, NSTRS); const uint32_t k[] = {K_TYPE}, v[] = {S_ENEMY}; const uint8_t t[] = {0xA0};
