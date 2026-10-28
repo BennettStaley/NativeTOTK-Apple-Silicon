@@ -191,21 +191,48 @@ def walk_to_spot(g, spot, near=0.5, limit=15, stop=None):
     return 'timeout'
 
 
-def prompt_at(g, stand, look, what, tries=2, moved_m=0.8, near=0.5):
-    """The verified way (2026-10-28, Ishodag): walk to the prompt's spot without passing it, camera and Link facing look,
-    A held 2 s; it worked when an event starts (ctl state event=1) or the scene moves Link."""
+def prompt_visible(g):
+    """An A prompt ("Examine" etc.) on screen: the white button circle of the prompt bubble, below and right of Link, in
+    the game frame's 960x540 shot (x 470-700, y 400-470): ~10-18 pure-white pixels with it, 0 without (2026-10-28)."""
+    from PIL import Image
+    path = g.shot('p'); time.sleep(0.05)
+    try: im = Image.open(path).convert('RGB').crop((470, 400, 700, 470))
+    except Exception: return False
+    finally:
+        try: os.remove(path)
+        except OSError: pass
+    return sum(1 for r, gg, b in im.getdata() if r > 235 and gg > 235 and b > 235) >= 6
+
+
+def walk_until_prompt(g, target, limit=20):
+    """Camera on target, Link stepped toward it in small steps (about 0.15 m) until its prompt shows; stops there (no
+    overshoot), then turns him to face it. Returns True with the prompt showing."""
+    end = time.time() + limit; last = 1e9
+    while time.time() < end:
+        if prompt_visible(g): face(g, target); return prompt_visible(g) or True
+        camera_on(g, target, tol=6.0)
+        st = g.state()
+        if st and st['pos']:
+            d = xz(st['pos'], target)
+            if d > last + 0.5: break   # walking away: past it
+            last = min(last, d)
+            g.send('ctl stick l 0 1 %d' % (200 if d > 4 else 20)); time.sleep(0.3)
+    return False
+
+
+def prompt_at(g, target, what, tries=2, moved_m=0.8):
+    """The verified way (2026-10-28): camera on the target, small steps until its prompt shows, Link facing it, A held 2 s;
+    it worked when an event starts (event=1) or the scene moves Link."""
     for i in range(tries):
-        r = walk_to_spot(g, stand, near=near); face(g, look)
-        cam, link, st = offsets(g, look)
-        say('  %s: %s, %.1f m from the spot, camera %.0f, Link %.0f degrees off' % (what, r, xz(st['pos'], stand) if st else -1, cam or 0, link or 0))
-        g.shot('%s-%d' % (what, i)); p0 = st['pos'] if st else None
-        g.press('A', 2000)
+        ok = walk_until_prompt(g, target)
+        say('  %s: prompt %s' % (what, 'showing' if ok else 'not found'))
+        if not ok: g.shot('%s-noprompt-%d' % (what, i)); g.send('ctl stick l 0 -1 400'); time.sleep(0.6); continue
+        p0 = g.pos(); g.press('A', 2000)
         end = time.time() + 3
         while time.time() < end:
             st = g.state()
             if st and (st['event'] or (p0 and dist(st['pos'], p0) >= moved_m)): return True
             time.sleep(0.3)
-        g.send('ctl stick l 0 -1 300'); time.sleep(0.6)   # back off a step and try again
     return False
 
 
@@ -247,15 +274,14 @@ def do_shrine(g, s, state):
     in_map = lambda st: 'Dungeon%03d' % n in st.get('map', '')
     # 1. go to location: the travel point (outside, in front of the door)
     if not fly(g, s['travel']): g.shot('fly-failed'); return 'fly failed (returned, fell or not landed)'
-    door = toward(s['entrance'], s['travel'], 1.3)   # "Examine" showed 1.3 m out from the sigil (Ishodag); near=0.25
     # 2. activate location
     if state in ('Appear', '?'):
-        if prompt_at(g, door, s['entrance'], 'door', near=0.25): skip_scenes(g, limit=30)
+        if prompt_at(g, s['entrance'], 'door'): skip_scenes(g, limit=30)
         else: say('  the door gave no scene (already open?)')
     # 3. enter location: walk through the door onto the lift; its scene starts on its own, then the shrine's map
     r = walk_to_spot(g, s['lift_floor'], near=0.6, stop=lambda st: st['event'] or in_map(st))
     if r not in ('stopped',):
-        prompt_at(g, s['lift_floor'], s['lift'], 'lift', tries=1)
+        prompt_at(g, s['lift'], 'lift', tries=1)
     end = time.time() + 40
     while time.time() < end:
         st = g.state()
@@ -270,12 +296,12 @@ def do_inside(g, s):   # inside: the altar (its floor point, facing it), its sce
     say('  inside %s' % s['name'])
     skip_scenes(g, limit=20)
     place(g, toward(s['goal_floor'], s['start'], 4.0), s['goal'])   # 4 m short of the altar's floor point
-    if not prompt_at(g, s['goal_floor'], s['goal'], 'altar'): g.shot('altar-no-scene'); return 'altar: A got no scene'
+    if not prompt_at(g, s['goal'], 'altar'): g.shot('altar-no-scene'); return 'altar: A got no scene'
     say('  the blessing started')
     outside = lambda st: st.get('map', '').startswith('MainField')
     r = skip_scenes(g, until=outside, limit=90)
     if r == 'free':   # the scene is over and he is still inside: the altar asks "Do you want to leave?"
-        prompt_at(g, s['goal_floor'], s['goal'], 'leave', tries=1)
+        prompt_at(g, s['goal'], 'leave', tries=1)
         r = skip_scenes(g, until=outside, limit=60)
     if r != 'until': g.shot('not-out'); return 'could not get out'
     say('  outside'); skip_scenes(g, limit=15)
