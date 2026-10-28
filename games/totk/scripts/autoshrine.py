@@ -65,8 +65,19 @@ class Game:
     def press(self, name='A', ms=2000):   # a prompt: nothing else held, a quiet moment, then the button HELD (a tap does
         time.sleep(0.5); self.key(name, ms)   # nothing at the shrine's door, 2026-10-28; holding 2 s activated it)
 
-    def shot(self, what):
-        self.nshot += 1; self.send('shot %s/%s-%02d-%s.png' % (self.shots, time.strftime('%H%M%S'), self.nshot, what))
+    def shot(self, what):   # the game frame only (the shot is a 3840x2160 canvas, the frame its top-left 1920x1080), 960 wide
+        self.nshot += 1; path = '%s/%s-%02d-%s.png' % (self.shots, time.strftime('%H%M%S'), self.nshot, what)
+        self.send('shot ' + path)
+        for _ in range(40):
+            if os.path.exists(path) and os.path.getsize(path) > 0: break
+            time.sleep(0.1)
+        time.sleep(0.2)
+        try:
+            from PIL import Image
+            im = Image.open(path); w, h = im.size
+            im.crop((0, 0, w // 2, h // 2)).resize((960, 540)).save(path)
+        except Exception as e: say('  shot not cropped: %s' % e)
+        return path
 
     def file_since(self, t0, prefix):
         self.lines(); return any(t >= t0 and p.startswith(prefix) for t, p in self.files)
@@ -83,6 +94,8 @@ def info(g, n):
     rest = m.group(1)
     d['name'] = re.search(r'name=(.*?) kind=', rest).group(1)
     d['kind'] = re.search(r'kind=(.*?) chests=', rest).group(1)
+    for f in ('cave', 'hidden', 'crystal', 'island'):
+        m2 = re.search(r'\b%s=(\d)' % f, rest); d[f] = int(m2.group(1)) if m2 else 1   # unknown: treated as not doable
     for k, x, y, z in re.findall(r'(\w+)=([-\d.]+),([-\d.]+),([-\d.]+)', rest): d[k] = (float(x), float(y), float(z))
     return d
 
@@ -221,7 +234,11 @@ def do_shrine(g, s, state):
         if p and xz(p, s['start']) < 60: break
         time.sleep(0.5)
     else: return 'enter: the shrine did not load'
-    say('  inside'); g.shot('inside')
+    return do_inside(g, s)
+
+
+def do_inside(g, s):   # from inside the shrine: the altar, its scene, out
+    say('  inside %s' % s['name']); g.shot('inside')
     skip_scenes(g, limit=30)
     # 4. go to location exit (the altar)
     g.send('noclip goto %.2f %.2f %.2f' % s['goal_floor']); g.wait(r'\[noclip\] arrived', 30)
@@ -247,18 +264,34 @@ def do_shrine(g, s, state):
     return 'done'
 
 
+def inside_shrine(shrines, p):   # the shrine whose inside Link is in (its start lift or altar within 300 m), else None
+    if p is None: return None
+    best = min(shrines, key=lambda s: min(dist(p, s['start']), dist(p, s['goal'])))
+    return best if min(dist(p, best['start']), dist(p, best['goal'])) < 300 else None
+
+
 def main():
     ap = argparse.ArgumentParser(); ap.add_argument('--run', required=True); ap.add_argument('--shrine', type=int); ap.add_argument('--count', type=int, default=3)
     a = ap.parse_args()
     g = Game(a.run); g.send('autoshrine watch on'); g.wait(r'\[as-done\] watch', 10)
-    shrines = [s for s in (info(g, n) for n in range(152)) if s]
+    need = ('travel', 'entrance', 'lift', 'lift_floor', 'start', 'goal', 'goal_floor', 'back', 'back_floor')
+    shrines = []
+    for n in range(152):   # a line can come back cut (other log output in between): ask again
+        for _ in range(3):
+            s = info(g, n)
+            if s and all(k in s for k in need): shrines.append(s); break
     say('read %d shrines' % len(shrines))
     tried = set(); results = []
     for _ in range(a.count if a.shrine is None else 1):
         states = save_states(g.profile); here = g.pos() or (0, 0, 0)
+        cur = inside_shrine(shrines, here)   # where is Link before any move: inside a shrine, finish that one first
+        if cur:
+            say('Link is inside %s: finishing it' % cur['name']); tried.add(cur['n'])
+            r = do_inside(g, cur); say('  -> %s' % r); results.append((cur['name'], r)); time.sleep(3); continue
         if a.shrine is not None: pick = [s for s in shrines if s['n'] == a.shrine]
         else:
-            pick = sorted((s for s in shrines if s['n'] not in tried and s['kind'] not in SKIP_KINDS and states.get(s['n']) in ('Appear', 'Open', 'Enter')),
+            pick = sorted((s for s in shrines if s['n'] not in tried and s['kind'] not in SKIP_KINDS and not (s['cave'] or s['hidden'] or s['crystal'])
+                           and states.get(s['n']) in ('Appear', 'Open', 'Enter')),   # caves: the flight would end in rock or a chasm
                           key=lambda s: xz(here, s['travel']))
         if not pick: say('nothing left'); break
         s = pick[0]; tried.add(s['n'])

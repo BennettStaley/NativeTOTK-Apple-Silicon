@@ -1541,7 +1541,8 @@ int runtime_autoshrine_command(const char *line) {
         if (!as_load_sync() || k < 0 || k >= SHRINES) { fprintf(stderr, "[as-info] %d none\n", k); return 1; }
         const ShrineInfo *si = &as_shrine[k]; float p[3], f[3];
         #define AS_P(name, v) fprintf(stderr, " %s=%.2f,%.2f,%.2f", name, (v)[0], (v)[1], (v)[2])
-        fprintf(stderr, "[as-info] %d name=%s kind=%s chests=%d", k, as_mark[LANDMARK_FIRST_SHRINE + k].name, SHRINE_KIND_TEXT[si->kind], si->nchests);
+        fprintf(stderr, "[as-info] %d name=%s kind=%s chests=%d cave=%d hidden=%d crystal=%d island=%d", k, as_mark[LANDMARK_FIRST_SHRINE + k].name,
+                SHRINE_KIND_TEXT[si->kind], si->nchests, si->cave, si->hidden, si->crystal, as_mark[LANDMARK_FIRST_SHRINE + k].island);
         AS_P("entrance", si->entrance); AS_P("lift", si->lift); AS_P("lift_floor", si->lift_floor); AS_P("start", si->start);
         AS_P("goal", si->goal); AS_P("goal_exit", si->goal_exit); AS_P("goal_floor", si->goal_floor); AS_P("back", si->back); AS_P("back_floor", si->back_floor);
         shrine_stand(si, SHRINE_AT_TRAVEL, 0, p, f); AS_P("travel", p);
