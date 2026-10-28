@@ -1206,8 +1206,8 @@ static void autoshrine_tick(uintptr_t actor, double now) {
         if (!as.approached) { if (as_walk_up(actor, to, t, now, 4)) { as.approached = 1; as.phase_t = now; as.phase = 0; } return; }
         double c = now - as.phase_t;
         if (as.phase == 0) { as_face(actor, face); as.phase = 1; }
-        else if (as.phase == 1 && c >= 0.3) { as_key(AS_KEY_ZL, 0.15); as.phase = 2; }
-        else if (as.phase == 2 && c >= 0.7) { as_key(AS_KEY_A, 0.15); fprintf(stderr, "[autoshrine] A at the gate\n"); as.phase = 3; }
+        else if (as.phase == 1 && c >= 0.3) { runtime_input_lease_release_all(); as.phase = 2; }   /* nothing held before A: a clean press */
+        else if (as.phase == 2 && c >= 0.8) { as_key(AS_KEY_A, 0.25); fprintf(stderr, "[autoshrine] A at the gate\n"); as.phase = 3; }
         else if (as.phase == 3 && c >= 0.9) as_scene(AS_WALK, 0, now, "after the gate's A: skipping its scene");
         return;
     }
@@ -1227,7 +1227,11 @@ static void autoshrine_tick(uintptr_t actor, double now) {
             if (atomic_load(&as_seq_goal) != as.seq_goal) { as.goal_ok = 1; fprintf(stderr, "[autoshrine] the goal's event file opened\n"); }
             else if (have && landmark_distance(at, as.a_pos) > 1.5f) { as.goal_ok = 1; fprintf(stderr, "[autoshrine] the altar's event moved Link %.1f m: the blessing has started\n", landmark_distance(at, as.a_pos)); }
             else if (t > 6) { as_diagnose(AS_GOAL, now, "the altar's A started nothing (Link not moved by an event in 6 s)"); return; }
-            else return;
+            else {   /* A again at 2 s and 4 s, each a clean press after a quiet moment (in a test a second press did it) */
+                if ((fmod(t, 2.0) >= 1.6 && fmod(t, 2.0) < 1.6 + dt)) runtime_input_lease_release_all();
+                if (t > 1.9 && fmod(t, 2.0) < dt) { as_key(AS_KEY_A, 0.25); fprintf(stderr, "[autoshrine] A at the altar's prompt again\n"); }
+                return;
+            }
             as.t0 = now; as.tries = 0; as.phase = 0; as.moving = 0; as.held = 1; t = 0;   /* the skipping starts now: he is held by it */
         }
         if (t > 120) { as_diagnose(as.after, now, "a scene did not end within 2 minutes"); return; }
@@ -1272,8 +1276,8 @@ static void autoshrine_tick(uintptr_t actor, double now) {
         uint32_t seen = as.seq_inside;
         if (atomic_load(&as_seq_inside) != seen || (have && landmark_distance(at, s->start) < 60)) { as_go(AS_LOADING, now, "the shrine's map opened"); as.seq_inside = seen; return; }
         if (as.phase == 0) { as_face(actor, s->lift); as.phase = 1; }
-        else if (as.phase == 1 && t >= 0.3) { as_key(AS_KEY_ZL, 0.15); as.phase = 2; }
-        else if (as.phase == 2 && t >= 0.7) { as_key(AS_KEY_A, 0.15); fprintf(stderr, "[autoshrine] A at the entrance lift\n"); as.phase = 3; as.phase_t = now; }
+        else if (as.phase == 1 && t >= 0.3) { runtime_input_lease_release_all(); as.phase = 2; }   /* nothing held before A: a clean press */
+        else if (as.phase == 2 && t >= 0.8) { as_key(AS_KEY_A, 0.25); fprintf(stderr, "[autoshrine] A at the entrance lift\n"); as.phase = 3; as.phase_t = now; }
         else if (as.phase == 3 && now - as.phase_t > 5 && as_ago(&as_map_ns) > 5) as_diagnose(AS_LIFT, now, "no map load 5 s after the lift's A");
         return;
     }
@@ -1313,9 +1317,9 @@ static void autoshrine_tick(uintptr_t actor, double now) {
         }
         double c = now - as.phase_t;
         if (as.phase == 0) { as_face(actor, s->goal); as.phase = 1; }
-        else if (as.phase == 1 && c >= 0.3) { as_key(AS_KEY_ZL, 0.15); as.phase = 2; }
-        else if (as.phase == 2 && c >= 0.7) {
-            as_key(AS_KEY_A, 0.15); fprintf(stderr, "[autoshrine] A at the altar's prompt\n");
+        else if (as.phase == 1 && c >= 0.3) { runtime_input_lease_release_all(); as.phase = 2; }   /* nothing held before A: a clean press */
+        else if (as.phase == 2 && c >= 0.8) {
+            as_key(AS_KEY_A, 0.25); fprintf(stderr, "[autoshrine] A at the altar's prompt\n");
             if (have) memcpy(as.a_pos, at, 12);
             as_stage(6); as_scene(AS_GOAL, 1, now, "the altar's A: skipping its scene from the start");
         }
@@ -1325,8 +1329,8 @@ static void autoshrine_tick(uintptr_t actor, double now) {
                         (ChoiceDefaultNo 0, ChoiceCancelNo 0): face the altar, ZL, A, A; outcome: the surface's map (8 s) */
         if (atomic_load(&as_seq_field) != as.seq_field || (have && landmark_distance(at, s->entrance) < 200)) { as.back = 0; as.have_safe = 0; as.inside = 0; as_go(AS_SURFACE, now, "the surface's map is loading"); return; }
         if (as.phase == 0) { as_face(actor, s->goal); as.phase = 1; }
-        else if (as.phase == 1 && t >= 0.3) { as_key(AS_KEY_ZL, 0.15); as.phase = 2; }
-        else if (as.phase == 2 && t >= 0.7) { as_key(AS_KEY_A, 0.15); as.phase = 3; }
+        else if (as.phase == 1 && t >= 0.3) { runtime_input_lease_release_all(); as.phase = 2; }   /* nothing held before A: a clean press */
+        else if (as.phase == 2 && t >= 0.8) { as_key(AS_KEY_A, 0.25); as.phase = 3; }
         else if (as.phase == 3 && t >= 2.0) { as_key(AS_KEY_A, 0.15); fprintf(stderr, "[autoshrine] A, A at the altar (\"I'm ready to go.\")\n"); as.phase = 4; }
         else if (as.phase == 4 && t >= 8) as_diagnose(AS_LEAVE, now, "the altar did not take Link out");
         return;
