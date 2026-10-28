@@ -368,7 +368,7 @@ def do_altar(g, s):
 
 
 def main():
-    ap = argparse.ArgumentParser(); ap.add_argument('--run', required=True); ap.add_argument('--shrine', type=int); ap.add_argument('--count', type=int, default=3); ap.add_argument('--altar', action='store_true')
+    ap = argparse.ArgumentParser(); ap.add_argument('--run', required=True); ap.add_argument('--shrine', type=int); ap.add_argument('--count', type=int, default=3); ap.add_argument('--altar', action='store_true'); ap.add_argument('--skip', default='', help='shrine numbers to leave out, comma separated (e.g. a door under sludge)')
     a = ap.parse_args()
     global USE_EVENT; USE_EVENT = not a.altar
     g = Game(a.run); g.send('autoshrine watch on'); g.wait(r'\[as-done\] watch', 10)
@@ -379,7 +379,7 @@ def main():
             s = info(g, n)
             if s and all(k in s for k in need): shrines.append(s); break
     say('read %d shrines' % len(shrines))
-    tried = set(); results = []
+    tried = set(int(x) for x in a.skip.split(',') if x.strip()); results = []
     for _ in range(a.count if a.shrine is None else 1):
         states = save_states(g.profile); here = g.pos() or (0, 0, 0)
         st0 = g.state() or {}; m0 = re.search(r'Dungeon(\d+)', st0.get('map', ''))   # where Link is, from the game's map name
