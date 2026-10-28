@@ -32,7 +32,8 @@ class Game:
     def __init__(self, run):
         self.input = os.path.join(run, 'input.txt'); self.logpath = os.path.join(run, 'logs', 'totk.log')
         self.profile = os.path.join(run, 'profile'); self.shots = os.path.join(run, 'shots'); os.makedirs(self.shots, exist_ok=True)
-        self.off = os.path.getsize(self.logpath); self.tag = 0; self.files = []; self.nshot = 0
+        self.off = 0; self.tag = 0; self.files = []; self.nshot = 0
+        self.lines()   # the whole log once: the map files opened so far (which shrine Link is in); waits start after it
 
     def send(self, line):
         with open(self.input, 'a') as f: f.write(line + '\n')
@@ -168,12 +169,30 @@ def place(g, to, face):   # noclip straight onto a spot, turned toward face, the
     return g.pos()
 
 
-def hold_prompt(g, spots, face, reacted_m=1.0, settle=2.5):
-    """A prompt that wants A HELD: Link placed on each spot in turn (distance matters for the prompt to show), a moment
-    for the banner / 'Saving...' to pass, A held 2 s; reacted when the scene moves Link reacted_m or more."""
-    for i, spot in enumerate(spots):
-        p0 = place(g, spot, face); time.sleep(settle)
-        g.shot('prompt-%d' % i); g.press('A', 2000); say('  A held (spot %d)' % (i + 1))
+def toward(a, b, d):   # the point d metres from a toward b (level)
+    dx, dz = b[0] - a[0], b[2] - a[2]; l = math.hypot(dx, dz) or 1
+    return (a[0] + dx / l * d, a[1], a[2] + dz / l * d)
+
+
+def approach(g, target, back_from, near, start_back=4.0):
+    """Link set down start_back metres out from target (on back_from's side), then WALKED up to it: walking is what turns
+    him (and the camera) to face it; "face" alone does not stick (2026-10-28). ZL then puts the camera behind him."""
+    start = toward(target, back_from, start_back)
+    place(g, start, target)
+    end = time.time() + 8
+    while time.time() < end:
+        p = g.pos()
+        if p and xz(p, target) <= near: break
+        g.send('autoshrine walk %.2f %.2f %.2f 300' % target); g.wait(r'\[as-done\] walk', 2)
+    g.key('ZL', 150); time.sleep(0.4)
+    p = g.pos(); return p
+
+
+def hold_prompt(g, target, back_from, near, reacted_m=1.0, tries=2, what='prompt'):
+    """A prompt that wants A HELD, reached facing it (approach); reacted when the scene moves Link reacted_m or more."""
+    for i in range(tries):
+        p0 = approach(g, target, back_from, near); time.sleep(1.5)
+        g.shot('%s-%d' % (what, i)); g.press('A', 2000); say('  A held at the %s (try %d)' % (what, i + 1))
         end = time.time() + 3
         while time.time() < end:
             p = g.pos()
@@ -216,24 +235,25 @@ def do_shrine(g, s, state):
     # 2. activate location
     if state in ('Appear', '?'):
         # 1.6 m out from the door showed "Examine" (2026-10-28); 1.2 and 2.0 m if not
-        ok = hold_prompt(g, [front(s, 1.6), front(s, 1.2), front(s, 2.0)], s['entrance'])
+        ok = hold_prompt(g, s['entrance'], s['travel'], near=1.6, what='door')   # 1.6 m from the door showed "Examine"
         g.shot('gate')
         if ok: skip_scenes(g, limit=40)
         else: say('  the door did not react (already open?); walking in anyway')
-    # 3. enter location
-    t_enter = time.time()
-    inside = lambda: (lambda p: p is not None and xz(p, s['start']) < 60)(g.pos())   # by position: map files may be cached
-    walk_to(g, s['entrance'], near=1.5, limit=6)   # through the doorway first: a straight line to the lift can meet the wall
-    if not walk_to(g, s['lift_floor'], near=1.2, limit=10) and not inside():
-        return 'enter: could not walk onto the lift'
-    if not inside():   # the lift: on it, A held
-        place(g, s['lift_floor'], s['lift']); time.sleep(0.5); g.press('A', 2000)
-    end = time.time() + 30
-    while time.time() < end:
-        p = g.pos()
-        if p and xz(p, s['start']) < 60: break
-        time.sleep(0.5)
-    else: return 'enter: the shrine did not load'
+    # 3. enter location: the doorway and the lift take A HELD (Mayamats went in that way); judged by position, 6 s each
+    inside = lambda: (lambda p: p is not None and xz(p, s['start']) < 60)(g.pos())
+    def wait_inside(sec=6):
+        end = time.time() + sec
+        while time.time() < end:
+            if inside(): return True
+            time.sleep(0.3)
+        return False
+    if not inside():   # walked in through the doorway onto the lift (facing it), A held there
+        hold_prompt(g, s['lift_floor'], s['entrance'], near=0.8, reacted_m=99, tries=1, what='lift')
+        wait_inside(6)
+    if not inside():
+        end = time.time() + 30   # the lift ride and the load
+        while time.time() < end and not inside(): time.sleep(0.5)
+    if not inside(): g.shot('not-in'); return 'enter: not inside after A held at the door and the lift'
     return do_inside(g, s)
 
 
@@ -241,7 +261,7 @@ def do_inside(g, s):   # from inside the shrine: the altar, its scene, out
     say('  inside %s' % s['name']); g.shot('inside')
     skip_scenes(g, limit=30)
     # 4. go to location exit, 5. exit location: on the altar's floor point, A held; its scene moves Link (1.3 m at Mayamats)
-    if not hold_prompt(g, [s['goal_floor']], s['goal'], reacted_m=0.8):
+    if not hold_prompt(g, s['goal_floor'], s['start'], near=0.8, reacted_m=0.8, what='altar'):
         g.shot('altar-no-scene'); return 'altar: A got no scene'
     say('  the blessing started')
     # 6. the exit: until Link is back on the surface. A scene holding him: X (its skip) and B (messages, the item's Get).
@@ -254,17 +274,21 @@ def do_inside(g, s):   # from inside the shrine: the altar, its scene, out
             g.key('X', 100); time.sleep(0.25); g.key('X', 100); g.key('B', 100)
         elif leaves < 3:
             leaves += 1; say('  free inside: A held at the altar to leave (%d)' % leaves)
-            hold_prompt(g, [s['goal_floor']], s['goal'], reacted_m=0.8, settle=1.0)
+            hold_prompt(g, s['goal_floor'], s['start'], near=0.8, reacted_m=0.8, tries=1, what='altar')
     if not outside(): g.shot('not-out'); return 'could not get out'
     say('  outside'); g.shot('outside')
     skip_scenes(g, limit=20)
     return 'done'
 
 
-def inside_shrine(shrines, p):   # the shrine whose inside Link is in (its start lift or altar within 300 m), else None
-    if p is None: return None
-    best = min(shrines, key=lambda s: min(dist(p, s['start']), dist(p, s['goal'])))
-    return best if min(dist(p, best['start']), dist(p, best['goal'])) < 300 else None
+def inside_shrine(g, shrines, p):   # the shrine whose map the game loaded last, when Link is in shrine coordinates (all the
+    if p is None or p[1] < -100 or abs(p[0]) > 1000 or abs(p[2]) > 1000: return None   # interiors share them: the map file says which)
+    g.lines(); last = None
+    for t, f in g.files:
+        m = re.match(r'Banc/SmallDungeon/Dungeon(\d+)_', f)
+        if m: last = int(m.group(1))
+        elif f.startswith('Banc/MainField/'): last = None
+    return next((s for s in shrines if s['n'] == last), None)
 
 
 def main():
@@ -281,7 +305,7 @@ def main():
     tried = set(); results = []
     for _ in range(a.count if a.shrine is None else 1):
         states = save_states(g.profile); here = g.pos() or (0, 0, 0)
-        cur = inside_shrine(shrines, here)   # where is Link before any move: inside a shrine, finish that one first
+        cur = inside_shrine(g, shrines, here)   # where is Link before any move: inside a shrine, finish that one first
         if cur:
             say('Link is inside %s: finishing it' % cur['name']); tried.add(cur['n'])
             r = do_inside(g, cur); say('  -> %s' % r); results.append((cur['name'], r)); time.sleep(3); continue
