@@ -21,6 +21,10 @@
    The kind: Scene/Component/SmallDungeonParam/DungeonNNN.game__scene__SmallDungeonParam.bgyml Type (none: puzzle;
    Gimmick: puzzle; EnemyWithCombine: a fight; Enemy: Proving Grounds, the gear taken at the door and given back by the
    goal; Treasure: the reward of a challenge outside, Rauru's Blessing).
+   Activating: the gate is the only A prompt outside (DgnObj_WarpPoint_Zonau_A_01 and the entrance have none). Its 1Open
+   is what the game calls activating the shrine: Link is stood on DestinationAnchor "AuthenticationPos" (1.85 m in from
+   the entrance, 3.75 m from the travel point, for all 152), touches the mark, the travel point turns on,
+   ShrineRegisterNumber goes up, SetOpenOwnGameData (DungeonState Appear -> Open), the entrance opens, an autosave.
    How a player gets in (field test, 2026-10-27): the lift's 2Go starts when Link walks in through the doorway; set down
    there by noclip he does not trigger it. The start lift inside (the same actor class) is walked into the same way.
    Skipping (the flows' EventTriggerSkipAcceptStart / SkipEnd marks; MrCheeze/totk-tools has the same flows as
@@ -49,8 +53,8 @@ static const char *const SHRINE_STATE_NAMES[] = {"", "Hidden", "Appear", "Open",
 enum { SHRINE_GOT_START = 1, SHRINE_GOT_GOAL = 2, SHRINE_GOT_GOAL_EXIT = 4, SHRINE_GOT_GOAL_FLOOR = 8, SHRINE_GOT_BACK = 16, SHRINE_GOT_BACK_FLOOR = 32,
        SHRINE_GOT_NEEDED = 15 };
 typedef struct {
-    int outside, inside, has_warp, has_lift, cave, hidden, crystal, kind, nchests, got;   /* got: SHRINE_GOT_... found inside */
-    float entrance[3], warp[3], lift[3], lift_floor[3];
+    int outside, inside, has_warp, has_lift, has_auth, cave, hidden, crystal, kind, nchests, got;   /* got: SHRINE_GOT_... found inside */
+    float entrance[3], warp[3], lift[3], lift_floor[3], auth[3];   /* auth: AuthenticationPos, where 1Open stands Link to activate it */
     float start[3], goal[3], goal_exit[3], goal_floor[3], back[3], back_floor[3];
     float chest[SHRINE_CHESTS][3], chest_front[SHRINE_CHESTS][2];
 } ShrineInfo;
@@ -75,7 +79,7 @@ static inline int shrine_byml_bool(const LandmarkByml *b, uint32_t node, const c
 enum { SHRINE_FLOORS = 256, SHRINE_WARPS = 512 };
 typedef struct {
     ShrineInfo s[SHRINES];
-    float floor[SHRINE_FLOORS][3], warp[SHRINE_WARPS][3]; int nfloors, nwarps;
+    float floor[SHRINE_FLOORS][3], warp[SHRINE_WARPS][3], auth[SHRINE_FLOORS][3]; int nfloors, nwarps, nauths;
 } ShrineScan;
 /* One decompressed map file (.bcett.byml); cave: it is under Banc/MainField/Cave/. Returns the actors it took, -1 when it
    is not a map file. */
@@ -101,6 +105,7 @@ static inline int shrine_scan_field(const uint8_t *d, size_t n, int cave, Shrine
         } else if (!strcmp(gyaml, "DestinationAnchor") && sc->nfloors < SHRINE_FLOORS) {
             const char *name = landmark_byml_text(&b, actor, "Name");
             if (name && !strcmp(name, "EnterSmallDungeonPos")) { memcpy(sc->floor[sc->nfloors++], xyz, 12); took++; }
+            else if (name && !strcmp(name, "AuthenticationPos") && sc->nauths < SHRINE_FLOORS) { memcpy(sc->auth[sc->nauths++], xyz, 12); took++; }
         } else if (!strcmp(gyaml, "DgnObj_WarpPoint_Zonau_A_01") && sc->nwarps < SHRINE_WARPS) { memcpy(sc->warp[sc->nwarps++], xyz, 12); took++; }
     }
     return took;
@@ -114,6 +119,8 @@ static inline int shrine_place_field(ShrineScan *sc) {
         if (!s->outside) continue;
         int w = landmark_nearest((const float (*)[3])sc->warp, sc->nwarps, s->entrance, 5);
         if ((s->has_warp = w >= 0)) memcpy(s->warp, sc->warp[w], 12);
+        int a = landmark_nearest((const float (*)[3])sc->auth, sc->nauths, s->entrance, 3);
+        if ((s->has_auth = a >= 0)) memcpy(s->auth, sc->auth[a], 12);
         if (!s->has_lift) continue;
         int f = landmark_nearest((const float (*)[3])sc->floor, sc->nfloors, s->lift, 4);
         if (f >= 0) memcpy(s->lift_floor, sc->floor[f], 12);
@@ -218,8 +225,9 @@ static inline int shrine_states_parse(const uint8_t *b, size_t n, uint8_t *state
    start lift: on LeaveSmallDungeonPos, facing its prompt. A chest: 1.3 m in front of it, facing it.
    The approach (walking in): 1 m further out than the travel point on the line from the lift out through the entrance,
    facing the lift (face is where he walks to). The start lift's approach: 3 m back from its floor toward the shrine's
-   start, facing the lift's prompt. */
-enum { SHRINE_AT_GATE, SHRINE_AT_LIFT, SHRINE_AT_GOAL, SHRINE_AT_BACK, SHRINE_AT_CHEST, SHRINE_AT_APPROACH, SHRINE_AT_BACK_APPROACH };
+   start, facing the lift's prompt. Activating: 0.5 m out from AuthenticationPos (without it, 1.85 m in from the entrance),
+   facing in (a point 5 m further in). */
+enum { SHRINE_AT_GATE, SHRINE_AT_LIFT, SHRINE_AT_GOAL, SHRINE_AT_BACK, SHRINE_AT_CHEST, SHRINE_AT_APPROACH, SHRINE_AT_BACK_APPROACH, SHRINE_AT_ACTIVATE };
 static inline void shrine_unit_xz(const float from[3], const float to[3], float out[2]) {
     float dx = to[0] - from[0], dz = to[2] - from[2], l = sqrtf(dx * dx + dz * dz);
     out[0] = l > 1e-3f ? dx / l : 0; out[1] = l > 1e-3f ? dz / l : 1;
@@ -242,6 +250,14 @@ static inline void shrine_stand(const ShrineInfo *s, int where, int chest, float
     case SHRINE_AT_APPROACH: {
         const float *out = s->has_warp ? s->warp : s->entrance; float in[2]; shrine_unit_xz(s->entrance, s->lift, in);
         stand[0] = out[0] - in[0]; stand[1] = out[1]; stand[2] = out[2] - in[1]; memcpy(face, s->lift_floor, 12);
+        break;
+    }
+    case SHRINE_AT_ACTIVATE: {
+        float in[2]; shrine_unit_xz(s->entrance, s->lift, in);
+        if (s->has_auth) memcpy(stand, s->auth, 12);
+        else { stand[0] = s->entrance[0] + 1.85f * in[0]; stand[1] = s->entrance[1] + 0.45f; stand[2] = s->entrance[2] + 1.85f * in[1]; }
+        stand[0] -= 0.5f * in[0]; stand[2] -= 0.5f * in[1];
+        face[0] = stand[0] + 5 * in[0]; face[1] = stand[1]; face[2] = stand[2] + 5 * in[1];
         break;
     }
     case SHRINE_AT_BACK_APPROACH: {

@@ -771,13 +771,13 @@ static _Atomic uint32_t as_seq_inside, as_seq_field, as_seq_goal, as_seq_event; 
 static _Atomic int as_inside_index = -1, as_watch_field;   /* watch_field: log the next surface map file */
 static pthread_mutex_t as_status_lock = PTHREAD_MUTEX_INITIALIZER;
 static char as_status[600] = "Not started";
-enum { AS_OFF, AS_PICK, AS_MOVE, AS_GATE, AS_SCENE, AS_WALK, AS_LOADING, AS_INSIDE, AS_CHEST, AS_GOAL, AS_BACK, AS_SURFACE, AS_SAVED, AS_STOPPING };
-static const char *const AS_STEP_TEXT[] = {"stopped", "choosing the next shrine", "flying", "opening the gate", "skipping a cutscene", "walking in",
+enum { AS_OFF, AS_PICK, AS_MOVE, AS_GATE, AS_SCENE, AS_WALK, AS_LOADING, AS_INSIDE, AS_CHEST, AS_GOAL, AS_BACK, AS_SURFACE, AS_SAVED, AS_STOPPING, AS_ACTIVATED };
+static const char *const AS_STEP_TEXT[] = {"stopped", "choosing the next shrine", "flying", "activating the shrine (A at its gate)", "skipping a cutscene", "walking in",
                                            "waiting for the shrine to load", "inside", "opening a chest", "at the altar", "walking into the start lift",
-                                           "back outside", "waiting for the autosave", "setting Link down"};
+                                           "back outside", "waiting for the autosave", "setting Link down", "checking the shrine is activated"};
 static struct {
     int step, one, target, k, chest, done, after, tries, event, back, flight, phase, have_last, have_safe, keyn, inside;   /* inside: in the shrine's own map */
-    int walk, until_field, skips; uint32_t event_seq;   /* event_seq: as_seq_event when the step began */   /* walk: the WASD keys held (SHRINE_STICK_...); until_field / skips: AS_SCENE's */
+    int walk, until_field, skips, activations; uint32_t event_seq, gate_seq;   /* gate_seq: as_seq_event at the gate's first A */   /* event_seq: as_seq_event when the step began */   /* walk: the WASD keys held (SHRINE_STICK_...); until_field / skips: AS_SCENE's */
     double started, t0, phase_t, last_tick, save_time;
     float stand[3], face[3], last[3], safe[3], probe[3];
     uint32_t seq_inside, seq_field, seq_goal;
@@ -929,8 +929,10 @@ static void as_pick(uintptr_t actor, double now) {
     fprintf(stderr, "[autoshrine] next: %s (Dungeon%03d, %s, %.0f m away, save says %s, %d chest%s)\n", as_mark[LANDMARK_FIRST_SHRINE + k].name, k,
             SHRINE_KIND_TEXT[s->kind], landmark_distance(s->entrance, at), as.state[k] ? SHRINE_STATE_NAMES[as.state[k]] : "nothing", s->nchests, s->nchests == 1 ? "" : "s");
     float stand[3], face[3];
-    int gate = as.state[k] == SHRINE_STATE_APPEAR || as.state[k] == SHRINE_STATE_UNKNOWN;   /* never opened: its gate's A first */
-    shrine_stand(s, SHRINE_AT_APPROACH, 0, stand, face);
+    int gate = as.state[k] == SHRINE_STATE_APPEAR || as.state[k] == SHRINE_STATE_UNKNOWN;   /* not activated yet: the gate's A first */
+    fprintf(stderr, "[autoshrine] %s\n", gate ? "not activated yet: land at its gate, A, then walk in" : "already activated: land in front, walk in");
+    as.activations = 0;
+    shrine_stand(s, gate ? SHRINE_AT_ACTIVATE : SHRINE_AT_APPROACH, 0, stand, face);
     as_move(stand, face, gate ? AS_GATE : AS_WALK, now);
 }
 /* A cutscene (or a message, or a load) holds Link: each 3 s cycle first pushes the stick briefly (he moves: it is over),
@@ -1013,10 +1015,35 @@ static void autoshrine_tick(uintptr_t actor, double now) {
     switch (as.step) {
     case AS_PICK: as_pick(actor, now); return;
     case AS_MOVE: as_tick_move(actor, now, dt); return;
-    case AS_GATE:   /* the gate's A: DmF_SY_SmallDungeon1Open (Link authenticates; skippable once seen before), then walk in */
-        if (as_press_cycle(actor, s->entrance, now, 3, 1)) return;
-        as_scene(AS_WALK, 0, now);
+    case AS_GATE:   /* the gate's A: DmF_SY_SmallDungeon1Open activates the shrine (skippable once seen before) */
+        if (as.phase == 0 && !as.tries) { as.save_time = as_save_time(); as.gate_seq = atomic_load(&as_seq_event); }
+        if (as_press_cycle(actor, as.face, now, 4, 2)) {
+            if (as.phase == 3 && atomic_load(&as_seq_event) != as.gate_seq) { fprintf(stderr, "[autoshrine] an event started at the gate\n"); as_scene(AS_ACTIVATED, 0, now); }
+            return;
+        }
+        as_scene(AS_ACTIVATED, 0, now);
         return;
+    case AS_ACTIVATED: {   /* 1Open ends with SetOpenOwnGameData and an autosave: the save must say Open (or later) */
+        if (fmod(t, 1.0) >= dt && t < 25) return;
+        double saved = as_save_time();
+        if (saved > as.save_time) {
+            static Landmark lm[LANDMARKS]; as_read_save(lm); as.save_time = saved;
+            int st = as.state[as.k];
+            fprintf(stderr, "[autoshrine] autosave: DungeonState.Dungeon%03d = %s\n", as.k, st ? SHRINE_STATE_NAMES[st] : "(not in it)");
+            if (st >= SHRINE_STATE_OPEN) { fprintf(stderr, "[autoshrine] activated (the save says %s); walking in\n", SHRINE_STATE_NAMES[st]); as_step(AS_WALK, now); return; }
+        }
+        if (t < 25) return;
+        if (atomic_load(&as_seq_event) != as.gate_seq) {   /* the activation's event ran but no save said so in 25 s */
+            fprintf(stderr, "[autoshrine] activated, not confirmed by a save (the gate's event ran); walking in\n"); as_step(AS_WALK, now); return;
+        }
+        if (as.activations++ < 1) {   /* nothing happened: once more, set down again at the gate */
+            float stand[3], face[3]; shrine_stand(s, SHRINE_AT_ACTIVATE, 0, stand, face);
+            fprintf(stderr, "[autoshrine] the gate did not answer; trying the activation once more\n");
+            as_move(stand, face, AS_GATE, now); return;
+        }
+        as_fail("the shrine did not activate (no event at the gate's A, the save still says not opened)", now);
+        return;
+    }
     case AS_SCENE: {
         if (as.until_field && (atomic_load(&as_seq_field) != as.seq_field || (have && landmark_distance(at, s->entrance) < 200))) {
             fprintf(stderr, "[autoshrine] the altar's scene took Link out (%d skip presses)\n", as.skips);

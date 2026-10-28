@@ -41,10 +41,11 @@ static uint32_t f32(float f) { uint32_t w; memcpy(&w, &f, 4); return w; }
 enum { K_ACTORS, K_DYNAMIC, K_INDEX, K_GYAML, K_TRANSLATE, K_NAME, K_EVENT, K_CRYSTAL, K_HIDDEN, K_ROTATE, K_TYPE, NKEYS };
 static const char *const shrine_keys[NKEYS] = {"Actors", "Dynamic", "DungeonIndexStr", "Gyaml", "Translate", "Name", "RequestEventName",
                                                "IsKeyCrystalAuthSmallDungeon", "IsHiddenSmallDungeon", "Rotate", "Type"};
-enum { S_ENTRANCE, S_LIFT, S_ANCHOR, S_WARP, S_D7, S_GO, S_ENTER_POS, S_START, S_ON_ELEVATOR, S_GOAL, S_GOAL_EXIT, S_EXIT_POS, S_TBOX, S_RETURN, S_LEAVE_POS, S_ENEMY, S_D200, NSTRS };
+enum { S_ENTRANCE, S_LIFT, S_ANCHOR, S_WARP, S_D7, S_GO, S_ENTER_POS, S_START, S_ON_ELEVATOR, S_GOAL, S_GOAL_EXIT, S_EXIT_POS, S_TBOX, S_RETURN, S_LEAVE_POS, S_ENEMY, S_D200, S_AUTH, NSTRS };
 static const char *const shrine_strs[NSTRS] = {"DgnObj_ZonauShrineEntrance_A_01", "FldObj_EnterAttetionActor", "DestinationAnchor", "DgnObj_WarpPoint_Zonau_A_01",
                                                "Dungeon007", "DmF_SY_SmallDungeon2Go", "EnterSmallDungeonPos", "StartPos", "OnElevator", "DgnObj_Hrl_GoalSystem_B_01",
-                                               "DgnObj_GoalExit", "SmallDungeonExit", "TBox_Dungeon_Stone", "DmF_SY_SmallDungeon4Return", "LeaveSmallDungeonPos", "Enemy", "Dungeon200"};
+                                               "DgnObj_GoalExit", "SmallDungeonExit", "TBox_Dungeon_Stone", "DmF_SY_SmallDungeon4Return", "LeaveSmallDungeonPos", "Enemy", "Dungeon200",
+                                               "AuthenticationPos"};
 typedef struct { int gyaml; float pos[3]; int name, ndyn, rotate; int dkey[2]; uint8_t dtype[2]; uint32_t dval[2]; float rot[3]; } TestActor;
 static uint32_t vec3(const float *v) { const uint8_t ft[3] = {0xD2, 0xD2, 0xD2}; const uint32_t fv[3] = {f32(v[0]), f32(v[1]), f32(v[2])}; return byml_array(3, ft, fv); }
 static size_t shrine_map(const TestActor *a, int n) {
@@ -286,9 +287,10 @@ int main(void) {
         {S_LIFT, {0, 102, -12}, -1, 2, 0, {K_INDEX, K_EVENT}, {0xA0, 0xA0}, {S_D7, S_GO}, {0}},
         {S_ANCHOR, {0, 101, -13}, S_ENTER_POS, 0, 0, {0}, {0}, {0}, {0}},
         {S_LIFT, {50, 102, -12}, -1, 2, 0, {K_INDEX, K_EVENT}, {0xA0, 0xA0}, {S_D200, S_GO}, {0}},   /* Dungeon200: no such shrine */
+        {S_ANCHOR, {0, 100.44f, -1.85f}, S_AUTH, 0, 0, {0}, {0}, {0}, {0}},
     };
-    size_t fn = shrine_map(field, 5);
-    CHECK(shrine_scan_field(buf, fn, 1, &sc) == 4, "outside: entrance, lift, floor, travel point (Dungeon200 left out)");
+    size_t fn = shrine_map(field, 6);
+    CHECK(shrine_scan_field(buf, fn, 1, &sc) == 5, "outside: entrance, lift, floor, travel point, AuthenticationPos (Dungeon200 left out)");
     CHECK(shrine_place_field(&sc) == 1 && sc.s[7].outside && sc.s[7].has_warp && sc.s[7].has_lift && sc.s[7].crystal && !sc.s[7].hidden && sc.s[7].cave,
           "Dungeon007 placed: a crystal shrine, in a cave");
     CHECK(sc.s[7].lift_floor[1] == 101 && sc.s[7].warp[2] == 2, "its lift floor and travel point");
@@ -322,6 +324,9 @@ int main(void) {
     CHECK(fabsf(stand[0] + 56.7f) < 1e-4f && stand[2] == -238 && face[0] == -58, "a chest: 1.3 m in front of it");
     shrine_stand(s7, SHRINE_AT_GATE, 0, stand, face);
     CHECK(stand[2] == 2 && face[1] == 100, "the gate: on the travel point facing the entrance");
+    shrine_stand(s7, SHRINE_AT_ACTIVATE, 0, stand, face);
+    CHECK(sc.s[7].has_auth && stand[0] == 0 && fabsf(stand[1] - 100.74f) < 1e-4f && fabsf(stand[2] + 1.35f) < 1e-4f && face[2] < stand[2] - 4.9f,
+          "activating: 0.5 m out from AuthenticationPos, facing in");
     shrine_stand(s7, SHRINE_AT_APPROACH, 0, stand, face);
     CHECK(stand[0] == 0 && fabsf(stand[1] - 100.7f) < 1e-4f && stand[2] == 3 && face[2] == -13, "walking in: 1 m out past the travel point, toward the lift floor");
     shrine_stand(s7, SHRINE_AT_BACK_APPROACH, 0, stand, face);
