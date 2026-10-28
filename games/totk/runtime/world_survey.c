@@ -756,10 +756,10 @@ uint8_t *runtime_romfs_host_read(const char *path, size_t *n);
 uint8_t *runtime_romfs_zs_decompress(const uint8_t *src, size_t n, size_t *out);
 void runtime_input_key_synthetic(unsigned code, int down);
 int settings_get(const char *key);
-enum { AS_KEY_A = 38, AS_KEY_B = 40, AS_KEY_X = 34, AS_KEY_PLUS = 36, AS_KEY_ZL = 58, AS_KEY_UP = 13, AS_KEY_DOWN = 1, AS_KEY_LEFT = 0, AS_KEY_RIGHT = 2 };   /* Mac key codes (input.c button(); WASD is the left stick) */
-/* Skipping: the "Skip +" prompt (EventSkip_00, lower right) shows only after a press, X (or B), and + then skips
-   (Prima Games, Screen Rant on the Blood Moon: "both the X and + buttons"). + with no prompt opens the pause menu, so a
-   B follows each try (it closes that menu, and advances a message). as_skip_reveal: the press that shows the prompt
+enum { AS_KEY_A = 38, AS_KEY_B = 40, AS_KEY_X = 34, AS_KEY_ZL = 58, AS_KEY_UP = 13, AS_KEY_DOWN = 1, AS_KEY_LEFT = 0, AS_KEY_RIGHT = 2 };   /* Mac key codes (input.c button(); WASD is the left stick) */
+/* Skipping: the shrine scenes show "Skip X" (EventSkip_00, lower right; "Skip Y" with Xbox prompts, the same button), and
+   X skips (in-game test 2026-10-28, the gate's scene). + is never pressed: once a scene is over it opens the pause menu.
+   X in play only jumps; a B follows every other try (it advances a message). as_skip_reveal: the skip button
    ("autoshrine skip x | b | none"; none: no skip at all, cutscenes are waited out). */
 static _Atomic int as_skip_reveal = AS_KEY_X;
 static ShrineInfo as_shrine[SHRINES];
@@ -1180,7 +1180,7 @@ static void autoshrine_tick(uintptr_t actor, double now) {
             if (have) memcpy(as.probe, at, 12);
             if (reveal) { as_key((unsigned)reveal, 0.1); as.skips++; }
             as.phase = 1;
-        } else if (as.phase == 1 && c >= 0.25) { if (reveal) as_key(AS_KEY_PLUS, 0.1); as.phase = 2; }
+        } else if (as.phase == 1 && c >= 0.25) { if (reveal) as_key((unsigned)reveal, 0.1); as.phase = 2; }   /* the skip is the prompt's own button ("Skip X"; + would open the pause menu once a scene is over) */
         else if (as.phase == 2 && c >= 0.5) { if (as.tries & 1) as_key(AS_KEY_B, 0.1); as.phase = 3; }
         else if (as.phase == 3 && c >= 0.8) {
             float moved = have ? landmark_distance(at, as.probe) : 0;
@@ -1399,7 +1399,7 @@ int runtime_autoshrine_command(const char *line) {
     else if (!strcmp(word, "finish") && arg[0]) runtime_autoshrine_finish(atoi(arg));   /* "autoshrine finish N": Dungeon N */
     else if (!strcmp(word, "chests") && (!strcmp(arg, "on") || !strcmp(arg, "off"))) runtime_autoshrine_set_chests(arg[1] == 'n');
     else if (!strcmp(word, "skip") && (!strcmp(arg, "x") || !strcmp(arg, "b") || !strcmp(arg, "none"))) {
-        atomic_store(&as_skip_reveal, arg[0] == 'x' ? AS_KEY_X : arg[0] == 'b' ? AS_KEY_B : 0); fprintf(stderr, "[autoshrine] skip: %s\n", arg[0] == 'n' ? "off" : arg[0] == 'x' ? "X, then +" : "B, then +");
+        atomic_store(&as_skip_reveal, arg[0] == 'x' ? AS_KEY_X : arg[0] == 'b' ? AS_KEY_B : 0); fprintf(stderr, "[autoshrine] skip: %s\n", arg[0] == 'n' ? "off" : arg[0] == 'x' ? "X" : "B");
     }
     else if (!strcmp(word, "status")) { char s[600]; runtime_autoshrine_status(s, sizeof s); fprintf(stderr, "[autoshrine] status: %s\n", s); }
     else fprintf(stderr, "[autoshrine] rejected: expected start, one, finish N, stop, status, chests on|off or skip x|b|none\n");
