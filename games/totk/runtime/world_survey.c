@@ -777,7 +777,7 @@ static const char *const AS_STEP_TEXT[] = {"stopped", "choosing the next shrine"
                                            "back outside", "waiting for the autosave", "setting Link down"};
 static struct {
     int step, one, target, k, chest, done, after, tries, event, back, flight, phase, have_last, have_safe, keyn, inside;   /* inside: in the shrine's own map */
-    int walk, until_field, skips;   /* walk: the WASD keys held (SHRINE_STICK_...); until_field / skips: AS_SCENE's */
+    int walk, until_field, skips; uint32_t event_seq;   /* event_seq: as_seq_event when the step began */   /* walk: the WASD keys held (SHRINE_STICK_...); until_field / skips: AS_SCENE's */
     double started, t0, phase_t, last_tick, save_time;
     float stand[3], face[3], last[3], safe[3], probe[3];
     uint32_t seq_inside, seq_field, seq_goal;
@@ -864,7 +864,7 @@ static int as_read_save(Landmark *lm) {
 static void as_step(int step, double now) {
     as_walk(0, NULL);
     as.step = step; as.t0 = now; as.phase = 0; as.tries = 0; as.have_last = 0; as.event = 0;
-    as.seq_inside = atomic_load(&as_seq_inside); as.seq_field = atomic_load(&as_seq_field); as.seq_goal = atomic_load(&as_seq_goal);
+    as.seq_inside = atomic_load(&as_seq_inside); as.seq_field = atomic_load(&as_seq_field); as.seq_goal = atomic_load(&as_seq_goal); as.event_seq = atomic_load(&as_seq_event);
     atomic_store(&as_watch_field, step == AS_GOAL || step == AS_BACK);
     if (step != AS_OFF && step != AS_STOPPING)
         fprintf(stderr, "[autoshrine] %s%s%s\n", as.k >= 0 ? as_mark[LANDMARK_FIRST_SHRINE + as.k].name : "", as.k >= 0 ? ": " : "", AS_STEP_TEXT[step]);
@@ -1045,29 +1045,39 @@ static void autoshrine_tick(uintptr_t actor, double now) {
         else if (as.phase == 4 && c >= 3) { as.tries++; as.phase = 0; }
         return;
     }
-    case AS_WALK: {   /* through the doorway: DmF_SY_SmallDungeon2Go takes him onto the lift and into the shrine's map */
+    case AS_WALK: {   /* noclip is off: Link walks through the doorway; DmF_SY_SmallDungeon2Go takes him onto the lift, then the load */
         uint32_t seen = as.seq_inside;   /* AS_LOADING looks for the map files from the same point */
-        if (atomic_load(&as_seq_inside) != seen || (have && landmark_distance(at, s->start) < 60)) { as_step(AS_LOADING, now); as.seq_inside = seen; return; }
-        float dx = have ? at[0] - s->lift_floor[0] : 99, dz = have ? at[2] - s->lift_floor[2] : 99;
-        if (dx * dx + dz * dz < 1.5f * 1.5f) { fprintf(stderr, "[autoshrine] on the entrance lift after %.1f s\n", t); as_step(AS_LOADING, now); as.seq_inside = seen; return; }
+        float dx = have ? at[0] - s->lift_floor[0] : 99, dz = have ? at[2] - s->lift_floor[2] : 99, d = sqrtf(dx * dx + dz * dz);
+        if (as.phase == 0) { fprintf(stderr, "[autoshrine] walking in: %.1f m to the entrance lift, noclip %s\n", d, atomic_load(&noclip_wanted) ? "on (!)" : "off"); as.phase = 1; }
+        const char *why = atomic_load(&as_seq_inside) != seen ? "the shrine's map opened" : have && landmark_distance(at, s->start) < 60 ? "Link is in the shrine's coordinates"
+                        : atomic_load(&as_seq_event) != as.event_seq ? "an event started (2Go)" : d < 1.5f ? "Link is on the entrance lift"
+                        : t > 8 && d < 4 ? "Link is at the lift after 8 s (the event may be carrying him)" : NULL;
+        if (why) {
+            fprintf(stderr, "[autoshrine] the way in started after %.1f s: %s; waiting for the shrine to load, nothing else meanwhile\n", t, why);
+            as_step(AS_LOADING, now); as.seq_inside = seen; return;
+        }
         if (t > 8) {
-            char why[160]; snprintf(why, sizeof why, "walked toward the entrance for 8 s and the way in did not start (%.1f m from the lift)", sqrtf(dx * dx + dz * dz));
-            as_fail(why, now); return;
+            char text[160]; snprintf(text, sizeof text, "walked toward the entrance for 8 s and the way in did not start (%.1f m from the lift)", d);
+            as_fail(text, now); return;
         }
         as_walk(actor, s->lift_floor);
         return;
     }
-    case AS_LOADING:   /* 2Go: the fade, then the shrine's map */
-        if (atomic_load(&as_seq_inside) != as.seq_inside || as.event) {
+    case AS_LOADING:   /* the fade and the loading screen: no key, no other shrine, until Link stands in the shrine's map */
+        if (!as.event && atomic_load(&as_seq_inside) != as.seq_inside) {
             int got = atomic_load(&as_inside_index);
-            if (!as.event && got != as.k) { char why[80]; snprintf(why, sizeof why, "the game loaded Dungeon%03d instead", got); as_fail(why, now); return; }
-            as.event = 1;
+            if (got != as.k) { char text[80]; snprintf(text, sizeof text, "the game loaded Dungeon%03d instead", got); as_fail(text, now); return; }
+            as.event = 1; fprintf(stderr, "[autoshrine] the shrine's map is loading (%.0f s)\n", t);
         }
-        if (have && landmark_distance(at, s->start) < 80) {   /* he is in the shrine's own coordinates (444 m or more from any entrance) */
-            fprintf(stderr, "[autoshrine] inside at %.1f,%.1f,%.1f%s\n", at[0], at[1], at[2], as.event ? "" : " (no map file seen)");
-            as.have_safe = 0; as.inside = 1; as_step(AS_INSIDE, now); return;
-        }
-        if (t > (as.event ? 60 : 25)) as_fail(as.event ? "the shrine's map loaded but Link did not appear in it" : "the way in started but the shrine did not load", now);
+        if (have && landmark_distance(at, s->start) < 80) {   /* in the shrine's own coordinates (444 m or more from any entrance): held there 2 s */
+            if (!as.have_last || landmark_distance(at, as.last) > 5) { memcpy(as.last, at, 12); as.have_last = 1; as.phase_t = now; }
+            if (now - as.phase_t >= 2) {
+                fprintf(stderr, "[autoshrine] inside after %.0f s at %.1f,%.1f,%.1f%s\n", t, at[0], at[1], at[2], as.event ? "" : " (no map file seen)");
+                as.have_safe = 0; as.inside = 1; as_step(AS_INSIDE, now); return;
+            }
+        } else as.have_last = 0;
+        if (fmod(t, 10.0) < dt && t > 1) fprintf(stderr, "[autoshrine] still loading after %.0f s (map file %s)\n", t, as.event ? "seen" : "not seen yet");
+        if (t > (as.event ? 180 : 90)) as_fail(as.event ? "the shrine's map opened but Link was not in it within 3 minutes" : "the way in started but the shrine did not load within 90 s", now);
         return;
     case AS_INSIDE:   /* 3Arrive (and on Great Sky Island the ability's scene): skipped, then on */
         as_scene(AS_INSIDE, 0, now);
