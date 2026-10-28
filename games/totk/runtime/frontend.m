@@ -429,6 +429,9 @@ static TOTKWindowDelegate *windowDelegate;
 static TOTKAppDelegate *appDelegate;
 int runtime_front_window_visible(void){return atomic_load(&windowVisible);}
 void runtime_front_request_close(void){dispatch_async(dispatch_get_main_queue(), ^{[window performClose:nil];});}
+/* Auto shrine (world_survey.c): a short sound when a run ends, so the player notices; Glass when it finished, the alert
+   sound when it stopped. Overrides world_survey.c's silent default. */
+void runtime_front_run_sound(int ok){dispatch_async(dispatch_get_main_queue(), ^{NSSound *glass=ok?[NSSound soundNamed:@"Glass"]:nil;if(glass)[glass play];else NSBeep();});}
 /* The menu's Restart now (mods and after-restart settings): a detached shell waits for this process to end, then opens the
    app again (TOTK_APP_BUNDLE, set by the launcher); the window closes the usual way, so a save in progress finishes first.
    0 when there is no app to reopen (a test run of the bare binary). */

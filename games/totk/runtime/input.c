@@ -54,18 +54,28 @@ void runtime_input_key_synthetic(unsigned code,int down){if(code>=128)return;pth
  if(press&&code==KEY_TAA_TOGGLE)key_taa_cycle();
  if(press&&code==KEY_PAD_TYPE_CYCLE)key_pad_type_cycle();
  if(press&&code==KEY_MOUSE_TOGGLE)key_mouse_toggle();}
-void runtime_input_key(unsigned code,int down){if(down&&code<128)user_input("keyboard");runtime_input_key_synthetic(code,down);}
+/* Leased keys (auto shrine, world_survey.c): a synthetic press that lets go by itself at its deadline, checked wherever
+   the game or noclip reads input, so a key can never stay held when the code that pressed it stops running. ms 0 lets
+   go at once. A key the player presses himself is his: its lease ends. */
+static uint64_t lease_until[128];
+static void lease_expire_locked(void){uint64_t now=0;for(unsigned i=0;i<128;i++)if(lease_until[i]){if(!now)now=runtime_now_ns();if(now>=lease_until[i]){lease_until[i]=0;keys[i]=0;}}}
+void runtime_input_lease(unsigned code,unsigned ms){if(code>=128)return;pthread_mutex_lock(&inputLock);
+ if(!ms){if(lease_until[code]){lease_until[code]=0;keys[code]=0;}}
+ else{if(!keys[code])pending|=button(code);keys[code]=1;lease_until[code]=runtime_now_ns()+(uint64_t)ms*1000000ull;}
+ pthread_mutex_unlock(&inputLock);}
+void runtime_input_lease_release_all(void){pthread_mutex_lock(&inputLock);for(unsigned i=0;i<128;i++)if(lease_until[i]){lease_until[i]=0;keys[i]=0;}pthread_mutex_unlock(&inputLock);}
+void runtime_input_key(unsigned code,int down){if(down&&code<128)user_input("keyboard");if(code<128){pthread_mutex_lock(&inputLock);lease_until[code]=0;pthread_mutex_unlock(&inputLock);}runtime_input_key_synthetic(code,down);}
 /* While the settings menu is open the game reads no buttons and no keyboard: nothing the player presses there reaches it.
    The controller's two sticks still do (the menu navigates with the d-pad), so the camera and Link can move while a
    setting is tried. */
 static _Atomic int inputHeld;
 void runtime_input_hold(int on){atomic_store(&inputHeld,on?1:0);if(on)runtime_input_clear();}
 /* Cheats (cheats.c): the buttons held now (keyboard and controller), in the npad bit order. */
-uint64_t runtime_input_buttons(void){uint64_t b=0;pthread_mutex_lock(&inputLock);for(unsigned i=0;i<128;i++)if(keys[i])b|=button(i);pthread_mutex_unlock(&inputLock);
+uint64_t runtime_input_buttons(void){uint64_t b=0;pthread_mutex_lock(&inputLock);lease_expire_locked();for(unsigned i=0;i<128;i++)if(keys[i])b|=button(i);pthread_mutex_unlock(&inputLock);
  return b|runtime_gamepad_held();}
-void runtime_input_left_stick(int32_t *x,int32_t *y){pthread_mutex_lock(&inputLock);int32_t kx=32767*((int)keys[2]-(int)keys[0]),ky=32767*((int)keys[13]-(int)keys[1]);int held=atomic_load(&inputHeld);pthread_mutex_unlock(&inputLock);
+void runtime_input_left_stick(int32_t *x,int32_t *y){pthread_mutex_lock(&inputLock);lease_expire_locked();int32_t kx=32767*((int)keys[2]-(int)keys[0]),ky=32767*((int)keys[13]-(int)keys[1]);int held=atomic_load(&inputHeld);pthread_mutex_unlock(&inputLock);
  int32_t px=0,py=0;runtime_gamepad_left_stick(&px,&py);if(held){*x=*y=0;return;}*x=abs(px)>abs(kx)?px:kx;*y=abs(py)>abs(ky)?py:ky;}
-void runtime_input_clear(void){pthread_mutex_lock(&inputLock);memset(keys,0,sizeof(keys));pending=0;pthread_mutex_unlock(&inputLock);runtime_gamepad_clear();}
+void runtime_input_clear(void){pthread_mutex_lock(&inputLock);memset(keys,0,sizeof(keys));memset(lease_until,0,sizeof(lease_until));pending=0;pthread_mutex_unlock(&inputLock);runtime_gamepad_clear();}
 static void initialize(void){pthread_mutex_lock(&inputLock);enabled=true;pthread_mutex_unlock(&inputLock);fprintf(stderr,"[totk] native keyboard controller initialized\n");}
 /* Docked: one full-key controller as player 1 (id 0, style bit 0). Handheld (TOTK_OPERATION_MODE=handheld, the iPhone):
    the same input is the handheld controller (id 0x20, style bit 1, joy-cons attached) and player 1 is not connected;
@@ -89,7 +99,7 @@ static int32_t camera_scale(int32_t v,int percent){if(percent==100)return v;int6
 static int pad_states(NpadState *out,int max,const uint32_t *id,uint32_t want_style);
 static int full_states(NpadState *out,int max,const uint32_t *id){return pad_states(out,max,id,1);}
 static int handheld_states(NpadState *out,int max,const uint32_t *id){return pad_states(out,max,id,2);}
-static int pad_states(NpadState *out,int max,const uint32_t *id,uint32_t want_style){if(max<=0)return 0;if(id)input_log(want_style==2?"handheld state":"full-key state",*id);if(!out||!id)runtime_fail("controller output pointer");pthread_mutex_lock(&inputLock);NpadState state={.sampling=++sample};if(enabled&&allowed&&*id==pad_id()&&want_style==pad_style()&&(styles&want_style)){
+static int pad_states(NpadState *out,int max,const uint32_t *id,uint32_t want_style){if(max<=0)return 0;if(id)input_log(want_style==2?"handheld state":"full-key state",*id);if(!out||!id)runtime_fail("controller output pointer");pthread_mutex_lock(&inputLock);NpadState state={.sampling=++sample};lease_expire_locked();if(enabled&&allowed&&*id==pad_id()&&want_style==pad_style()&&(styles&want_style)){
  state.attributes=1;for(unsigned i=0;i<128;i++)if(keys[i])state.buttons|=button(i);state.buttons|=pending;pending=0;
  state.lx=32767*((int)keys[2]-(int)keys[0]);state.ly=32767*((int)keys[13]-(int)keys[1]);state.rx=32767*((int)keys[124]-(int)keys[123]);state.ry=32767*((int)keys[126]-(int)keys[125]);
  RuntimeGamepadState pad;runtime_gamepad_read(&pad);if(atomic_load(&inputHeld)){pad.buttons=0;state.buttons=0;state.lx=state.ly=state.rx=state.ry=0;}state.buttons|=pad.buttons;state.buttons&=~runtime_noclip_taken();

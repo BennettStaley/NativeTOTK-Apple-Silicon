@@ -327,6 +327,8 @@ int main(void) {
     shrine_stand(s7, SHRINE_AT_ACTIVATE, 0, stand, face);
     CHECK(sc.s[7].has_auth && stand[0] == 0 && fabsf(stand[1] - 100.74f) < 1e-4f && fabsf(stand[2] + 1.35f) < 1e-4f && face[2] < stand[2] - 4.9f,
           "activating: 0.5 m out from AuthenticationPos, facing in");
+    shrine_stand(s7, SHRINE_AT_GOAL_APPROACH, 0, stand, face);
+    CHECK(stand[0] == 0 && fabsf(stand[2] + 271.75f) < 1e-4f && fabsf(stand[1] - 27.5f) < 1e-4f && face[2] == -275, "the altar: 2.5 m back from SmallDungeonExit, facing its prompt");
     shrine_stand(s7, SHRINE_AT_TRAVEL, 0, stand, face);
     CHECK(stand[0] == 0 && fabsf(stand[1] - 101.9f) < 1e-4f && stand[2] == 2 && face[2] == -1.85f, "landing: the travel point 1.5 m up, facing AuthenticationPos");
     shrine_stand(s7, SHRINE_AT_APPROACH, 0, stand, face);
