@@ -938,7 +938,7 @@ static void as_move(const float stand[3], const float face[3], int after, double
    his feet: when it is on, he is first taken back to where he last stood, unless the player stopped it; then noclip off.
    A summary and a sound. */
 static void as_end(int ok, const char *why, double now, int by_player) {
-    as_walk(0, NULL); runtime_input_lease_release_all();
+    as_walk(0, NULL); runtime_input_lease_release_all(); (void)by_player;   /* a stop by the player sets Link down safely too */
     snprintf(as.why, sizeof as.why, "%s%s", ok ? "Finished: " : "", why);
     fprintf(stderr, "[autoshrine] %s\n", as.why);
     fprintf(stderr, "[autoshrine] summary: %d done, %d skipped%s%s%s\n", as.done, as.skipped, as.skipped ? " (" : "", as.skipped_list, as.skipped ? ")" : "");
@@ -948,7 +948,12 @@ static void as_end(int ok, const char *why, double now, int by_player) {
         else fprintf(stderr, "[autoshrine] no save found in the profile\n");
     }
     runtime_front_run_sound(ok);
-    if (!by_player && atomic_load(&noclip_wanted) && as.have_safe) {
+    if (atomic_load(&noclip_wanted) && (noclip_flight.on || !as.have_safe)) {   /* in the air (a flight; stopped by the player too):
+        the flight's own end is on the ground; down there first, then noclip off (2026-10-28: a stop mid-flight dropped Link 60 m) */
+        float at[3]; pthread_mutex_lock(&noclip_goto_lock); int pending = noclip_goto.pending; pthread_mutex_unlock(&noclip_goto_lock);
+        if (noclip_flight.on || pending) { memcpy(at, noclip_flight.on ? noclip_flight.to : noclip_goto.xyz, 12); memcpy(as.stand, at, 12); as_go(AS_STOPPING, now, "setting Link down where the flight lands"); return; }
+    }
+    if (atomic_load(&noclip_wanted) && as.have_safe) {
         float at[3] = {as.safe[0], as.safe[1] + 0.5f, as.safe[2]};
         if (!as.inside && noclip.holding && landmark_distance(noclip.xyz, at) > 40) runtime_noclip_goto(at);
         memcpy(as.stand, at, 12); as_go(AS_STOPPING, now, "setting Link down"); return;
@@ -1378,9 +1383,17 @@ static void autoshrine_tick(uintptr_t actor, double now) {
         as_go(AS_PICK, now, "done; the next shrine");
         return;
     }
-    case AS_R_MENU:   /* B closes the pause menu (or a message); then look again */
-        if (as.phase == 0) { as_key(AS_KEY_B, 0.12); fprintf(stderr, "[autoshrine] B (menu)\n"); as.phase = 1; }
-        else if (t >= 0.8) as_go(AS_DIAGNOSE, now, "look again after B");
+    case AS_R_MENU:   /* B closes the pause menu (or a message); then look again. The third time A instead: the Game Over
+                         screen's Continue (its event file was read once at start, so a game over shows only as Link held still) */
+        if (as.phase == 0) {
+            if (as.rec[REC_MENU] >= 3) { as_key(AS_KEY_A, 0.25); fprintf(stderr, "[autoshrine] A (Continue, if this is the Game Over screen)\n"); as.phase = 2; as.phase_t = now; if (have) memcpy(as.probe, at, 12); }
+            else { as_key(AS_KEY_B, 0.12); fprintf(stderr, "[autoshrine] B (menu)\n"); as.phase = 1; }
+        }
+        else if (as.phase == 1 && t >= 0.8) as_go(AS_DIAGNOSE, now, "look again after B");
+        else if (as.phase == 2) {   /* a game over reloads the last save: a map load, or Link somewhere else */
+            if (as_ago(&as_map_ns) < 2 || !have || (have && landmark_distance(at, as.probe) > 15)) { as_go(AS_GAMEOVER, now, "GAME_OVER: Continue reloaded the save"); return; }
+            if (now - as.phase_t > 4) as_go(AS_DIAGNOSE, now, "look again after A");
+        }
         return;
     case AS_R_PROMPT: {   /* back off 2 m (straight back, then 30 degrees to one side, then the other), walk up to the prompt, back to the state */
         if (!as_prompt_of(as.ret)) { as_go(AS_R_UNKNOWN, now, "no prompt to work on"); return; }
