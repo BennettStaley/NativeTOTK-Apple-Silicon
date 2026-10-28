@@ -192,16 +192,17 @@ def walk_to_spot(g, spot, near=0.5, limit=15, stop=None):
 
 
 def prompt_visible(g):
-    """An A prompt ("Examine" etc.) on screen: the white button circle of the prompt bubble, below and right of Link, in
-    the game frame's 960x540 shot (x 470-700, y 400-470): ~10-18 pure-white pixels with it, 0 without (2026-10-28)."""
+    """An A prompt ("Examine" etc.) on screen: its button circle and word, just below and right of Link, at x 545-625,
+    y 423-446 of the 960x540 game frame: 367-450 bright pixels (r+g+b > 600) with it, 0-2 without, a white lantern
+    beside it included (checked on 40 shots, 2026-10-28)."""
     from PIL import Image
     path = g.shot('p'); time.sleep(0.05)
-    try: im = Image.open(path).convert('RGB').crop((470, 400, 700, 470))
+    try: im = Image.open(path).convert('RGB').crop((545, 423, 625, 446))
     except Exception: return False
     finally:
         try: os.remove(path)
         except OSError: pass
-    return sum(1 for r, gg, b in im.getdata() if r > 235 and gg > 235 and b > 235) >= 6
+    return sum(1 for px in im.getdata() if sum(px) > 600) >= 150
 
 
 def walk_until_prompt(g, target, limit=20):
