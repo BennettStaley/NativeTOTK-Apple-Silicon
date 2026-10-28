@@ -807,6 +807,17 @@ void runtime_input_lease(unsigned code, unsigned ms);
 void runtime_input_lease_release_all(void);
 /* frontend.m (Mac): a short sound when a run ends, ok or not; elsewhere nothing. */
 __attribute__((weak)) void runtime_front_run_sound(int ok) { (void)ok; }
+/* TOTK_AUTOSHRINE_SHOTS=<folder> (testing): a screenshot at every step change and once a second while landing or in a
+   cutscene, named <n>-<step>.png, so a run can be judged afterwards without anyone watching it. */
+void dm_gfx_shot_at(long frames, const char *path);
+static void as_shot(const char *what) {
+    static const char *dir; static int checked; static unsigned n;
+    if (!checked) { checked = 1; dir = getenv("TOTK_AUTOSHRINE_SHOTS"); if (dir && !*dir) dir = NULL; }
+    if (!dir) return;
+    char path[1200]; snprintf(path, sizeof path, "%s/%04u-%s.png", dir, n++, what);
+    for (char *c = path + strlen(dir) + 1; *c; c++) if (*c == ' ' || *c == '/' || *c == ',' || *c == '"') *c = '_';
+    dm_gfx_shot_at(2, path);
+}
 static void as_say(void) {
     char line[1600]; const char *name = as.k >= 0 ? as_mark[LANDMARK_FIRST_SHRINE + as.k].name : "";
     char skipped[760] = "";
@@ -908,6 +919,7 @@ static void as_step(int step, double now) {
     atomic_store(&as_watch_field, step == AS_GOAL || step == AS_BACK || step == AS_LEAVE);
     if (step != AS_OFF && step != AS_STOPPING)
         fprintf(stderr, "[autoshrine] step %d, %s: %s\n", as.stage, AS_STAGE_TEXT[as.stage], AS_STEP_TEXT[step]);
+    if (step != AS_OFF) as_shot(AS_STEP_TEXT[step]);
     as_say();
 }
 static void as_move(const float stand[3], const float face[3], int after, double now) {
@@ -1065,6 +1077,7 @@ static void as_tick_move(uintptr_t actor, double now, double dt) {
         return;
     }
     if (as.phase == 3) {   /* landed: on his feet near the place, and still there (the game returns a player it finds stuck) */
+        { static double last; if (now - last >= 1) { last = now; as_shot("landing"); } }
         if (have && (at[0] - as.stand[0]) * (at[0] - as.stand[0]) + (at[2] - as.stand[2]) * (at[2] - as.stand[2]) > 64) {
             char why[200]; snprintf(why, sizeof why, "the game returned Link from the landing spot %.1f,%.1f,%.1f (it faded out and put him back at %.1f,%.1f,%.1f)",
                                     as.stand[0], as.stand[1], as.stand[2], at[0], at[1], at[2]);
@@ -1143,7 +1156,8 @@ static void autoshrine_tick(uintptr_t actor, double now) {
             else if (as.phase == 3 && c >= 0.9) as_scene(AS_WALK, 0, now);
         }
         return;
-    case AS_SCENE: {   /* skip at once and again every 0.8 s: X (shows "Skip +"), + 0.25 s later, B every other time for a message;
+    case AS_SCENE: {
+        { static double last; if (now - last >= 1) { last = now; as_shot("scene"); } }   /* skip at once and again every 0.8 s: X (shows "Skip +"), + 0.25 s later, B every other time for a message;
                           the stick pushed all along (back, away from the altar, at the end). It is over when Link moves under it
                           two cycles running, the next map loads, or (at the altar) the surface's map loads. */
         if (as.until_field && (atomic_load(&as_seq_field) != as.seq_field || (have && landmark_distance(at, s->entrance) < 200))) {
@@ -1191,6 +1205,7 @@ static void autoshrine_tick(uintptr_t actor, double now) {
         return;
     }
     case AS_WALK: {   /* step 3: noclip is off; Link walks through the doorway; DmF_SY_SmallDungeon2Go takes him onto the lift, then the load */
+        { static double last; if (now - last >= 1) { last = now; as_shot("walking"); } }
         uint32_t seen = as.seq_inside;   /* AS_LOADING looks for the map files from the same point */
         float dx = have ? at[0] - s->lift_floor[0] : 99, dz = have ? at[2] - s->lift_floor[2] : 99, d = sqrtf(dx * dx + dz * dz);
         if (as.phase == 0) { fprintf(stderr, "[autoshrine] walking in: %.1f m to the entrance lift, noclip %s\n", d, atomic_load(&noclip_wanted) ? "on (!)" : "off"); as.phase = 1; }
