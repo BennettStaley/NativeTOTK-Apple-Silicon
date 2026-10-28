@@ -65,6 +65,11 @@
 #define GAME_DISH_SET_STRING64 0x282280      /* GameDataMgr::setStructString64 */
 #define GAME_DISH_GET_BOOL 0x1b02f8          /* GameDataMgr::getStructBool */
 #define GAME_DISH_SET_BOOL 0x923d20          /* GameDataMgr::setStructBool */
+/* Game state for scripts only (world_survey.c, "ctl state", how they were found): engine::event::EventMgr::sInstance, read
+   by the AI query QueryIsPlayingMainEvent (its 1.0.0 twin reads 0x464a988, totk-lotuskit's EventMgr::sInstance), and the
+   object QueryGetCurrentNormalizedBancName reads the current map's name through. Named, not GAME_ADDR: 1.4.3 only. */
+#define GAME_STATE_EVENT_MGR 0x3ada558
+#define GAME_STATE_BANC 0x3ad76f0
 #define GAME_ADDR_0x69a18c 0x45ce70
 #define GAME_ADDR_0x4663f08 0x3add238
 #define GAME_ADDR_0x15ecb0c 0x1bd01c4
