@@ -235,7 +235,7 @@ probe-cheat-vm:
 	@mkdir -p build/tests
 	xcrun clang -std=c11 -O1 -g -Wall -Wextra -Werror -Iruntime tests/cheats/probe.c runtime/cheat_vm.c runtime/cheat_code.c -o build/tests/cheat_vm_probe
 	build/tests/cheat_vm_probe
-# Give a dish (runtime/dish_give.h, the Dishes parts of runtime/spawn_list.h): name hashes, limits, the actor list; map pins from a save (runtime/map_pins.h) (CPU only).
+# Give a dish (runtime/dish_give.h, the Dishes parts of runtime/spawn_list.h): name hashes, limits, the actor list; map pins from a save (runtime/map_pins.h); towers and shrines from map and message files and a save (runtime/landmarks.h) (CPU only).
 probe-dish:
 	@mkdir -p build/tests
 	xcrun clang -std=c11 -O1 -g -Wall -Wextra -Werror -Iruntime tests/dish/probe.c -o build/tests/dish_probe
