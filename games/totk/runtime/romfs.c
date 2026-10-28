@@ -400,7 +400,8 @@ static uint8_t *zs_decompress(const uint8_t *src,size_t n,size_t *out) {
 }
 /* A player's Common layout archive (UI mods: button glyphs, HUD) with the build's own edits applied again: every edit of the
    build's copy (yielded, from build_yield) that the mod leaves as the game ships it (mods_port_merge: the quick-menu
-   background fix and the layouts for the output's shape, such as Native 16:10), or, without the build's copy, the quick-menu
+   background fix and the layouts for the output's shape, such as Native 16:10; in a layout or animation the mod rebuilt, by pane
+   name), or, without the build's copy, the quick-menu
    fix alone (mods_capture_fix). Served as a zstd frame of raw blocks from <mods>/.cache: capture-fix-<path digest>.blarc.zs,
    its .key holding the player file's and the build copy's size, modification time and path and the verdict, so the next
    start with the same files reads nothing. 1 = out names the file to serve; 0 = the player's file is served unchanged (its
@@ -409,7 +410,7 @@ static int capture_refix(const char *who,const char *name,const char *file,const
  uint64_t t0=runtime_now_ns();char key[8800],cache[4096],keyfile[4400],saved[9400]={0},port[4096];struct stat ps;
  snprintf(port,sizeof port,"%s",yielded);*yielded=0;
  uint64_t vi=lower(name);if(vi>=file_count||strcmp(entry_name(entry(vi)),name)||stat(port,&ps))*port=0;
- snprintf(key,sizeof key,"totk-capture-fix-2\t%llu\t%lld.%09ld\t%s\t%llu\t%lld.%09ld\t%s",(unsigned long long)st->st_size,(long long)st->st_mtimespec.tv_sec,(long)st->st_mtimespec.tv_nsec,file,
+ snprintf(key,sizeof key,"totk-capture-fix-3\t%llu\t%lld.%09ld\t%s\t%llu\t%lld.%09ld\t%s",(unsigned long long)st->st_size,(long long)st->st_mtimespec.tv_sec,(long)st->st_mtimespec.tv_nsec,file,
   *port?(unsigned long long)ps.st_size:0ull,*port?(long long)ps.st_mtimespec.tv_sec:0ll,*port?(long)ps.st_mtimespec.tv_nsec:0l,port);
  uint8_t d[32];CC_SHA256(file,(CC_LONG)strlen(file),d);
  snprintf(cache,sizeof cache,"%s/.cache",mods_dir());
@@ -429,8 +430,8 @@ static int capture_refix(const char *who,const char *name,const char *file,const
  if(plain&&*port){   /* all the build's edits the mod leaves alone */
   size_t pn=0,pm=0,on=0,om=0;uint8_t *pz=host_file(port,&pn,256u<<20),*pp=pz?zs_decompress(pz,pn,&pm):NULL,*oz=image_file(vi,&on),*op=zs_decompress(oz,on,&om);free(pz);free(oz);
   ModsMerge ms;moved=pp&&op?mods_port_merge(plain,m,op,om,pp,pm,&ms,why,sizeof why):-1;free(pp);free(op);
-  if(moved>=0)snprintf(done,sizeof done,"%u values in %u members (%u values the mod also changes keep the mod's, %u members the mod rebuilt keep the mod's)",
-   ms.words,ms.members-ms.skipped,ms.kept,ms.skipped);
+  if(moved>=0)snprintf(done,sizeof done,"%u values in %u members (%u of them by pane name in %u members the mod rebuilt, %u values with no place there; %u values the mod also changes keep the mod's; %u members the mod dropped or rebuilt past reading keep the mod's)",
+   ms.words,ms.members-ms.skipped,ms.by_name,ms.rebuilt,ms.lost,ms.kept,ms.skipped);
   else fprintf(stderr,"[totk] mods: %s: %s: the port's edits do not merge (%s); trying the quick-menu background fix alone\n",who,name,why);
  }
  if(plain&&moved<0){moved=mods_capture_fix(plain,m,why,sizeof why);if(moved>0)snprintf(done,sizeof done,"the quick-menu background fix alone: %d visibility keys moved from frame 1 to 0",moved);}

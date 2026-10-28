@@ -58,6 +58,19 @@ static size_t make_flan(uint8_t *b, const char *const *panes, const float *f1, i
     w32(s + 4, (uint32_t)size);
     return 0x14 + size;
 }
+/* A BFLYT of the given sections: a pane's name, translate y and scale y; another section (usd1) is zeros. */
+typedef struct { const char *magic, *name; size_t size; float y, sy; } Pane;
+static size_t make_flyt(uint8_t *b, const Pane *s, int n) {
+    memcpy(b, "FLYT", 4); b[4] = 0xFF; b[5] = 0xFE; w16(b + 6, 0x14); w16(b + 0x10, (unsigned)n);
+    size_t pos = 0x14;
+    for (int k = 0; k < n; k++) {
+        uint8_t *p = b + pos; memset(p, 0, s[k].size); memcpy(p, s[k].magic, 4); w32(p + 4, (uint32_t)s[k].size);
+        if (s[k].size >= 84) { snprintf((char *)p + 12, 24, "%s", s[k].name); memcpy(p + 48, &s[k].y, 4); memcpy(p + 72, &s[k].sy, 4); }
+        pos += s[k].size;
+    }
+    w32(b + 12, (uint32_t)pos);
+    return pos;
+}
 /* A SARC of the given members (names sorted is not needed for the lookup). */
 static size_t make_sarc(uint8_t *out, const char *const *names, uint8_t *const *data, const size_t *lens, int n) {
     size_t sfnt = 0x20 + 16 * (size_t)n, at = sfnt + 8, name_off[8];
@@ -251,6 +264,44 @@ int main(void) {
         expect(mods_port_merge(m, mn, g, gn, p, pn, &ms, why, sizeof why) == 0, "merge: already merged");
         expect(mods_port_merge(m, mn, g, gn, (const uint8_t *)"not a SARC", 10, &ms, why, sizeof why) == -1 && strstr(why, "port"), "merge: the port's copy is no SARC");
         free(g); free(p); free(m);
+    }
+    /* A layout and an animation the mod rebuilt (resized): merged by pane name. The game's layout: RootPane, P_BG (a longer
+       section), N_Gone, a user data section. The port squeezes RootPane (sy), moves P_BG (y), stretches it (sy), changes a word
+       past P_BG's base fields, moves N_Gone and changes the user data. The mod adds N_Added in front, drops N_Gone, makes P_BG
+       shorter and sets its own sy. The animation: the game animates A and B, the port moves both keys, the mod animates C, B, D. */
+    {
+        uint8_t *gl = calloc(1, 1024), *pl = calloc(1, 1024), *ml = calloc(1, 1024);
+        size_t gln = make_flyt(gl, (const Pane[]){{"pan1", "RootPane", 84, 0, 1}, {"pic1", "P_BG", 100, 0, 1}, {"pan1", "N_Gone", 84, 0, 1}, {"usd1", "", 12, 0, 0}}, 4);
+        size_t pln = make_flyt(pl, (const Pane[]){{"pan1", "RootPane", 84, 0, 0.9f}, {"pic1", "P_BG", 100, -60, 1.25f}, {"pan1", "N_Gone", 84, 5, 1}, {"usd1", "", 12, 0, 0}}, 4);
+        size_t mln = make_flyt(ml, (const Pane[]){{"pan1", "N_Added", 84, 3, 1}, {"pan1", "RootPane", 84, 0, 1}, {"pic1", "P_BG", 96, 0, 2}, {"usd1", "", 12, 0, 0}}, 4);
+        pl[0x14 + 84 + 88] = 7; pl[0x14 + 84 + 100 + 84 + 8] = 9;   /* past P_BG's base fields; the user data */
+        const char *const ga[] = {"A_00", "B_00"}, *const ma[] = {"C_00", "B_00", "D_00"}; const float one2[] = {1, 1}, half2[] = {0.5f, 0.5f}, one3[] = {1, 1, 1};
+        uint8_t *gf = calloc(1, 4096), *pf = calloc(1, 4096), *mf = calloc(1, 4096);
+        size_t gfn = make_flan(gf, ga, one2, 2), pfn = make_flan(pf, ga, half2, 2), mfn = make_flan(mf, ma, one3, 3);
+        const char *const nm[] = {"blyt/S.bflyt", "anim/S_In.bflan"};
+        uint8_t *gd[] = {gl, gf}, *pd[] = {pl, pf}, *md[] = {ml, mf}; size_t gs[] = {gln, gfn}, ps[] = {pln, pfn}, msz[] = {mln, mfn};
+        uint8_t *g = calloc(1, 16384), *p = calloc(1, 16384), *m = calloc(1, 16384);
+        size_t gn = make_sarc(g, nm, gd, gs, 2), pn = make_sarc(p, nm, pd, ps, 2), mn = make_sarc(m, nm, md, msz, 2);
+        ModsMerge ms; size_t n;
+        expect(mods_port_merge(m, mn, g, gn, p, pn, &ms, why, sizeof why) == 3, "rebuilt: three values written");
+        expect(ms.members == 2 && ms.rebuilt == 2 && ms.skipped == 0 && ms.by_name == 3 && ms.kept == 1 && ms.lost == 4, "rebuilt: counts");
+        uint8_t *l = sarc_member(m, mn, "blyt/S.bflyt", &n); float f;
+        expect(l && n == mln, "rebuilt: the mod's layout keeps its size");
+        if (l) {
+            memcpy(&f, l + 0x14 + 84 + 72, 4); expect(f == 0.9f, "rebuilt: RootPane squeezed (found past the mod's added pane)");
+            memcpy(&f, l + 0x14 + 168 + 48, 4); expect(f == -60, "rebuilt: P_BG moved");
+            memcpy(&f, l + 0x14 + 168 + 72, 4); expect(f == 2, "rebuilt: P_BG keeps the mod's own scale");
+            memcpy(&f, l + 0x14 + 48, 4); expect(f == 3, "rebuilt: the mod's added pane left alone");
+            expect(l[0x14 + 168 + 88] == 0, "rebuilt: past the base fields of a pane the mod resized: not written");
+        }
+        expect(key_frame(m, mn, "anim/S_In.bflan", 1) == 0.5f && key_frame(m, mn, "anim/S_In.bflan", 0) == 1 && key_frame(m, mn, "anim/S_In.bflan", 2) == 1,
+               "rebuilt animation: B's key moved, the mod's own panes left alone");
+        expect(mods_port_merge(m, mn, g, gn, p, pn, &ms, why, sizeof why) == 0 && ms.lost == 4, "rebuilt: already merged");
+        uint8_t junk[16] = "FLYT\xFF\xFE\x14"; uint8_t *jd[] = {ml, junk}; size_t jl[] = {mln, 16};
+        const char *const jn[] = {"blyt/S.bflyt", "anim/S_In.bflan"};
+        mn = make_sarc(m, jn, jd, jl, 2);
+        expect(mods_port_merge(m, mn, g, gn, p, pn, &ms, why, sizeof why) == 2 && ms.rebuilt == 1 && ms.skipped == 1, "rebuilt: an animation that does not read stays the mod's");
+        free(gl); free(pl); free(ml); free(gf); free(pf); free(mf); free(g); free(p); free(m);
     }
 
     char cmd[1200]; snprintf(cmd, sizeof cmd, "rm -rf '%s'", root); if (system(cmd)) {}

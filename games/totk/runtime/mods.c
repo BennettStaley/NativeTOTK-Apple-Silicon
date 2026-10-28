@@ -730,6 +730,102 @@ int mods_capture_fix(uint8_t *sarc, size_t len, char *why, size_t cap) {
     const float zero = 0.0f; for (int k = 0; k < nmove; k++) memcpy(move[k], &zero, 4);
     return nmove;
 }
+/* ---- the port's edits on a member the mod rebuilt: matched by name instead of by offset ---- */
+/* A named piece of a layout (a pane section) or of an animation (one target's key list): key = name (len bytes, NUL padded),
+   tag (the section's or the animation tag's magic), id (an animation target: its index, target, curve and the entry's
+   type); fixed = how many bytes from at still line up when the mod's copy of it has another size (a pane's base fields,
+   an animation's keys by index). */
+typedef struct { const uint8_t *name; unsigned len; uint32_t tag, id; uint8_t *at; size_t size, fixed; } Part;
+enum { PANE_BASE = 84 };   /* a pane section's head: magic, size, flags, name, user data, translate, rotate, scale, size */
+static size_t flyt_parts(uint8_t *b, size_t n, Part *out, size_t cap) {   /* the panes of a BFLYT, in order; (size_t)-1 = not one */
+    static const char *const PANES[] = {"pan1", "pic1", "txt1", "wnd1", "bnd1", "prt1", "ali1", "scr1"};
+    if (n < 0x14 || memcmp(b, "FLYT", 4) || b[4] != 0xFF || b[5] != 0xFE) return (size_t)-1;
+    size_t pos = le16(b + 6), np = 0; unsigned sections = le16(b + 0x10);
+    for (unsigned s = 0; s < sections; s++) {
+        if (pos + 8 > n) return (size_t)-1;
+        size_t size = le32(b + pos + 4); if (size < 8 || size > n - pos) return (size_t)-1;
+        for (size_t k = 0; k < sizeof PANES / sizeof *PANES; k++)
+            if (!memcmp(b + pos, PANES[k], 4) && size >= PANE_BASE) { if (np == cap) return (size_t)-1; out[np++] = (Part){b + pos + 12, 24, le32(b + pos), 0, b + pos, size, PANE_BASE}; break; }
+        pos += size;
+    }
+    return np;
+}
+static size_t flan_parts(uint8_t *b, size_t n, Part *out, size_t cap) {   /* every key list of a BFLAN (step and hermite curves); (size_t)-1 = not one */
+    if (n < 0x14 || memcmp(b, "FLAN", 4) || b[4] != 0xFF || b[5] != 0xFE) return (size_t)-1;
+    size_t pos = 0x14, np = 0; unsigned sections = le16(b + 0x10);
+    for (unsigned s = 0; s < sections; s++) {
+        if (pos + 8 > n) return (size_t)-1;
+        size_t size = le32(b + pos + 4); if (size < 8 || size > n - pos) return (size_t)-1;
+        if (!memcmp(b + pos, "pai1", 4)) {
+            if (size < 20) return (size_t)-1;
+            size_t count = le16(b + pos + 14), table = pos + le32(b + pos + 16);
+            for (size_t e = 0; e < count; e++) {
+                if (table + 4 * e + 4 > n) return (size_t)-1;
+                size_t eo = pos + le32(b + table + 4 * e); if (eo + 32 > n) return (size_t)-1;
+                for (unsigned t = 0; t < b[eo + 28]; t++) {
+                    if (eo + 32 + 4 * t + 4 > n) return (size_t)-1;
+                    size_t to = eo + le32(b + eo + 32 + 4 * t); if (to + 8 > n) return (size_t)-1;
+                    for (unsigned g = 0; g < b[to + 4]; g++) {
+                        if (to + 8 + 4 * g + 4 > n) return (size_t)-1;
+                        size_t go = to + le32(b + to + 8 + 4 * g); if (go + 12 > n) return (size_t)-1;
+                        unsigned curve = b[go + 2]; size_t key = curve == 1 ? 8 : curve == 2 ? 12 : 0;
+                        size_t nk = le16(b + go + 4), ko = go + le32(b + go + 8); if (!key) continue;
+                        if (ko > n || nk * key > n - ko || np == cap) return (size_t)-1;
+                        uint32_t id = (uint32_t)b[go] | (uint32_t)b[go + 1] << 8 | curve << 16 | (uint32_t)b[eo + 29] << 24;
+                        out[np++] = (Part){b + eo, 28, le32(b + to), id, b + ko, nk * key, nk * key};
+                    }
+                }
+            }
+        }
+        pos += size;
+    }
+    return np;
+}
+static int part_same(const Part *a, const Part *b) {
+    return a->tag == b->tag && a->id == b->id && !strncmp((const char *)a->name, (const char *)b->name, a->len < b->len ? a->len : b->len);
+}
+static size_t part_nth(const Part *ps, size_t i) { size_t k = 0; for (size_t j = 0; j < i; j++) k += part_same(&ps[j], &ps[i]); return k; }
+static unsigned words_changed(const uint8_t *o, const uint8_t *p, size_t n) {
+    unsigned c = 0; for (size_t w = 0; w < n; w += 4) c += memcmp(o + w, p + w, n - w < 4 ? n - w : 4) != 0; return c;
+}
+/* Over n bytes: a word the port changed that the mod (m) still has as the game ships it (o) takes the port's (p) value; one
+   the mod changed as well keeps the mod's. */
+static void merge_words(uint8_t *m, const uint8_t *o, const uint8_t *p, size_t n, ModsMerge *st) {
+    for (size_t w = 0; w < n; w += 4) {
+        size_t wn = n - w < 4 ? n - w : 4;
+        if (!memcmp(o + w, p + w, wn) || !memcmp(m + w, p + w, wn)) continue;
+        if (memcmp(m + w, o + w, wn)) { st->kept++; continue; }
+        memcpy(m + w, p + w, wn); st->words++;
+    }
+}
+/* A member the mod resized (ml != ol): each pane (BFLYT) or animation key list (BFLAN) the port changed is found by name in the
+   mod's copy and merged as merge_words does. 0 = done, -1 = a member that is not a layout or does not read. */
+static int merge_by_name(uint8_t *m, size_t ml, const uint8_t *o, const uint8_t *p, size_t ol, ModsMerge *st) {
+    int flyt = ol >= 4 && !memcmp(o, "FLYT", 4);
+    if (!flyt && (ol < 4 || memcmp(o, "FLAN", 4))) return -1;
+    size_t (*parts)(uint8_t *, size_t, Part *, size_t) = flyt ? flyt_parts : flan_parts, oc = ol / 8 + 1, mc = ml / 8 + 1;
+    Part *op = malloc(oc * sizeof *op), *mp = malloc(mc * sizeof *mp);
+    size_t on = op ? parts((uint8_t *)o, ol, op, oc) : (size_t)-1, mn = mp ? parts(m, ml, mp, mc) : (size_t)-1;
+    if (on == (size_t)-1 || mn == (size_t)-1) { free(op); free(mp); return -1; }
+    unsigned before = st->words, inside = 0;
+    for (size_t i = 0; i < on; i++) {
+        const uint8_t *pa = p + (op[i].at - o);   /* the port edits in place: at the game's offsets */
+        unsigned changed = words_changed(op[i].at, pa, op[i].size); if (!changed) continue;
+        inside += changed;
+        size_t nth = part_nth(op, i), j = 0, seen = 0;
+        for (; j < mn; j++) if (part_same(&op[i], &mp[j]) && seen++ == nth) break;
+        if (j == mn) { st->lost += changed; continue; }   /* the mod's copy has no such pane or key list */
+        size_t span = op[i].size;
+        if (mp[j].size != op[i].size) {   /* resized too: the part of it that still lines up */
+            span = op[i].fixed < mp[j].fixed ? op[i].fixed : mp[j].fixed; if (span > op[i].size) span = op[i].size;
+            st->lost += words_changed(op[i].at + span, pa + span, op[i].size - span);
+        }
+        merge_words(mp[j].at, op[i].at, pa, span, st);
+    }
+    unsigned all = words_changed(o, p, ol); if (all > inside) st->lost += all - inside;   /* changes outside every pane / key list */
+    st->by_name += st->words - before;
+    free(op); free(mp); return 0;
+}
 int mods_port_merge(uint8_t *sarc, size_t len, const uint8_t *orig, size_t orig_len, const uint8_t *port, size_t port_len,
                     ModsMerge *st, char *why, size_t cap) {
     char scratch[8]; if (!why || !cap) { why = scratch; cap = sizeof scratch; }
@@ -751,15 +847,12 @@ int mods_port_merge(uint8_t *sarc, size_t len, const uint8_t *orig, size_t orig_
         if (!o || ol != pl || !memcmp(o, p, pl)) continue;   /* a member the port adds, resizes or leaves as the game ships it */
         st->members++;
         uint8_t *m = sarc_member(sarc, len, name, &ml);
-        if (!m || ml != ol) { st->skipped++; continue; }   /* the mod rebuilt or dropped that member: its own copy stays */
-        /* 4-byte words from the member's start (the port's edits are floats in place): a word the mod left as the game ships
-           it takes the port's value; one the mod changed too keeps the mod's. */
-        for (size_t w = 0; w < pl; w += 4) {
-            size_t wn = pl - w < 4 ? pl - w : 4;
-            if (!memcmp(o + w, p + w, wn) || !memcmp(m + w, p + w, wn)) continue;
-            if (memcmp(m + w, o + w, wn)) { st->kept++; continue; }
-            memcpy(m + w, p + w, wn); st->words++;
+        if (!m) { st->skipped++; continue; }   /* the mod dropped that member */
+        if (ml != ol) {   /* the mod rebuilt it: by pane / animated pane name (a layout or an animation), else its own copy stays */
+            if (merge_by_name(m, ml, o, p, ol, st)) st->skipped++; else st->rebuilt++;
+            continue;
         }
+        merge_words(m, o, p, pl, st);   /* 4-byte words from the member's start: the port's edits are floats in place */
     }
     return (int)st->words;
 }

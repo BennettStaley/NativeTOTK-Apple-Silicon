@@ -121,8 +121,21 @@ int mods_capture_fix(uint8_t *sarc, size_t len, char *why, size_t cap);
 /* The port's own edits of that archive carried over to a mod's copy (all of them: the quick-menu fix and the layouts for the
    output's shape, such as Native 16:10's taller canvas). The edits are values changed in place, so per member the port's copy
    (port) is compared with the game's (orig) word by word; each changed word the mod (sarc, edited in place) still has as the
-   game ships it takes the port's value, a word the mod changed as well keeps the mod's. A member the mod resized or lacks is
-   left as the mod has it. Returns the words written (st has the counts), or -1 with why filled when an archive is no SARC. */
-typedef struct { unsigned members, skipped, words, kept; } ModsMerge;
+   game ships it takes the port's value, a word the mod changed as well keeps the mod's. A member the mod resized (rebuilt: a
+   pane added or removed) is merged by name instead: each pane of a layout (BFLYT) the port changed is found by its name (the
+   nth pane of that name and kind) in the mod's copy and merged the same way (the whole pane section, or its base fields -
+   translate, rotate, scale, size - when the mod resized the pane too); in an animation (BFLAN) each key list by animated
+   pane, tag, target and curve, keys by index. A changed value the mod's rebuilt copy has no place for (its pane is gone)
+   counts in lost. A member the mod lacks, or resized and that is no layout or animation (or does not read), is left as
+   the mod has it (skipped). Returns the words written (st has the counts), or -1 with why filled when an archive is no SARC. */
+typedef struct {
+    unsigned members;            /* members the port changes */
+    unsigned skipped;            /* of those, left as the mod has them */
+    unsigned words;              /* values written (by_name of them in members the mod rebuilt) */
+    unsigned kept;               /* values the mod changed as well: the mod's stay */
+    unsigned rebuilt;            /* members the mod resized, merged by pane name */
+    unsigned by_name;
+    unsigned lost;               /* the port's values in rebuilt members with no place in the mod's copy */
+} ModsMerge;
 int mods_port_merge(uint8_t *sarc, size_t len, const uint8_t *orig, size_t orig_len, const uint8_t *port, size_t port_len,
                     ModsMerge *st, char *why, size_t cap);
