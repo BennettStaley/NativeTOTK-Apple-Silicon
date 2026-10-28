@@ -11,12 +11,19 @@ void runtime_survey_tick(uint64_t frame);
 void runtime_survey_cancel_user(void);
 /* Noclip (the Cheats tab, Mac; 1.0.0 and 1.4.3): while on, the player is held each frame at a point the left stick moves
    relative to the camera and the triggers (ZR / RT up, ZL / LT down) raise and lower, speed in metres a second; walls and
-   the ground do not stop him. */
+   the ground do not stop him. L / LB and R / RB step the speed down and up. On a controller, L3 + d-pad down held for half
+   a second turns it on or off (gamepad.m). */
 int runtime_noclip_available(void);
 void runtime_noclip_set(int on);
 int runtime_noclip_on(void);
 void runtime_noclip_set_speed(float metres_per_second);
 float runtime_noclip_speed(void);
+enum { NOCLIP_NSPEEDS = 5 };
+extern const int runtime_noclip_speeds[NOCLIP_NSPEEDS];   /* the speeds the Cheats tab and L / R step through, m/s */
+void runtime_noclip_step_speed(int dir);                  /* to the next speed up (1) or down (-1) */
+/* The npad buttons noclip keeps from the game while on (input.c): the triggers and the shoulder buttons, so ZR does not
+   draw the bow (and slow time in the air) and ZL does not raise the shield while flying. 0 while off. */
+uint64_t runtime_noclip_taken(void);
 /* Teleport: noclip on, the player held at xyz (a map pin's position) from the next frame. 0 when refused. */
 int runtime_noclip_goto(const float xyz[3]);
 /* Set by the 1.4.3 patches in survey sessions: the benchmark camera block (world_survey.c). */

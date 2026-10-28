@@ -225,6 +225,7 @@ static struct { int pending; float xyz[3]; } noclip_goto;   /* a teleport for th
 enum { NOCLIP_FLIGHT_SPEED = 120, NOCLIP_FLIGHT_CLEAR = 60 };   /* metres a second, metres */
 static struct { int on; float to[3], cruise; } noclip_flight;
 enum { NOCLIP_UP = 1 << 9, NOCLIP_DOWN = 1 << 8 };   /* npad ZR, ZL: the triggers, the same on every controller layout */
+enum { NOCLIP_SLOWER = 1 << 6, NOCLIP_FASTER = 1 << 7 };   /* npad L, R: the shoulder buttons */
 void dm_gfx_camera_want(int on);   /* nvn_mtl.m: the game camera of each frame, for flying relative to it */
 int dm_gfx_camera(float pos[3], float right[3], uint64_t *frame);
 /* survey route (NX Optimizer's benchmark, 2026-10-20): one scene of UltraCam's benchmark, played as UltraCam plays it
@@ -621,6 +622,13 @@ int runtime_noclip_goto(const float xyz[3]) {
     return 1;
 }
 float runtime_noclip_speed(void) { uint32_t bits = atomic_load(&noclip_speed_bits); float v; memcpy(&v, &bits, 4); return v; }
+const int runtime_noclip_speeds[NOCLIP_NSPEEDS] = {5, 12, 25, 50, 100};
+void runtime_noclip_step_speed(int dir) {
+    int at = 0; while (at < NOCLIP_NSPEEDS - 1 && runtime_noclip_speeds[at] < (int)lroundf(runtime_noclip_speed())) at++;
+    at += dir; if (at < 0) at = 0; if (at > NOCLIP_NSPEEDS - 1) at = NOCLIP_NSPEEDS - 1;
+    runtime_noclip_set_speed((float)runtime_noclip_speeds[at]);
+}
+uint64_t runtime_noclip_taken(void) { return atomic_load(&noclip_wanted) ? NOCLIP_UP | NOCLIP_DOWN | NOCLIP_SLOWER | NOCLIP_FASTER : 0; }
 /* Frame-end thread: the first frame with a player takes his position; after that he is set to the held point, which the
    left stick moves relative to the camera (up: away from it, right: to the screen's right; level, whatever the camera's
    pitch) and the triggers raise (ZR / RT) and lower (ZL / LT). Without a camera yet, his facing. Gravity and collisions
@@ -672,6 +680,12 @@ static void noclip_tick(uintptr_t actor) {
         if (len > 1e-3f) { mx = fx / len * push; mz = fz / len * push; }
     }
     uint64_t buttons = runtime_input_buttons();
+    static uint64_t buttons_before;
+    uint64_t pressed = buttons & ~buttons_before; buttons_before = buttons;
+    if (pressed & (NOCLIP_SLOWER | NOCLIP_FASTER)) {
+        runtime_noclip_step_speed(pressed & NOCLIP_FASTER ? 1 : -1);
+        fprintf(stderr, "[noclip] speed %.0f m/s\n", runtime_noclip_speed());
+    }
     float up = (buttons & NOCLIP_UP ? 1.0f : 0.0f) - (buttons & NOCLIP_DOWN ? 1.0f : 0.0f);
     float next[3] = {noclip.xyz[0] + mx * speed * dt, noclip.xyz[1] + up * speed * dt, noclip.xyz[2] + mz * speed * dt};
     if (noclip_flight.on) {   /* flying to a teleport target; the stick or the triggers end it */

@@ -17,6 +17,7 @@
 #include "controller_map.h"   // the player's button layout (controls.txt)
 #include "switch_left_fallback.h"
 #include "mouse_look.h"       // mouse mode: movement as the right stick and the gyro
+#include "world_survey.h"     // noclip: the L3 + d-pad down chord
 
 static pthread_mutex_t gamepadLock = PTHREAD_MUTEX_INITIALIZER;
 static RuntimeGamepadState gamepadState;
@@ -522,6 +523,22 @@ static void refresh_gamepads(void) {   // on the main queue (controller value ha
         chordSince = now;   /* no further event comes while both stay held: look again when the hold is long enough */
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (MENU_CHORD_MS + 10) * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{ refresh_gamepads(); });
     } else if (!chordFired && now - chordSince >= MENU_CHORD_MS * 1000000ULL) { chordFired = 1; runtime_front_settings_toggle(); }
+    /* Noclip (world_survey.c): L3 + d-pad down held for NOCLIP_CHORD_MS turns it on or off, on the physical buttons whatever
+       they are mapped to. Until then the game has them (a crouch and a whistle); once it fires it does not, until both are
+       let go. Not while a menu has the controller. */
+    enum { NOCLIP_CHORD_MS = 500 };
+    static int noclipChordFired; static uint64_t noclipChordSince;
+    const uint64_t noclipChord = (1ULL << 4) | (1ULL << 15);
+    if ((physical & noclipChord) != noclipChord || textCapture || !runtime_noclip_available()) {
+        noclipChordSince = 0;
+        if (!(physical & noclipChord)) noclipChordFired = 0;
+    } else if (!noclipChordSince) {
+        noclipChordSince = now;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (NOCLIP_CHORD_MS + 10) * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{ refresh_gamepads(); });
+    } else if (!noclipChordFired && now - noclipChordSince >= NOCLIP_CHORD_MS * 1000000ULL) {
+        noclipChordFired = 1; runtime_noclip_set(!runtime_noclip_on());
+    }
+    if (noclipChordFired) suppressed |= physical & noclipChord;
     for (int i = 0; i < CONTROLLER_BUTTONS; i++) {
         uint64_t bit = 1ULL << i;
         int kind = controller_mode_kind(controllerModes[i]);

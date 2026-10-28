@@ -64,8 +64,6 @@ static NSWindow *settings_window(void);   /* frontend.m: the game window */
     MapPin pins[MAP_PINS_MAX]; int npins;   /* the Cheats tab's Teleport rows (map_pins.h), read when the tab is built */   /* the Cheats tab: the folded list is open; the list was checked this run */
 }
 static TOTKSettingsPanel *settingsPanel;
-static const int NOCLIP_SPEEDS[] = {5, 12, 25, 50, 100};   /* the Cheats tab's noclip speeds, metres a second (12 by default) */
-enum { NOCLIP_NSPEEDS = (int)(sizeof NOCLIP_SPEEDS / sizeof *NOCLIP_SPEEDS) };
 enum { PANEL_WIDTH = 480, PANEL_MARGIN = 16, PAGE_STEP = 8 /* rows per LT / RT on a pane without row frames */,
        SAVES_ROW = -1, CHEATS_FOLDER_ROW = -2, CHEATS_OFF_ROW = -3, CHEATS_RESTART_ROW = -4, CHEATS_DB_ROW = -5, CHEATS_UNAVAILABLE_ROW = -6,
        CHEATS_NOCLIP_ROW = -7, CHEATS_NOCLIP_SPEED_ROW = -8, CHEATS_PIN_ROW = -100 /* - k: map pin k */,
@@ -560,11 +558,11 @@ static int cheat_choice_members(int leader, int *all, int *usable, int max, int 
         NSSwitch *fly = [NSSwitch new]; fly.state = runtime_noclip_on() ? NSControlStateValueOn : NSControlStateValueOff;
         fly.target = self; fly.action = @selector(noclipSwitched:);
         [self addCheatsRow:[self cheatsRow:@"Noclip (fly through walls)"
-                                    about:@"Left stick flies Link relative to the camera; RT / ZR rises, LT / ZL sinks (keyboard: WASD, Shift, Option). Save first: flying out of bounds can break events or drop you into unloaded ground."
+                                    about:@"Left stick flies Link relative to the camera; RT / ZR rises, LT / ZL sinks, LB / RB change the speed; the game does not get those four while noclip is on (keyboard: WASD, Shift, Option). On a controller, hold L3 + d-pad down for half a second to turn it on or off. Save first: flying out of bounds can break events or drop you into unloaded ground."
                                    detail:runtime_noclip_on() ? @"On: Link is held where you steer him" : @"Off at every start"
                                     color:runtime_noclip_on() ? NSColor.systemGreenColor : nil control:fly] id:CHEATS_NOCLIP_ROW];
         NSPopUpButton *speed = [NSPopUpButton new]; speed.controlSize = NSControlSizeSmall; speed.refusesFirstResponder = YES;
-        for (int i = 0; i < NOCLIP_NSPEEDS; i++) { [speed addItemWithTitle:[NSString stringWithFormat:@"%d m/s", NOCLIP_SPEEDS[i]]]; speed.lastItem.tag = NOCLIP_SPEEDS[i]; }
+        for (int i = 0; i < NOCLIP_NSPEEDS; i++) { [speed addItemWithTitle:[NSString stringWithFormat:@"%d m/s", runtime_noclip_speeds[i]]]; speed.lastItem.tag = runtime_noclip_speeds[i]; }
         [speed selectItemWithTag:(NSInteger)lroundf(runtime_noclip_speed())];
         speed.target = self; speed.action = @selector(noclipSpeedChosen:);
         [self addCheatsRow:[self cheatsRow:@"Noclip speed" detail:@"How fast Link flies (← → change it)" color:nil control:speed] id:CHEATS_NOCLIP_SPEED_ROW];
@@ -676,9 +674,7 @@ static int cheat_choice_members(int leader, int *all, int *usable, int max, int 
 - (void)noclipSwitched:(NSSwitch *)s { runtime_noclip_set(s.state == NSControlStateValueOn); [self rebuildKeepingPlace]; }
 - (void)noclipSpeedChosen:(NSPopUpButton *)b { runtime_noclip_set_speed((float)b.selectedTag); [self.window makeFirstResponder:self]; }
 - (void)stepNoclipSpeed:(int)dir {
-    int at = 0; while (at < NOCLIP_NSPEEDS - 1 && NOCLIP_SPEEDS[at] < (int)lroundf(runtime_noclip_speed())) at++;
-    at = MAX(0, MIN(NOCLIP_NSPEEDS - 1, at + dir));
-    runtime_noclip_set_speed((float)NOCLIP_SPEEDS[at]); [self rebuildKeepingPlace];
+    runtime_noclip_step_speed(dir); [self rebuildKeepingPlace];
 }
 - (void)cheatsAllOff {
     runtime_noclip_set(0);
