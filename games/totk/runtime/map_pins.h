@@ -1,4 +1,4 @@
-/* The player's map pins (Mac Cheats tab: Teleport to map pin), read from the newest save of the profile, the way a save
+/* The player's map pins (Mac Tools › Teleport), read from the newest save of the profile, the way a save
    editor does: progress.sav is a table of (GameData name hash, value or offset) pairs from 0x28 up to the GUID table
    (hash 0xa3db7114); an array's offset points at its length and then its elements. MapData.IconData.MapPinData.Pos
    (0x5f93e70f, Vector3Array) holds the pins' positions and .Type (0x1b62aa42, EnumArray) their colours, Invalid for an

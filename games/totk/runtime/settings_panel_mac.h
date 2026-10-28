@@ -68,7 +68,7 @@ static NSWindow *settings_window(void);   /* frontend.m: the game window */
     uint64_t padPrev; double padRepeatAt; int padDir;
     BOOL cheatsUnavailableShown, cheatDbAsked, towersShown, shrinesShown;   /* towersShown, shrinesShown: the Teleport lists are open */
     Landmark marks[LANDMARKS];   /* the towers and shrines with the last save's state (landmarks.h), when the tab is built */
-    MapPin pins[MAP_PINS_MAX]; int npins;   /* the Cheats tab's Teleport rows (map_pins.h), read when the tab is built */   /* the Cheats tab: the folded list is open; the list was checked this run */
+    MapPin pins[MAP_PINS_MAX]; int npins;   /* the Teleport tab's map pin rows (map_pins.h), read when the tab is built */
 }
 static TOTKSettingsPanel *settingsPanel;
 /* The towers' and shrines' names and places (landmarks.h), read from the RomFS once a run, off the main thread. */
@@ -565,31 +565,7 @@ static int cheat_choice_members(int leader, int *all, int *usable, int max, int 
     NSString *file = [NSString stringWithFormat:@"%s.txt", *bid ? bid : "<build ID>"];
     BOOL hasFolder = folder && *folder && strcmp(folder, "0");
     NSString *where = hasFolder ? [@(folder) stringByAbbreviatingWithTildeInPath] : @"(off: TOTK_CHEATS_DIR=0)";
-    if (runtime_noclip_available()) {   /* world_survey.c: not a cheat file's code, so above the files' cheats */
-        NSSwitch *fly = [NSSwitch new]; fly.state = runtime_noclip_on() ? NSControlStateValueOn : NSControlStateValueOff;
-        fly.target = self; fly.action = @selector(noclipSwitched:);
-        [self addCheatsRow:[self cheatsRow:@"Noclip (fly through walls)"
-                                    about:@"Left stick flies Link relative to the camera; RT / ZR rises, LT / ZL sinks, LB / RB change the speed; the game does not get those four while noclip is on (keyboard: WASD, Shift, Option). On a controller, hold L3 + d-pad down for half a second to turn it on or off. Save first: flying out of bounds can break events or drop you into unloaded ground."
-                                   detail:runtime_noclip_on() ? @"On: Link is held where you steer him" : @"Off at every start"
-                                    color:runtime_noclip_on() ? NSColor.systemGreenColor : nil control:fly] id:CHEATS_NOCLIP_ROW];
-        NSPopUpButton *speed = [NSPopUpButton new]; speed.controlSize = NSControlSizeSmall; speed.refusesFirstResponder = YES;
-        for (int i = 0; i < NOCLIP_NSPEEDS; i++) { [speed addItemWithTitle:[NSString stringWithFormat:@"%d m/s", runtime_noclip_speeds[i]]]; speed.lastItem.tag = runtime_noclip_speeds[i]; }
-        [speed selectItemWithTag:(NSInteger)lroundf(runtime_noclip_speed())];
-        speed.target = self; speed.action = @selector(noclipSpeedChosen:);
-        [self addCheatsRow:[self cheatsRow:@"Noclip speed" detail:@"How fast Link flies (← → change it)" color:nil control:speed] id:CHEATS_NOCLIP_SPEED_ROW];
-        const char *profile = getenv("TOTK_PROFILE_DIR");
-        npins = profile ? map_pins_read(profile, pins, MAP_PINS_MAX, NULL, 0) : -1;
-        for (int k = 0; k < npins; k++) {
-            NSButton *go = [self cheatsButton:@"Go" action:@selector(pinGo:)]; go.tag = k;
-            [self addCheatsRow:[self cheatsRow:[NSString stringWithFormat:@"Teleport to the %@ map pin", [@(pins[k].colour) isEqualToString:@"LightBlue"] ? @"light blue" : @(pins[k].colour).lowercaseString]
-                                        detail:[NSString stringWithFormat:@"%.0f, %.0f, %.0f · flies you there with noclip (120 m/s; the stick stops it), then holds you: switch noclip off to land", pins[k].xyz[0], pins[k].xyz[1], pins[k].xyz[2]]
-                                         color:nil control:go] id:CHEATS_PIN_ROW - k];
-        }
-        if (npins <= 0)
-            [self addCheatsRow:[self cheatsRow:@"Teleport to a map pin" detail:npins < 0 ? @"No save yet." :
-                                 @"No map pins in the last save: place a pin on the map, then save (or wait for an autosave)." color:nil control:nil] id:CHEATS_PIN_ROW - MAP_PINS_MAX];
-        [self buildLandmarks:profile];
-    }
+    if (runtime_noclip_available()) [self addNoclipRows];   /* world_survey.c: not a cheat file's code, so above the files' cheats */
     if (runtime_cheats_count()) {
         NSButton *off = [self cheatsButton:@"Turn off" action:@selector(cheatsAllOff)]; off.enabled = cheats_any_on() || runtime_noclip_on();
         NSString *how = runtime_cheats_live_code() ? @"All of them stop at once. " : @"Live cheats stop at once; code patches after a restart. ";
@@ -632,6 +608,40 @@ static int cheat_choice_members(int leader, int *all, int *usable, int max, int 
     }
 }
 /* Teleport to a Skyview Tower / a shrine: two folded lists, what the newest save has not done yet first, by name. */
+/* Noclip's switch and speed: on the Cheats tab, and on the Teleport tab, where switching it off lands. */
+- (void)addNoclipRows {
+    NSSwitch *fly = [NSSwitch new]; fly.state = runtime_noclip_on() ? NSControlStateValueOn : NSControlStateValueOff;
+    fly.target = self; fly.action = @selector(noclipSwitched:);
+    [self addCheatsRow:[self cheatsRow:@"Noclip (fly through walls)"
+                                about:@"Left stick flies Link relative to the camera; RT / ZR rises, LT / ZL sinks, LB / RB change the speed; the game does not get those four while noclip is on (keyboard: WASD, Shift, Option). On a controller, hold L3 + d-pad down for half a second to turn it on or off. Save first: flying out of bounds can break events or drop you into unloaded ground."
+                               detail:runtime_noclip_on() ? @"On: Link is held where you steer him" : @"Off at every start"
+                                color:runtime_noclip_on() ? NSColor.systemGreenColor : nil control:fly] id:CHEATS_NOCLIP_ROW];
+    NSPopUpButton *speed = [NSPopUpButton new]; speed.controlSize = NSControlSizeSmall; speed.refusesFirstResponder = YES;
+    for (int i = 0; i < NOCLIP_NSPEEDS; i++) { [speed addItemWithTitle:[NSString stringWithFormat:@"%d m/s", runtime_noclip_speeds[i]]]; speed.lastItem.tag = runtime_noclip_speeds[i]; }
+    [speed selectItemWithTag:(NSInteger)lroundf(runtime_noclip_speed())];
+    speed.target = self; speed.action = @selector(noclipSpeedChosen:);
+    [self addCheatsRow:[self cheatsRow:@"Noclip speed" detail:@"How fast Link flies (← → change it)" color:nil control:speed] id:CHEATS_NOCLIP_SPEED_ROW];
+}
+/* ---- the Teleport tab: the map pins, the Skyview Towers and the shrines; each Go flies Link there with noclip ---- */
+- (void)buildTeleport {
+    if (!runtime_noclip_available()) {
+        [self addCheatsRow:[self cheatsRow:@"Teleport" detail:@"Not available in this game version: teleporting flies Link there with noclip, which needs the 1.0.0 or 1.4.3 build." color:nil control:nil] id:CHEATS_UNAVAILABLE_ROW];
+        return;
+    }
+    [self addNoclipRows];
+    const char *profile = getenv("TOTK_PROFILE_DIR");
+    npins = profile ? map_pins_read(profile, pins, MAP_PINS_MAX, NULL, 0) : -1;
+    for (int k = 0; k < npins; k++) {
+        NSButton *go = [self cheatsButton:@"Go" action:@selector(pinGo:)]; go.tag = k;
+        [self addCheatsRow:[self cheatsRow:[NSString stringWithFormat:@"Teleport to the %@ map pin", [@(pins[k].colour) isEqualToString:@"LightBlue"] ? @"light blue" : @(pins[k].colour).lowercaseString]
+                                    detail:[NSString stringWithFormat:@"%.0f, %.0f, %.0f · flies you there with noclip (120 m/s; the stick stops it), then holds you: switch noclip off to land", pins[k].xyz[0], pins[k].xyz[1], pins[k].xyz[2]]
+                                     color:nil control:go] id:CHEATS_PIN_ROW - k];
+    }
+    if (npins <= 0)
+        [self addCheatsRow:[self cheatsRow:@"Teleport to a map pin" detail:npins < 0 ? @"No save yet." :
+                             @"No map pins in the last save: place a pin on the map, then save (or wait for an autosave)." color:nil control:nil] id:CHEATS_PIN_ROW - MAP_PINS_MAX];
+    [self buildLandmarks:profile];
+}
 - (void)buildLandmarks:(const char *)profile {
     if (!landmarks_read) {
         landmarks_read = 1;
@@ -642,7 +652,7 @@ static int cheat_choice_members(int leader, int *all, int *usable, int max, int 
             dispatch_async(dispatch_get_main_queue(), ^{
                 if (placed) memcpy(landmark_places, got, sizeof landmark_places);
                 free(got); landmarks_read = placed ? 2 : 3;
-                if (self.superview && self.kind == MENU_CHEATS) [self rebuildKeepingPlace];
+                if (self.superview && self.kind == MENU_TELEPORT) [self rebuildKeepingPlace];
             });
         });
     }
@@ -819,6 +829,7 @@ static int cheat_choice_members(int leader, int *all, int *usable, int max, int 
         [list addArrangedSubview:row]; [rows addObject:row]; [rowSetting addObject:@(i)];
     }
     if (kind == MENU_CHEATS) [self buildCheats];
+    else if (kind == MENU_TELEPORT) [self buildTeleport];
     else if (kind == MENU_SAVES) {
         NSView *saves = [self savesRow];
         [list addArrangedSubview:saves]; [rows addObject:saves]; [rowSetting addObject:@(SAVES_ROW)];

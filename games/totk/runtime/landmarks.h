@@ -1,4 +1,4 @@
-/* The 15 Skyview Towers and 152 shrines (Mac Cheats tab: Teleport to a tower / shrine), read from the game's own RomFS
+/* The 15 Skyview Towers and 152 shrines (Mac Tools › Teleport), read from the game's own RomFS
    and the player's newest save; nothing of the game is kept in the port.
    Places: the surface map's static actors (the Banc/MainField files ending _Static.bcett.byml.zs, BYML v7). A tower is
    FldObj_Cannon_A_01 with Dynamic.TowerNo "Tower01".."Tower15" and its door FldObj_CannonDoor_A_01 a few metres out; a

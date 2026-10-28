@@ -220,7 +220,7 @@ static void *input_file(void *arg) {
             extern void dm_gfx_anomdump(void); dm_gfx_anomdump();
         } else if (sscanf(line, "querylog %u %n", &code, &used) == 1 && used && !line[used] && code > 0 && code <= 600) {
             extern void dm_gfx_querylog_next(long n); dm_gfx_querylog_next((long)code);   /* occlusion query results of the next n frames */
-        } else if (!strncmp(line, "noclip goto ", 12)) {   /* "noclip goto X Y Z": the Cheats tab's Teleport to map pin */
+        } else if (!strncmp(line, "noclip goto ", 12)) {   /* "noclip goto X Y Z": Tools › Teleport */
             float xyz[3]; if (sscanf(line + 12, "%f %f %f", &xyz[0], &xyz[1], &xyz[2]) == 3) runtime_noclip_goto(xyz);
         } else if (!strcmp(line, "noclip on\n") || !strcmp(line, "noclip off\n")) {   /* the Cheats tab's noclip switch (world_survey.c) */
             runtime_noclip_set(line[8] == 'n');

@@ -33,20 +33,20 @@ typedef struct {
 
 /* The menu: four top tabs, each a row of sections. A section either lists the settings whose page is its name
    (SETTINGS_PAGES, in menu order: settings.txt is grouped the same way) or is a page of its own (Mods, Saves, Cheats,
-   Spawn), which holds no settings, so Reset never touches mods, saves, cheats or the spawner's favorites. */
+   Teleport, Spawn), which holds no settings, so Reset never touches mods, saves, cheats or the spawner's favorites. */
 static const char *const SETTINGS_PAGES[] = {"Display", "Frame rate", "Controls", "Audio", "Interface", "Image", "Effects",
                                              "World detail", "Downloads", "World", "Camera"};
 enum { SETTINGS_NPAGES = sizeof SETTINGS_PAGES / sizeof *SETTINGS_PAGES };
 static const char *const SETTINGS_TABS[] = {"Game", "Graphics", "Content", "Tools"};
 enum { SETTINGS_NTABS = sizeof SETTINGS_TABS / sizeof *SETTINGS_TABS };
-enum { MENU_SETTINGS, MENU_MODS, MENU_SAVES, MENU_CHEATS, MENU_SPAWN };
+enum { MENU_SETTINGS, MENU_MODS, MENU_SAVES, MENU_CHEATS, MENU_SPAWN, MENU_TELEPORT };
 typedef struct { int tab; const char *name; int kind; } SettingsSection;
 static const SettingsSection SETTINGS_SECTIONS[] = {
     {0, "Display", MENU_SETTINGS}, {0, "Frame rate", MENU_SETTINGS}, {0, "Controls", MENU_SETTINGS}, {0, "Audio", MENU_SETTINGS},
     {0, "Interface", MENU_SETTINGS},
     {1, "Image", MENU_SETTINGS}, {1, "Effects", MENU_SETTINGS}, {1, "World detail", MENU_SETTINGS},
     {2, "Mods", MENU_MODS}, {2, "Saves", MENU_SAVES}, {2, "Downloads", MENU_SETTINGS},
-    {3, "Cheats", MENU_CHEATS}, {3, "Spawn", MENU_SPAWN}, {3, "World", MENU_SETTINGS}, {3, "Camera", MENU_SETTINGS},
+    {3, "Cheats", MENU_CHEATS}, {3, "Teleport", MENU_TELEPORT}, {3, "Spawn", MENU_SPAWN}, {3, "World", MENU_SETTINGS}, {3, "Camera", MENU_SETTINGS},
 };
 enum { SETTINGS_NSECTIONS = sizeof SETTINGS_SECTIONS / sizeof *SETTINGS_SECTIONS };
 /* The first section of a tab and how many it has. */
