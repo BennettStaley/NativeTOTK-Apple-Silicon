@@ -771,7 +771,7 @@ static _Atomic int as_chests, as_cancel;
 static _Atomic uint32_t as_seq_inside, as_seq_field, as_seq_goal, as_seq_event;   /* RomFS opens: a shrine's map, the surface's map, the goal's event, any event flow */
 static _Atomic int as_inside_index = -1, as_watch_field;   /* watch_field: log the next surface map file */
 static pthread_mutex_t as_status_lock = PTHREAD_MUTEX_INITIALIZER;
-static char as_status[600] = "Not started";
+static char as_status[1600] = "Not started";
 /* The player's eight steps (2026-10-28), by which the status line, the log and every Stopped reason name where the run is:
    1 go to location (noclip to the travel point, set down, watched), 2 activate location (walk up to the gate, A, its
    scene), 3 enter location (walk through the doorway, the load, the arrival scene), 4 go to location exit (chests on the
@@ -795,7 +795,11 @@ static struct {
     float stand[3], face[3], last[3], safe[3], probe[3], wd_pos[3], stall_pos[3];
     uint32_t seq_inside, seq_field, seq_goal, event_seq;   /* the RomFS counters when the step began */
     uint8_t state[SHRINES], run[SHRINES];
-    char left_out[200], why[300];
+    int fails_in_row, skipped, recovering, resume, verify_k, moving;   /* recovering: leaving a failed shrine by the start lift;
+        resume: AS_STOPPING goes on to the next shrine; verify_k: the shrine done last, its save state logged at the next choice;
+        moving: AS_SCENE's cycles in a row in which Link moved */
+    float a_pos[3];   /* where Link stood when A landed at the altar */
+    char left_out[200], why[300], skipped_list[700];
 } as;
 /* input.c: a press that lets go by itself (ms 0: at once), and letting go of all of them. Every key the run presses is one:
    no key stays held when the run stops ticking (a load, a cutscene without a player, a stop). */
@@ -804,10 +808,12 @@ void runtime_input_lease_release_all(void);
 /* frontend.m (Mac): a short sound when a run ends, ok or not; elsewhere nothing. */
 __attribute__((weak)) void runtime_front_run_sound(int ok) { (void)ok; }
 static void as_say(void) {
-    char line[700]; const char *name = as.k >= 0 ? as_mark[LANDMARK_FIRST_SHRINE + as.k].name : "";
-    if (as.step != AS_OFF) snprintf(line, sizeof line, "Running: %s%sstep %d, %s: %s · %d done%s%s", name, *name ? " · " : "", as.stage, AS_STAGE_TEXT[as.stage],
-                                    AS_STEP_TEXT[as.step], as.done, as.left_out[0] ? " · left out: " : "", as.left_out);
-    else snprintf(line, sizeof line, "%s · %d done%s%s", as.why[0] ? as.why : "Stopped", as.done, as.left_out[0] ? " · left out: " : "", as.left_out);
+    char line[1600]; const char *name = as.k >= 0 ? as_mark[LANDMARK_FIRST_SHRINE + as.k].name : "";
+    char skipped[760] = "";
+    if (as.skipped) snprintf(skipped, sizeof skipped, " · %d skipped (%s)", as.skipped, as.skipped_list);
+    if (as.step != AS_OFF) snprintf(line, sizeof line, "Running: %s%sstep %d, %s: %s · %d done%s", name, *name ? " · " : "", as.stage, AS_STAGE_TEXT[as.stage],
+                                    AS_STEP_TEXT[as.step], as.done, skipped);
+    else snprintf(line, sizeof line, "%s · %d done%s%s%s", as.why[0] ? as.why : "Stopped", as.done, skipped, as.left_out[0] ? " · left out: " : "", as.left_out);
     pthread_mutex_lock(&as_status_lock); snprintf(as_status, sizeof as_status, "%s", line); pthread_mutex_unlock(&as_status_lock);
 }
 static void as_stage(int stage) {
@@ -857,6 +863,20 @@ static int as_walk_up(uintptr_t actor, const float to[3], double t, double now, 
     as_walk(actor, to);
     return 0;
 }
+/* Before every A: Link turned to face the prompt (forceSetMatrix where he stands) and a 0.12 s tap of the stick toward it,
+   which turns him the game's own way. */
+static void as_face(uintptr_t actor, const float to[3]) {
+    static const unsigned code[4] = {AS_KEY_UP, AS_KEY_DOWN, AS_KEY_LEFT, AS_KEY_RIGHT};
+    float at[3], cam[3], right[3]; uint64_t frame;
+    if (!as_pos(actor, at)) return;
+    as_force_facing(actor, at, to);
+    float fwd[2], rt[2], dir[2], cl; int keys = SHRINE_STICK_UP;
+    shrine_unit_xz(at, to, dir);
+    if (dm_gfx_camera(cam, right, &frame) && (cl = sqrtf(right[0] * right[0] + right[2] * right[2])) > 1e-3f) {
+        shrine_unit_xz(cam, at, fwd); rt[0] = right[0] / cl; rt[1] = right[2] / cl; keys = shrine_stick(fwd, rt, dir);
+    }
+    for (int i = 0; i < 4; i++) if (keys & (1 << i)) runtime_input_lease(code[i], 120);
+}
 static double as_save_time(void) {
     const char *profile = getenv("TOTK_PROFILE_DIR"); char path[1800]; struct stat st;
     if (!profile) return 0;
@@ -900,7 +920,13 @@ static void as_move(const float stand[3], const float face[3], int after, double
 static void as_end(int ok, const char *why, double now, int by_player) {
     as_walk(0, NULL); runtime_input_lease_release_all();
     snprintf(as.why, sizeof as.why, "%s%s", ok ? "Finished: " : "", why);
-    fprintf(stderr, "[autoshrine] %s (%d done)\n", as.why, as.done);
+    fprintf(stderr, "[autoshrine] %s\n", as.why);
+    fprintf(stderr, "[autoshrine] summary: %d done, %d skipped%s%s%s\n", as.done, as.skipped, as.skipped ? " (" : "", as.skipped_list, as.skipped ? ")" : "");
+    {   /* the progress is in the game's own autosave after each shrine (5Out asks for one); the menu's manual save is not driven */
+        double saved = as_save_time(); struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
+        if (saved > 0) fprintf(stderr, "[autoshrine] the newest save is %.0f s old (the game's autosave)\n", ts.tv_sec + ts.tv_nsec * 1e-9 - saved);
+        else fprintf(stderr, "[autoshrine] no save found in the profile\n");
+    }
     if (!ok && as.k >= 0) as.run[as.k] = SHRINE_SKIP_FAILED;
     runtime_front_run_sound(ok);
     if (!by_player && atomic_load(&noclip_wanted) && as.have_safe) {
@@ -913,10 +939,33 @@ static void as_end(int ok, const char *why, double now, int by_player) {
     as.step = AS_OFF; atomic_store(&as_active, 0); as_say();
 }
 /* "Stopped at step 5, exit location: no event after 4 A presses (Irasak Shrine)" */
+/* A shrine that fails in a run of many is skipped and the run goes on: before its entrance (steps 1-3) Link is set down
+   and the next one chosen; inside, he leaves by the start lift first. The whole run stops when he cannot get out, after
+   three shrines in a row failed, or in a run of one shrine. */
 static void as_fail(const char *what, double now) {
     char why[300]; const char *name = as.k >= 0 ? as_mark[LANDMARK_FIRST_SHRINE + as.k].name : "";
     if (as.stage) snprintf(why, sizeof why, "Stopped at step %d, %s: %s%s%s%s", as.stage, AS_STAGE_TEXT[as.stage], what, *name ? " (" : "", name, *name ? ")" : "");
     else snprintf(why, sizeof why, "Stopped: %s", what);
+    if (as.k >= 0 && !as.recovering && !as.one && as.target < 0 && as.fails_in_row < 2) {
+        as.fails_in_row++; as.skipped++; as.run[as.k] = SHRINE_SKIP_FAILED;
+        size_t o = strlen(as.skipped_list);
+        snprintf(as.skipped_list + o, sizeof as.skipped_list - o, "%s%s: step %d, %s", o ? "; " : "", name, as.stage, what);
+        fprintf(stderr, "[autoshrine] skipping %s: step %d, %s: %s; on to the next shrine\n", name, as.stage, AS_STAGE_TEXT[as.stage], what);
+        as_walk(0, NULL); runtime_input_lease_release_all();
+        if (as.inside) {   /* out by the start lift, then the next one */
+            float stand[3], face[3]; shrine_stand(&as_shrine[as.k], SHRINE_AT_BACK_APPROACH, 0, stand, face);
+            as.recovering = 1; as_stage(7); as_move(stand, face, AS_BACK, now); return;
+        }
+        if (atomic_load(&noclip_wanted) && as.have_safe) {   /* set down where he last stood, then the next one */
+            float at[3] = {as.safe[0], as.safe[1] + 0.5f, as.safe[2]};
+            if (noclip.holding && landmark_distance(noclip.xyz, at) > 40) runtime_noclip_goto(at);
+            memcpy(as.stand, at, 12); as.resume = 1; as_step(AS_STOPPING, now); return;
+        }
+        if (atomic_load(&noclip_wanted)) runtime_noclip_set(0);
+        as_stage(8); as_step(AS_PICK, now); return;
+    }
+    if (as.recovering) { char why2[300]; snprintf(why2, sizeof why2, "%s, while leaving a failed shrine", why); as_end(0, why2, now, 0); return; }
+    if (as.fails_in_row >= 2 && !as.one && as.target < 0) { char why2[300]; snprintf(why2, sizeof why2, "%s; three shrines in a row failed", why); as_end(0, why2, now, 0); return; }
     as_end(0, why, now, 0);
 }
 /* A press cycle at a prompt (every period seconds, at most tries cycles): a short walk toward the prompt from the second
@@ -924,9 +973,9 @@ static void as_fail(const char *what, double now) {
 static int as_press_cycle(uintptr_t actor, const float prompt[3], double now, double period, int tries) {
     double t = now - as.t0 - as.tries * period;
     if (as.tries >= tries) return 0;
-    if (as.phase == 0) { as.phase = 1; }
-    else if (as.phase == 1) { if (as.tries && t < 0.4) as_walk(actor, prompt); else { as_walk(0, NULL); if (t >= 0.6) { as_key(AS_KEY_ZL, 0.15); as.phase = 2; } } }
-    else if (as.phase == 2 && t >= 1.1) { as_key(AS_KEY_A, 0.15); fprintf(stderr, "[autoshrine] A (try %d)\n", as.tries + 1); as.phase = 3; }
+    if (as.phase == 0) { as_face(actor, prompt); as.phase = 1; }
+    else if (as.phase == 1) { if (t >= 0.4) { as_key(AS_KEY_ZL, 0.15); as.phase = 2; } }
+    else if (as.phase == 2 && t >= 0.9) { as_key(AS_KEY_A, 0.15); fprintf(stderr, "[autoshrine] A (try %d)\n", as.tries + 1); as.phase = 3; }
     else if (as.phase == 3 && t >= period) { as.tries++; as.phase = 0; }
     return 1;
 }
@@ -936,6 +985,10 @@ static void as_pick(uintptr_t actor, double now) {
     if (!as_pos(actor, at) || (fabsf(at[0]) < 1 && fabsf(at[2]) < 1)) { if (now - as.t0 > 120) as_fail("no player to start from (120 s)", now); return; }
     static Landmark lm[LANDMARKS]; int skip[SHRINES], count[SHRINE_SKIPS] = {0};
     int found = as_read_save(lm);
+    if (as.verify_k >= 0 && as.verify_k < SHRINES) {   /* the shrine done last: what the save says now (read here, not waited for) */
+        fprintf(stderr, "[autoshrine] the save now says DungeonState.Dungeon%03d = %s\n", as.verify_k, as.state[as.verify_k] ? SHRINE_STATE_NAMES[as.state[as.verify_k]] : "(not in it)");
+        as.verify_k = -1;
+    }
     for (int k = 0; k < SHRINES; k++) count[skip[k] = shrine_skip(&as_shrine[k], as.state[k], lm[LANDMARK_FIRST_SHRINE + k].lock, as.run[k])]++;
     size_t o = 0; as.left_out[0] = 0;
     for (int r = 1; r < SHRINE_SKIPS && o < sizeof as.left_out - 1; r++)
@@ -949,7 +1002,8 @@ static void as_pick(uintptr_t actor, double now) {
     }
     int k = as.target >= 0 ? as.target : shrine_next(as_shrine, skip, at);
     if (k < 0) { as.k = -1; as_end(1, "no shrine left to do", now, 0); return; }
-    as.k = k; as.stage = 0; as.goal_ok = 0; as.back = 0; as.inside = 0;
+    as.k = k; as.stage = 0; as.goal_ok = 0; as.back = 0; as.inside = 0; as.recovering = 0;
+    as.save_time = as_save_time();   /* AS_SAVED reads only saves newer than this */
     as_stage(1);
     const ShrineInfo *s = &as_shrine[k];
     fprintf(stderr, "[autoshrine] next: %s (Dungeon%03d, %s, %.0f m away, save says %s, %d chest%s)\n", as_mark[LANDMARK_FIRST_SHRINE + k].name, k,
@@ -1039,7 +1093,7 @@ static void autoshrine_tick(uintptr_t actor, double now) {
     int req = atomic_exchange(&as_request, 0);
     if (req == 3 && as.step != AS_OFF && as.step != AS_STOPPING) { as_fail("stopped from the menu or the input file", now); return; }
     if ((req == 1 || req == 2) && as.step == AS_OFF) {
-        int chests = atomic_load(&as_chests); memset(&as, 0, sizeof as); as.k = -1; as.one = req == 2; as.target = atomic_exchange(&as_want, -1); as.started = now; as.last_tick = now;
+        int chests = atomic_load(&as_chests); memset(&as, 0, sizeof as); as.k = -1; as.verify_k = -1; as.one = req == 2; as.target = atomic_exchange(&as_want, -1); as.started = now; as.last_tick = now;
         atomic_store(&as_cancel, 0); dm_gfx_camera_want(1); runtime_input_lease_release_all();
         fprintf(stderr, "[autoshrine] start: %s, chests %s\n", as.target >= 0 ? "one chosen shrine" : as.one ? "the nearest shrine" : "every shrine it can do, nearest first", chests ? "on" : "off");
         as_step(AS_PICK, now);
@@ -1081,26 +1135,51 @@ static void autoshrine_tick(uintptr_t actor, double now) {
             if (as_walk_up(actor, to, t, now, 4)) { as.approached = 1; as.t0 = now; as.phase = 0; as.tries = 0; }
             return;
         }
-        if (as_press_cycle(actor, as.face, now, 4, 2)) {
-            if (as.phase == 3 && atomic_load(&as_seq_event) != as.event_seq) { fprintf(stderr, "[autoshrine] an event started at the gate\n"); as_scene(AS_WALK, 0, now); }
-            return;
+        {   /* face the gate, ZL, A; the activation's scene is skipped from the moment A lands */
+            double c = now - as.t0;
+            if (as.phase == 0) { as_face(actor, as.face); as.phase = 1; }
+            else if (as.phase == 1 && c >= 0.3) { as_key(AS_KEY_ZL, 0.15); as.phase = 2; }
+            else if (as.phase == 2 && c >= 0.7) { as_key(AS_KEY_A, 0.15); fprintf(stderr, "[autoshrine] A at the gate\n"); as.phase = 3; }
+            else if (as.phase == 3 && c >= 0.9) as_scene(AS_WALK, 0, now);
         }
-        as_scene(AS_WALK, 0, now);   /* its scene skipped or waited out, then walk in at once (the autosave saying Open can come late) */
         return;
-    case AS_SCENE: {
+    case AS_SCENE: {   /* skip at once and again every 0.8 s: X (shows "Skip +"), + 0.25 s later, B every other time for a message;
+                          the stick pushed all along (back, away from the altar, at the end). It is over when Link moves under it
+                          two cycles running, the next map loads, or (at the altar) the surface's map loads. */
         if (as.until_field && (atomic_load(&as_seq_field) != as.seq_field || (have && landmark_distance(at, s->entrance) < 200))) {
-            fprintf(stderr, "[autoshrine] the altar's scene took Link out (%d skip tries)\n", as.skips);
+            fprintf(stderr, "[autoshrine] the altar's scene took Link out after %.0f s (%d skip tries)\n", t, as.skips);
             as.back = 0; as.have_safe = 0; as.inside = 0; as_step(AS_SURFACE, now); return;
         }
+        if (as.after == AS_WALK && (atomic_load(&as_seq_inside) != as.seq_inside || (have && landmark_distance(at, s->start) < 60))) {
+            uint32_t seen = as.seq_inside; fprintf(stderr, "[autoshrine] the way in started during the gate's scene\n");
+            as_stage(3); as_step(AS_LOADING, now); as.seq_inside = seen; return;
+        }
+        if (as.until_field && !as.goal_ok && have && t < 4) {   /* the altar's event pulls him to it (warps him in front of the monk) */
+            float was = landmark_distance(as.a_pos, s->goal), now_d = landmark_distance(at, s->goal);
+            if (atomic_load(&as_seq_goal) != as.seq_goal) { as.goal_ok = 1; fprintf(stderr, "[autoshrine] the goal's event file opened\n"); }
+            else if (landmark_distance(at, as.a_pos) > 0.5f && now_d < was - 0.3f) { as.goal_ok = 1; fprintf(stderr, "[autoshrine] the altar pulled Link in (%.1f m closer)\n", was - now_d); }
+        }
         if (t > 180) { as_fail("a cutscene did not end within 3 minutes", now); return; }
-        double c = t - 3.0 * as.tries; int reveal = atomic_load(&as_skip_reveal);
-        if (as.phase == 0) {   /* a short push of the stick: ahead (at the altar back, away from it) */
-            if (!have) { if (c >= 3) as.tries++; return; }
-            memcpy(as.probe, at, 12); as_key(as.until_field ? AS_KEY_DOWN : AS_KEY_UP, 0.35); as.phase = 1;
-        } else if (as.phase == 1 && c >= 0.8) {
+        if (have) as_key(as.until_field ? AS_KEY_DOWN : AS_KEY_UP, 0.3);
+        double c = t - 0.8 * as.tries; int reveal = atomic_load(&as_skip_reveal);
+        if (as.phase == 0) {
+            if (have) memcpy(as.probe, at, 12);
+            if (reveal) { as_key((unsigned)reveal, 0.1); as.skips++; }
+            as.phase = 1;
+        } else if (as.phase == 1 && c >= 0.25) { if (reveal) as_key(AS_KEY_PLUS, 0.1); as.phase = 2; }
+        else if (as.phase == 2 && c >= 0.5) { if (as.tries & 1) as_key(AS_KEY_B, 0.1); as.phase = 3; }
+        else if (as.phase == 3 && c >= 0.8) {
             float moved = have ? landmark_distance(at, as.probe) : 0;
-            if (moved > 0.3f && (!as.until_field || t > 10)) {
-                fprintf(stderr, "[autoshrine] Link answers the stick (%.1f m) after %.0f s, %d skip tries\n", moved, t, as.skips);
+            as.moving = moved > 0.3f ? as.moving + 1 : 0;
+            as.tries++; as.phase = 0;
+            if (as.moving >= 2 && (!as.until_field || t > 4)) {
+                fprintf(stderr, "[autoshrine] Link walks again after %.1f s (%d skip tries)\n", t, as.skips);
+                runtime_input_lease_release_all();
+                if (as.until_field && !as.goal_ok) {   /* the A started nothing */
+                    if (++as.event >= 4) { as_fail("no event after 4 A presses at the altar", now); return; }
+                    int tries = as.event; fprintf(stderr, "[autoshrine] no event at the altar yet; walking up to it again\n");
+                    as_stage(4); as_step(AS_GOAL, now); as.tries = tries; return;
+                }
                 if (as.until_field) {   /* the altar's scene is over and he is still inside: ask the altar to leave */
                     float stand[3], face[3]; shrine_stand(s, SHRINE_AT_GOAL_APPROACH, 0, stand, face);
                     fprintf(stderr, "[autoshrine] still inside after the altar; A at the altar again for \"Do you want to leave?\"\n");
@@ -1108,12 +1187,7 @@ static void autoshrine_tick(uintptr_t actor, double now) {
                 }
                 as_go_on(now); return;
             }
-            if (reveal) { as_key((unsigned)reveal, 0.12); as.skips++; }   /* shows "Skip +" where the game allows a skip */
-            as.phase = 2;
-        } else if (as.phase == 2 && c >= 1.1) { if (reveal) as_key(AS_KEY_PLUS, 0.12); as.phase = 3; }
-        else if (as.phase == 3 && c >= 1.6) { as_key(AS_KEY_B, 0.1); as.phase = 4; }   /* the pause menu if + opened it; a message */
-        else if (as.phase == 4 && c >= 2.3) { as_key(AS_KEY_B, 0.1); as.phase = 5; }
-        else if (as.phase == 5 && c >= 3) { as.tries++; as.phase = 0; }
+        }
         return;
     }
     case AS_WALK: {   /* step 3: noclip is off; Link walks through the doorway; DmF_SY_SmallDungeon2Go takes him onto the lift, then the load */
@@ -1163,31 +1237,27 @@ static void autoshrine_tick(uintptr_t actor, double now) {
         else if (as.phase < 4 && t >= 3.5 + (as.phase - 1) * 1.5) { as_key(AS_KEY_B, 0.1); as.phase++; }
         else if (as.phase == 4 && t >= 8) { as.chest++; as_after_inside(now); }
         return;
-    case AS_GOAL: {   /* step 4 then 5: walk into the altar's prompt, A; its event (DmF_SY_SmallDungeonGoal) must be seen to start */
+    case AS_GOAL: {   /* step 4 then 5: walk into the altar's prompt, face it, A; the skipping starts as A lands (AS_SCENE checks
+                         that the event began: its file opens or he is pulled to the altar; else he walks up and tries again) */
         if (atomic_load(&as_seq_field) != as.seq_field) { as.back = 0; as.have_safe = 0; as.inside = 0; as_stage(6); as_step(AS_SURFACE, now); return; }
         if (!as.approached) {
             if (as_walk_up(actor, s->goal_floor, t, now, 5)) {
+                float dx = have ? at[0] - s->goal_floor[0] : 99, dz = have ? at[2] - s->goal_floor[2] : 99;
+                if (dx * dx + dz * dz > 1.5f * 1.5f) {   /* not in the prompt's range: something stands between */
+                    char why[120]; snprintf(why, sizeof why, "could not walk up to the altar's prompt (%.1f m short)", sqrtf(dx * dx + dz * dz));
+                    as_fail(why, now); return;
+                }
                 as.approached = 1; as.phase = 1; as.phase_t = now; as_stage(5);
-                if (!as.tries) as.save_time = as_save_time();
             }
             return;
         }
         double c = now - as.phase_t;
-        int started = atomic_load(&as_seq_goal) != as.seq_goal;
-        if (as.phase == 1 && c >= 0.3) { as_key(AS_KEY_ZL, 0.15); as.phase = 2; }
-        else if (as.phase == 2 && c >= 0.8) { as_key(AS_KEY_A, 0.15); fprintf(stderr, "[autoshrine] A at the altar (try %d)\n", as.tries + 1); if (have) memcpy(as.last, at, 12); as.phase = 3; }
-        else if (as.phase == 3 && c >= 2.3) {
-            if (!started && have && landmark_distance(at, as.last) > 0.6f) { started = 1; fprintf(stderr, "[autoshrine] the altar pulled Link in (%.1f m)\n", landmark_distance(at, as.last)); }
-            if (!started) { if (have) memcpy(as.probe, at, 12); as_key(AS_KEY_DOWN, 0.35); as.phase = 4; }   /* can he still walk away from it? */
-        } else if (as.phase == 4 && c >= 3.2) {
-            float moved = have ? landmark_distance(at, as.probe) : 0;
-            if (moved < 0.15f) { started = 1; fprintf(stderr, "[autoshrine] Link does not answer the stick: the altar's event holds him\n"); }
-            else if (++as.tries >= 4) { as_fail("no event after 4 A presses at the altar", now); return; }
-            else { fprintf(stderr, "[autoshrine] no event yet (Link still walks); walking up to the prompt again\n"); as.approached = 0; as.t0 = now; return; }
-        }
-        if (started) {
-            if (atomic_load(&as_seq_goal) != as.seq_goal) fprintf(stderr, "[autoshrine] the goal's event file opened\n");
-            as.goal_ok = 1; as_stage(6); as_scene(AS_LEAVE, 1, now);
+        if (as.phase == 1) { as_face(actor, s->goal); as.phase = 2; }
+        else if (as.phase == 2 && c >= 0.3) { as_key(AS_KEY_ZL, 0.15); as.phase = 3; }
+        else if (as.phase == 3 && c >= 0.7) {
+            as_key(AS_KEY_A, 0.15); fprintf(stderr, "[autoshrine] A at the altar (try %d)\n", as.tries + 1);
+            if (have) memcpy(as.a_pos, at, 12);
+            int tries = as.tries; as_stage(6); as_scene(AS_LEAVE, 1, now); as.event = tries;   /* AS_SCENE counts the tries in event */
         }
         return;
     }
@@ -1201,11 +1271,15 @@ static void autoshrine_tick(uintptr_t actor, double now) {
             as_stage(7); as_move(stand, face, AS_BACK, now);
         }
         return;
-    case AS_BACK: {   /* step 7: walk into the start lift: DmF_SY_SmallDungeon4Return */
+    case AS_BACK: {   /* step 7: walk into the start lift (DmF_SY_SmallDungeon4Return), with an A now and then in case it asks */
         if (atomic_load(&as_seq_field) != as.seq_field || (have && landmark_distance(at, s->entrance) < 200)) { as.back = 1; as.have_safe = 0; as.inside = 0; as_stage(6); as_step(AS_SURFACE, now); return; }
+        if (t > 15) { as_fail("could not get Link out by the start lift (15 s)", now); return; }
         float dx = have ? at[0] - s->back_floor[0] : 99, dz = have ? at[2] - s->back_floor[2] : 99;
-        if (dx * dx + dz * dz < 1.5f * 1.5f || as.event) { as.event = 1; as_walk(0, NULL); if (t > 30) as_fail("on the start lift but the shrine did not let Link out (30 s)", now); return; }
-        if (t > 8) { as_fail("walked toward the start lift for 8 s without leaving", now); return; }
+        if (dx * dx + dz * dz < 2.0f * 2.0f || t > 6) {
+            if (fmod(t, 2.0) < dt) { as_face(actor, s->back); as_key(AS_KEY_A, 0.15); fprintf(stderr, "[autoshrine] A at the start lift\n"); }
+            if (fmod(t, 2.0) > 0.5) as_walk(actor, s->back);
+            return;
+        }
         as_walk(actor, s->back);
         return;
     }
@@ -1216,27 +1290,25 @@ static void autoshrine_tick(uintptr_t actor, double now) {
         }
         if (t > 120) as_fail("Link did not appear outside the shrine within 2 minutes", now);
         return;
-    case AS_SAVED: {   /* step 6: done only when confirmed: the autosave says Clear, or the altar's event was seen and took him out */
-        if (fmod(t, 1.0) >= dt && t < 60) return;
-        double saved = as_save_time();
+    case AS_SAVED: {   /* step 6 ends: done when the altar's event was seen and took him out (its branch always sets Clear before
+                          it does; the save is read at the next choice, not waited for); after the start lift, up to 10 s for a
+                          save that says Clear */
         const char *name = as_mark[LANDMARK_FIRST_SHRINE + as.k].name;
-        if (saved > as.save_time) {
-            static Landmark lm[LANDMARKS]; as_read_save(lm); as.save_time = saved;
-            fprintf(stderr, "[autoshrine] autosave: DungeonState.Dungeon%03d = %s\n", as.k, as.state[as.k] ? SHRINE_STATE_NAMES[as.state[as.k]] : "(not in it)");
-            as.event = as.state[as.k] ? as.state[as.k] : -1;   /* event: the last save's state of this shrine */
+        if (as.recovering) {   /* out of a failed shrine: on to the next */
+            as.recovering = 0; fprintf(stderr, "[autoshrine] out of %s; on to the next shrine\n", name);
+            as_stage(8); as_step(AS_PICK, now); return;
         }
-        if (as.event == SHRINE_STATE_CLEAR) fprintf(stderr, "[autoshrine] done: %s (Dungeon%03d): the autosave says Clear\n", name, as.k);
-        else {
-            if (t < 60) return;
-            if (as.goal_ok && !as.back)   /* the blessing's branch always sets Clear before it takes him out */
-                fprintf(stderr, "[autoshrine] done: %s (Dungeon%03d): the altar's event ran and took Link out (no autosave said Clear within 60 s)\n", name, as.k);
-            else {
-                char why[160]; snprintf(why, sizeof why, "not confirmed done: %s%s", as.event > 0 ? "the autosave says " : "no autosave within 60 s",
-                                        as.event > 0 ? SHRINE_STATE_NAMES[as.event] : as.back ? " after leaving by the start lift" : " and the altar's event was not seen");
-                as_fail(why, now); return;
+        if (!as.goal_ok || as.back) {
+            if (fmod(t, 1.0) >= dt && t < 10) return;
+            double saved = as_save_time();
+            if (saved > as.save_time) { static Landmark lm[LANDMARKS]; as_read_save(lm); as.save_time = saved; }
+            if (as.state[as.k] != SHRINE_STATE_CLEAR) {
+                if (t < 10) return;
+                as_fail(as.back ? "left by the start lift and no save says Clear" : "the altar's event was not seen and no save says Clear", now); return;
             }
-        }
-        as.run[as.k] = SHRINE_SKIP_DONE; as.done++;
+            fprintf(stderr, "[autoshrine] done: %s (Dungeon%03d): the save says Clear\n", name, as.k);
+        } else fprintf(stderr, "[autoshrine] done: %s (Dungeon%03d): the altar's event took Link out\n", name, as.k);
+        as.run[as.k] = SHRINE_SKIP_DONE; as.done++; as.fails_in_row = 0; as.verify_k = as.k;
         as_stage(8);
         as_step(AS_PICK, now);
         return;
@@ -1249,8 +1321,9 @@ static void autoshrine_tick(uintptr_t actor, double now) {
             if (d > step) { for (int c = 0; c < 3; c++) noclip.xyz[c] += (as.stand[c] - noclip.xyz[c]) * step / d; return; }
         }
         if (atomic_load(&noclip_wanted)) runtime_noclip_set(0);
-        dm_gfx_camera_want(0);
         fprintf(stderr, "[autoshrine] set down\n");
+        if (as.resume) { as.resume = 0; dm_gfx_camera_want(1); as_stage(8); as_step(AS_PICK, now); return; }
+        dm_gfx_camera_want(0);
         as.step = AS_OFF; atomic_store(&as_active, 0); as_say();
         return;
     }

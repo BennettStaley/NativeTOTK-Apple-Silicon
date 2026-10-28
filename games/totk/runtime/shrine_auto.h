@@ -174,11 +174,12 @@ static inline int shrine_kind_parse(const uint8_t *d, size_t n) {
 
 /* Why the run leaves a shrine out (SHRINE_GO: it does it). Text in SHRINE_SKIP_TEXT. */
 enum { SHRINE_GO, SHRINE_SKIP_NO_DATA, SHRINE_SKIP_CLEAR, SHRINE_SKIP_LOCKED, SHRINE_SKIP_HIDDEN, SHRINE_SKIP_CRYSTAL, SHRINE_SKIP_CAVE,
-       SHRINE_SKIP_DONE, SHRINE_SKIP_FAILED, SHRINE_SKIPS };
+       SHRINE_SKIP_DONE, SHRINE_SKIP_FAILED, SHRINE_SKIP_FIGHT, SHRINE_SKIP_PROVING, SHRINE_SKIPS };
 static const char *const SHRINE_SKIP_TEXT[SHRINE_SKIPS] = {
     "", "its entrance or goal is not in the game's map files", "completed", "locked by the story lock",
     "not revealed yet (its quest raises it)", "its crystal has not been brought yet", "in a cave: the flight down would pass through rock",
-    "done in this run", "failed in this run"};
+    "done in this run", "failed in this run", "needs a fight: the altar's gate opens only after the construct is beaten",
+    "Proving Grounds: the altar's gate opens only after the fight"};
 /* state: SHRINE_STATE_...; lock: landmarks.h LANDMARK_LOCK_... of the shrine; run: 0, SHRINE_SKIP_DONE or _FAILED. A shrine
    the save does not mention is taken to be in its starting state (hidden and crystal shrines start Hidden). */
 static inline int shrine_skip(const ShrineInfo *s, int state, int lock, int run) {
@@ -189,6 +190,10 @@ static inline int shrine_skip(const ShrineInfo *s, int state, int lock, int run)
     int hidden = state == SHRINE_STATE_HIDDEN || (state == SHRINE_STATE_UNKNOWN && (s->hidden || s->crystal));
     if (hidden) return s->crystal ? SHRINE_SKIP_CRYSTAL : SHRINE_SKIP_HIDDEN;
     if (s->cave) return SHRINE_SKIP_CAVE;
+    /* A fight's altar answers nothing until the construct is beaten (Miryotanog Shrine, 2026-10-28: A on the altar's floor
+       five times, no event) */
+    if (s->kind == SHRINE_COMBAT) return SHRINE_SKIP_FIGHT;
+    if (s->kind == SHRINE_PROVING) return SHRINE_SKIP_PROVING;
     return SHRINE_GO;
 }
 /* The shrine to do next: the nearest entrance to from among those with skip[k] == SHRINE_GO; -1 when none. */

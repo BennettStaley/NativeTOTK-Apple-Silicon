@@ -355,6 +355,10 @@ int main(void) {
     CHECK(shrine_skip(&plain, SHRINE_STATE_ENTER, LANDMARK_OPEN, SHRINE_SKIP_FAILED) == SHRINE_SKIP_FAILED, "failed in this run");
     ShrineInfo none = {0};
     CHECK(shrine_skip(&none, SHRINE_STATE_APPEAR, LANDMARK_OPEN, 0) == SHRINE_SKIP_NO_DATA, "no map data");
+    ShrineInfo fight = plain; fight.kind = SHRINE_COMBAT;
+    CHECK(shrine_skip(&fight, SHRINE_STATE_APPEAR, LANDMARK_OPEN, 0) == SHRINE_SKIP_FIGHT, "a fight: left out");
+    fight.kind = SHRINE_PROVING;
+    CHECK(shrine_skip(&fight, SHRINE_STATE_OPEN, LANDMARK_OPEN, 0) == SHRINE_SKIP_PROVING, "Proving Grounds: left out");
     /* nearest first, from where Link is, then from each shrine done */
     static ShrineInfo row[SHRINES]; int skip[SHRINES];
     for (int k = 0; k < SHRINES; k++) { row[k] = plain; skip[k] = SHRINE_SKIP_LOCKED; row[k].entrance[0] = 1000.0f * k; row[k].entrance[1] = 0; row[k].entrance[2] = 0; }
