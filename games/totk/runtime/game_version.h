@@ -70,6 +70,14 @@
    object QueryGetCurrentNormalizedBancName reads the current map's name through. Named, not GAME_ADDR: 1.4.3 only. */
 #define GAME_STATE_EVENT_MGR 0x3ada558
 #define GAME_STATE_BANC 0x3ad76f0
+/* "ctl event NAME" only (world_survey.c, how they were found): engine::event::EventMgr::requestEvent (1.0.0 0x11e5300,
+   totk-lotuskit's symbol), the EventRequestArg constructor it is always called after (1.0.0 0x101419c), and the teardown
+   of the request's two actor links as the game's own "request DmF_SY_WorldReset" routine (0x21c66fc) does it. 1.4.3 only. */
+#define GAME_EVENT_REQUEST 0xcac4cc
+#define GAME_EVENT_ARG_INIT 0xce1108
+#define GAME_EVENT_LINK_FINI 0x1aff9c          /* BaseProcLink's destructor body */
+#define GAME_EVENT_LINK_VTABLE_GOT 0x395d8d0   /* GOT slot of the vtable stored into a link before that call */
+#define GAME_EVENT_LINK_VTABLE 0x361dc18       /* what the slot's relocation names */
 #define GAME_ADDR_0x69a18c 0x45ce70
 #define GAME_ADDR_0x4663f08 0x3add238
 #define GAME_ADDR_0x15ecb0c 0x1bd01c4
