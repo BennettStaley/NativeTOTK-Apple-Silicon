@@ -174,27 +174,28 @@ def face(g, target, tol=15.0, tries=8):   # camera on it, then short taps of the
 
 
 def walk_to_spot(g, spot, near=0.5, limit=15, stop=None):
-    """Walked (camera re-aimed on the spot each step, left stick straight up) to within near metres of spot, steps
-    shrinking close to it so it is never passed (the prompt shows only there). stop(st) ends it early (an event, a map)."""
-    end = time.time() + limit; best = 1e9
+    """Walked toward spot (camera re-aimed each step, left stick straight up) until within near metres; steps shrink to
+    ~0.1 m inside 2 m so the prompt's window is not passed; stops as soon as the distance stops shrinking (at or past it,
+    or blocked). stop(st) ends it early (an event, a map)."""
+    end = time.time() + limit; last = 1e9
     while time.time() < end:
         _, _, st = offsets(g, spot)
         if st and stop and stop(st): return 'stopped'
         if not st or not st['pos']: time.sleep(0.2); continue
         d = xz(st['pos'], spot)
         if d <= near: return 'there'
-        if d > best + 0.3: return 'passed'   # going away: past it or blocked
-        best = min(best, d)
-        camera_on(g, spot)
-        g.send('ctl stick l 0 1 %d' % (250 if d > 3 else 120 if d > 1.2 else 50)); time.sleep(0.35)
+        if d > last - 0.02 and d < 2.0: return 'closest'   # no closer: the nearest point on this line
+        last = d
+        camera_on(g, spot, tol=6.0)
+        g.send('ctl stick l 0 1 %d' % (300 if d > 4 else 150 if d > 2 else 40)); time.sleep(0.35)
     return 'timeout'
 
 
-def prompt_at(g, stand, look, what, tries=2, moved_m=0.8):
+def prompt_at(g, stand, look, what, tries=2, moved_m=0.8, near=0.5):
     """The verified way (2026-10-28, Ishodag): walk to the prompt's spot without passing it, camera and Link facing look,
     A held 2 s; it worked when an event starts (ctl state event=1) or the scene moves Link."""
     for i in range(tries):
-        r = walk_to_spot(g, stand); face(g, look)
+        r = walk_to_spot(g, stand, near=near); face(g, look)
         cam, link, st = offsets(g, look)
         say('  %s: %s, %.1f m from the spot, camera %.0f, Link %.0f degrees off' % (what, r, xz(st['pos'], stand) if st else -1, cam or 0, link or 0))
         g.shot('%s-%d' % (what, i)); p0 = st['pos'] if st else None
@@ -246,10 +247,10 @@ def do_shrine(g, s, state):
     in_map = lambda st: 'Dungeon%03d' % n in st.get('map', '')
     # 1. go to location: the travel point (outside, in front of the door)
     if not fly(g, s['travel']): g.shot('fly-failed'); return 'fly failed (returned, fell or not landed)'
-    door = toward(s['entrance'], s['travel'], 1.3)   # "Examine" showed 1.3 m out from the sigil (Ishodag)
+    door = toward(s['entrance'], s['travel'], 1.3)   # "Examine" showed 1.3 m out from the sigil (Ishodag); near=0.25
     # 2. activate location
     if state in ('Appear', '?'):
-        if prompt_at(g, door, s['entrance'], 'door'): skip_scenes(g, limit=30)
+        if prompt_at(g, door, s['entrance'], 'door', near=0.25): skip_scenes(g, limit=30)
         else: say('  the door gave no scene (already open?)')
     # 3. enter location: walk through the door onto the lift; its scene starts on its own, then the shrine's map
     r = walk_to_spot(g, s['lift_floor'], near=0.6, stop=lambda st: st['event'] or in_map(st))
