@@ -136,22 +136,87 @@ def save_states(profile):   # DungeonState of each shrine in the newest save
     return {k: names.get(tab.get(mm3('DungeonState.Dungeon%03d' % k)), '?') for k in range(152)}
 
 
-def held(g, push='S'):   # True when a cutscene (or a menu) holds Link: a short push of the stick does not move him
-    a = g.pos()
-    g.key(push, 300)
-    b = g.pos()
-    return a is not None and b is not None and dist(a, b) < 0.3
+def toward(a, b, d):   # the point d metres from a toward b (level)
+    dx, dz = b[0] - a[0], b[2] - a[2]; l = math.hypot(dx, dz) or 1
+    return (a[0] + dx / l * d, a[1], a[2] + dz / l * d)
 
 
-def skip_scenes(g, until=None, limit=60):
-    """While the game says a main event plays (ctl state event=1): X (the scenes' "Skip X"), then B for a message or the
-    item's Get screen. Over when event=0 twice running, or until() says so. Returns 'free', 'until' or 'timeout'."""
+def cam_yaw(st):   # where the camera looks (level), in degrees
+    p, c = st['pos'], st['cam']; return math.degrees(math.atan2(p[2] - c[2], p[0] - c[0]))
+
+
+def offsets(g, target):   # (camera off, Link off) from target in degrees, and the state
+    st = g.state()
+    if not st or not st['pos'] or not st['cam'] or not st['face']: return None, None, st
+    p = st['pos']; want = math.degrees(math.atan2(target[2] - p[2], target[0] - p[0]))
+    fx, fz = st['face']
+    return (want - cam_yaw(st) + 540) % 360 - 180, (want - math.degrees(math.atan2(fz, fx)) + 540) % 360 - 180, st
+
+
+def camera_on(g, target, tol=8.0, tries=10):   # right stick: about 86 degrees a second at full push (2026-10-28)
+    for _ in range(tries):
+        cam, _, st = offsets(g, target)
+        if cam is None: time.sleep(0.2); continue
+        if abs(cam) <= tol: return True
+        ms = max(60, min(500, abs(cam) / 86.0 * 1000))
+        g.send('ctl stick r %d 0 %d' % (1 if cam > 0 else -1, ms)); time.sleep(ms / 1000 + 0.25)
+    return False
+
+
+def face(g, target, tol=15.0, tries=8):   # camera on it, then short taps of the left stick straight up turn Link to it
+    for _ in range(tries):
+        camera_on(g, target)
+        _, link, st = offsets(g, target)
+        if link is None: time.sleep(0.2); continue
+        if abs(link) <= tol: return True
+        g.send('ctl stick l 0 1 50'); time.sleep(0.35)
+    return False
+
+
+def walk_to_spot(g, spot, near=0.5, limit=15, stop=None):
+    """Walked (camera re-aimed on the spot each step, left stick straight up) to within near metres of spot, steps
+    shrinking close to it so it is never passed (the prompt shows only there). stop(st) ends it early (an event, a map)."""
+    end = time.time() + limit; best = 1e9
+    while time.time() < end:
+        _, _, st = offsets(g, spot)
+        if st and stop and stop(st): return 'stopped'
+        if not st or not st['pos']: time.sleep(0.2); continue
+        d = xz(st['pos'], spot)
+        if d <= near: return 'there'
+        if d > best + 0.3: return 'passed'   # going away: past it or blocked
+        best = min(best, d)
+        camera_on(g, spot)
+        g.send('ctl stick l 0 1 %d' % (250 if d > 3 else 120 if d > 1.2 else 50)); time.sleep(0.35)
+    return 'timeout'
+
+
+def prompt_at(g, stand, look, what, tries=2, moved_m=0.8):
+    """The verified way (2026-10-28, Ishodag): walk to the prompt's spot without passing it, camera and Link facing look,
+    A held 2 s; it worked when an event starts (ctl state event=1) or the scene moves Link."""
+    for i in range(tries):
+        r = walk_to_spot(g, stand); face(g, look)
+        cam, link, st = offsets(g, look)
+        say('  %s: %s, %.1f m from the spot, camera %.0f, Link %.0f degrees off' % (what, r, xz(st['pos'], stand) if st else -1, cam or 0, link or 0))
+        g.shot('%s-%d' % (what, i)); p0 = st['pos'] if st else None
+        g.press('A', 2000)
+        end = time.time() + 3
+        while time.time() < end:
+            st = g.state()
+            if st and (st['event'] or (p0 and dist(st['pos'], p0) >= moved_m)): return True
+            time.sleep(0.3)
+        g.send('ctl stick l 0 -1 300'); time.sleep(0.6)   # back off a step and try again
+    return False
+
+
+def skip_scenes(g, until=None, limit=90):
+    """While a main event plays (event=1): X held 1 s (its "Skip X"), then B (messages, the item's Get screen).
+    Over when event=0 twice running, or until() says so."""
     free = 0; end = time.time() + limit
     while time.time() < end:
-        if until and until(): return 'until'
         st = g.state()
+        if until and st and until(st): return 'until'
         if st and st['event']:
-            free = 0; g.key('X', 100); time.sleep(0.3); g.key('B', 100); time.sleep(0.3)
+            free = 0; g.key('X', 1000); time.sleep(0.2); g.key('B', 100); time.sleep(0.2)
         else:
             free += 1
             if free >= 2: return 'free'
@@ -159,76 +224,10 @@ def skip_scenes(g, until=None, limit=60):
     return 'timeout'
 
 
-def walk_to(g, to, near=1.0, limit=8.0):
-    end = time.time() + limit
-    while time.time() < end:
-        p = g.pos()
-        if p and xz(p, to) < near: return p
-        g.send('autoshrine walk %.2f %.2f %.2f 500' % to); g.wait(r'\[as-done\] walk', 2)
-    return None
-
-
-def front(s, out=1.6):   # in front of the shrine's door, on the travel point's side
-    e, t = s['entrance'], s['travel']; dx, dz = t[0] - e[0], t[2] - e[2]; l = math.hypot(dx, dz) or 1
-    return (e[0] + dx / l * out, e[1] + 1.0, e[2] + dz / l * out)
-
-
-def place(g, to, face):   # noclip straight onto a spot, turned toward face, then down; returns where he stands
+def place(g, to, look):   # noclip straight onto a spot (never at or inside a door), then down
     g.send('noclip goto %.2f %.2f %.2f' % (to[0], to[1] + 0.5, to[2])); g.wait(r'\[noclip\] arrived', 30); time.sleep(0.8)
-    g.send('autoshrine face %.2f %.2f %.2f' % face); g.wait(r'\[as-done\] face', 3)
     g.send('noclip off'); time.sleep(1.2)
     return g.pos()
-
-
-def toward(a, b, d):   # the point d metres from a toward b (level)
-    dx, dz = b[0] - a[0], b[2] - a[2]; l = math.hypot(dx, dz) or 1
-    return (a[0] + dx / l * d, a[1], a[2] + dz / l * d)
-
-
-def turn_to(g, target, tol=15.0, tries=12):
-    """Link turned to face target: short taps of the left stick toward it, worked out from the camera (the stick is camera
-    relative); checked against his facing from ctl state. Returns the angle left, in degrees."""
-    ang = 180.0
-    for _ in range(tries):
-        st = g.state()
-        if not st or not st['pos'] or not st['face'] or not st['cam'] or not st['camright']: time.sleep(0.2); continue
-        p = st['pos']; dx, dz = target[0] - p[0], target[2] - p[2]; l = math.hypot(dx, dz) or 1; dx /= l; dz /= l
-        fx, fz = st['face']; ang = math.degrees(math.acos(max(-1, min(1, fx * dx + fz * dz))))
-        if ang <= tol: return ang
-        cfx, cfz = p[0] - st['cam'][0], p[2] - st['cam'][2]; cl = math.hypot(cfx, cfz) or 1; cfx /= cl; cfz /= cl
-        rx, rz = st['camright']
-        sx, sy = dx * rx + dz * rz, dx * cfx + dz * cfz; sl = math.hypot(sx, sy) or 1
-        g.send('ctl stick l %.3f %.3f 90' % (sx / sl, sy / sl)); time.sleep(0.25)
-    return ang
-
-
-def approach(g, target, back_from, near, start_back=4.0):
-    """Link set down start_back metres out from target (back_from's side), walked up to it, then turned to face it (checked
-    with ctl state) and the camera put behind him (ZL)."""
-    place(g, toward(target, back_from, start_back), target)
-    end = time.time() + 8
-    while time.time() < end:
-        p = g.pos()
-        if p and xz(p, target) <= near: break
-        g.send('autoshrine walk %.2f %.2f %.2f 300' % target); g.wait(r'\[as-done\] walk', 2)
-    left = turn_to(g, target); g.key('ZL', 150); time.sleep(0.4)
-    say('  at %.1f m, facing it to %.0f degrees' % (xz(g.pos() or target, target), left))
-    return g.pos()
-
-
-def hold_prompt(g, target, back_from, near, reacted_m=1.0, tries=2, what='prompt'):
-    """A prompt that wants A HELD, reached facing it (approach); reacted when the scene moves Link reacted_m or more."""
-    for i in range(tries):
-        p0 = approach(g, target, back_from, near); time.sleep(1.0)
-        st = g.state(); g.shot('%s-%d' % (what, i))
-        say('  prompt: %s' % (st and st.get('prompt')))
-        g.press('A', 2000); say('  A held at the %s (try %d)' % (what, i + 1))
-        end = time.time() + 3
-        while time.time() < end:
-            p = g.pos()
-            if p and p0 and dist(p, p0) >= reacted_m: return True
-            time.sleep(0.2)
-    return False
 
 
 def fly(g, to, hold=2.0):
@@ -242,86 +241,44 @@ def fly(g, to, hold=2.0):
     return p is not None and xz(p, to) < 4
 
 
-def prompt(g, look, tries=3, reacted=None, wait=2.0):
-    """A at a prompt: face it, a clean A, watch reacted() for wait seconds; again up to tries times."""
-    for i in range(tries):
-        g.send('autoshrine face %.2f %.2f %.2f' % look); g.wait(r'\[as-done\] face', 2)
-        t0 = time.time(); g.press('A'); say('  A (try %d)' % (i + 1))
-        while time.time() < t0 + wait:
-            if reacted(t0): return True
-            time.sleep(0.2)
-    return False
-
-
-def game_over_check(g):   # Link not moving for B and the screen not changing: A on the Game Over screen's Continue
-    g.key('B', 100); time.sleep(0.5)
-    if not held(g): return False
-    g.press('A'); time.sleep(8)
-    return True
-
-
 def do_shrine(g, s, state):
     n = s['n']; say('shrine %d %s (%s), save says %s' % (n, s['name'], s['kind'], state))
-    # 1. go to location
-    if not fly(g, s['travel']): g.shot('fly-failed'); return 'fly failed (returned or not landed)'
-    g.shot('landed')
+    in_map = lambda st: 'Dungeon%03d' % n in st.get('map', '')
+    # 1. go to location: the travel point (outside, in front of the door)
+    if not fly(g, s['travel']): g.shot('fly-failed'); return 'fly failed (returned, fell or not landed)'
+    door = toward(s['entrance'], s['travel'], 1.3)   # "Examine" showed 1.3 m out from the sigil (Ishodag)
     # 2. activate location
     if state in ('Appear', '?'):
-        # 1.6 m out from the door showed "Examine" (2026-10-28); 1.2 and 2.0 m if not
-        ok = hold_prompt(g, s['entrance'], s['travel'], near=1.6, what='door')   # 1.6 m from the door showed "Examine"
-        g.shot('gate')
-        if ok: skip_scenes(g, limit=40)
-        else: say('  the door did not react (already open?); walking in anyway')
-    # 3. enter location: the doorway and the lift take A HELD (Mayamats went in that way); judged by position, 6 s each
-    inside = lambda: (lambda st: bool(st) and 'Dungeon%03d' % n in st.get('map', ''))(g.state())   # the game's own map name
-    def wait_inside(sec=6):
-        end = time.time() + sec
-        while time.time() < end:
-            if inside(): return True
-            time.sleep(0.3)
-        return False
-    if not inside():   # walked in through the doorway onto the lift (facing it), A held there
-        hold_prompt(g, s['lift_floor'], s['entrance'], near=0.8, reacted_m=99, tries=1, what='lift')
-        wait_inside(6)
-    if not inside():
-        end = time.time() + 30   # the lift ride and the load
-        while time.time() < end and not inside(): time.sleep(0.5)
-    if not inside(): g.shot('not-in'); return 'enter: not inside after A held at the door and the lift'
+        if prompt_at(g, door, s['entrance'], 'door'): skip_scenes(g, limit=30)
+        else: say('  the door gave no scene (already open?)')
+    # 3. enter location: walk through the door onto the lift; its scene starts on its own, then the shrine's map
+    r = walk_to_spot(g, s['lift_floor'], near=0.6, stop=lambda st: st['event'] or in_map(st))
+    if r not in ('stopped',):
+        prompt_at(g, s['lift_floor'], s['lift'], 'lift', tries=1)
+    end = time.time() + 40
+    while time.time() < end:
+        st = g.state()
+        if st and in_map(st) and not st['event']: break
+        if st and st['event']: g.key('X', 1000)
+        time.sleep(0.5)
+    else: g.shot('not-in'); return 'enter: the shrine did not load'
     return do_inside(g, s)
 
 
-def do_inside(g, s):   # from inside the shrine: the altar, its scene, out
-    say('  inside %s' % s['name']); g.shot('inside')
-    skip_scenes(g, limit=30)
-    # 4. go to location exit, 5. exit location: on the altar's floor point, A held; its scene moves Link (1.3 m at Mayamats)
-    if not hold_prompt(g, s['goal_floor'], s['start'], near=0.8, reacted_m=0.8, what='altar'):
-        g.shot('altar-no-scene'); return 'altar: A got no scene'
-    say('  the blessing started')
-    # 6. the exit: until Link is back on the surface. A scene holding him: X (its skip) and B (messages, the item's Get).
-    # Free but still inside (the scene is over): A held at the altar again answers "Do you want to leave?" (2026-10-28,
-    # Turakawak). The start lift is not used: its spot dropped him through the floor.
-    outside = lambda: (lambda st: bool(st) and st.get('map', '').startswith('MainField'))(g.state())   # the game's map name
-    end = time.time() + 90; leaves = 0
-    while time.time() < end and not outside():
-        if held(g):
-            g.key('X', 100); time.sleep(0.25); g.key('X', 100); g.key('B', 100)
-        elif leaves < 3:
-            leaves += 1; say('  free inside: A held at the altar to leave (%d)' % leaves)
-            hold_prompt(g, s['goal_floor'], s['start'], near=0.8, reacted_m=0.8, tries=1, what='altar')
-    if not outside(): g.shot('not-out'); return 'could not get out'
-    say('  outside'); g.shot('outside')
+def do_inside(g, s):   # inside: the altar (its floor point, facing it), its scene skipped, out
+    say('  inside %s' % s['name'])
     skip_scenes(g, limit=20)
+    place(g, toward(s['goal_floor'], s['start'], 4.0), s['goal'])   # 4 m short of the altar's floor point
+    if not prompt_at(g, s['goal_floor'], s['goal'], 'altar'): g.shot('altar-no-scene'); return 'altar: A got no scene'
+    say('  the blessing started')
+    outside = lambda st: st.get('map', '').startswith('MainField')
+    r = skip_scenes(g, until=outside, limit=90)
+    if r == 'free':   # the scene is over and he is still inside: the altar asks "Do you want to leave?"
+        prompt_at(g, s['goal_floor'], s['goal'], 'leave', tries=1)
+        r = skip_scenes(g, until=outside, limit=60)
+    if r != 'until': g.shot('not-out'); return 'could not get out'
+    say('  outside'); skip_scenes(g, limit=15)
     return 'done'
-
-
-def inside_shrine(g, shrines, p):   # the shrine whose map the game loaded last, when Link is in shrine coordinates (all the
-    if p is None or p[1] < -100 or abs(p[0]) > 1000 or abs(p[2]) > 1000: return None   # interiors share them: the map file says which)
-    g.lines(); last = None
-    for t, f in g.files:
-        m = re.match(r'Banc/SmallDungeon/Dungeon(\d+)_', f)
-        if m: last = int(m.group(1))
-        elif f.startswith('Banc/MainField/'): last = None
-    return next((s for s in shrines if s['n'] == last), None)
 
 
 def main():
