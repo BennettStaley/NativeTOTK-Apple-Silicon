@@ -932,7 +932,8 @@ static int as_press_cycle(uintptr_t actor, const float prompt[3], double now, do
 }
 static void as_pick(uintptr_t actor, double now) {
     float at[3];
-    if (!as_pos(actor, at)) { if (now - as.t0 > 30) as_fail("no player to start from (30 s)", now); return; }
+    /* While a save loads the player reads back as the origin (0, -0.15, 0): wait for his real place, as for no player */
+    if (!as_pos(actor, at) || (fabsf(at[0]) < 1 && fabsf(at[2]) < 1)) { if (now - as.t0 > 120) as_fail("no player to start from (120 s)", now); return; }
     static Landmark lm[LANDMARKS]; int skip[SHRINES], count[SHRINE_SKIPS] = {0};
     int found = as_read_save(lm);
     for (int k = 0; k < SHRINES; k++) count[skip[k] = shrine_skip(&as_shrine[k], as.state[k], lm[LANDMARK_FIRST_SHRINE + k].lock, as.run[k])]++;
