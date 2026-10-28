@@ -890,7 +890,7 @@ static void as_end(int ok, const char *why, double now, int by_player) {
         if (!as.inside && noclip.holding && landmark_distance(noclip.xyz, at) > 40) runtime_noclip_goto(at);
         memcpy(as.stand, at, 12); as_step(AS_STOPPING, now); return;
     }
-    if (!by_player && atomic_load(&noclip_wanted)) runtime_noclip_set(0);
+    if (atomic_load(&noclip_wanted)) runtime_noclip_set(0);   /* stopped by the player too: never left flying (stuck in the ground, the game puts him back) */
     if (!atomic_load(&noclip_wanted)) dm_gfx_camera_want(0);
     as.step = AS_OFF; atomic_store(&as_active, 0); as_say();
 }
