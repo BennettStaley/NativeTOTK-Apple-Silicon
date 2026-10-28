@@ -240,25 +240,22 @@ def do_shrine(g, s, state):
 def do_inside(g, s):   # from inside the shrine: the altar, its scene, out
     say('  inside %s' % s['name']); g.shot('inside')
     skip_scenes(g, limit=30)
-    # 4. go to location exit (the altar)
-    g.send('noclip goto %.2f %.2f %.2f' % s['goal_floor']); g.wait(r'\[noclip\] arrived', 30)
-    time.sleep(0.6); g.send('noclip off'); time.sleep(1.0); g.shot('altar')
-    # 5. exit location: A at the altar; its scene moves Link
-    a = g.pos()
-    if not prompt(g, s['goal'], reacted=lambda t0: (lambda p: p is not None and a is not None and dist(p, a) > 1.0)(g.pos()), wait=2.0):
+    # 4. go to location exit, 5. exit location: on the altar's floor point, A held; its scene moves Link (1.3 m at Mayamats)
+    if not hold_prompt(g, [s['goal_floor']], s['goal'], reacted_m=0.8):
         g.shot('altar-no-scene'); return 'altar: A got no scene'
     say('  the blessing started')
-    # 6. wait for the location exit, or skip it: until Link is back on the surface
+    # 6. the exit: until Link is back on the surface. A scene holding him: X (its skip) and B (messages, the item's Get).
+    # Free but still inside (the scene is over): A held at the altar again answers "Do you want to leave?" (2026-10-28,
+    # Turakawak). The start lift is not used: its spot dropped him through the floor.
     outside = lambda: (lambda p: p is not None and xz(p, s['entrance']) < 200)(g.pos())
-    r = skip_scenes(g, until=outside, limit=90)
-    if r != 'until':
-        # 7. exit by walking: the start lift
-        say('  still inside after the altar (%s); the start lift' % r)
-        g.send('noclip goto %.2f %.2f %.2f' % s['back_floor']); g.wait(r'\[noclip\] arrived', 30); time.sleep(0.6); g.send('noclip off'); time.sleep(1)
-        prompt(g, s['back'], reacted=lambda t0: outside(), wait=4.0)
-        end = time.time() + 30
-        while time.time() < end and not outside(): time.sleep(0.5)
-        if not outside(): return 'could not get out'
+    end = time.time() + 90; leaves = 0
+    while time.time() < end and not outside():
+        if held(g):
+            g.key('X', 100); time.sleep(0.25); g.key('X', 100); g.key('B', 100)
+        elif leaves < 3:
+            leaves += 1; say('  free inside: A held at the altar to leave (%d)' % leaves)
+            hold_prompt(g, [s['goal_floor']], s['goal'], reacted_m=0.8, settle=1.0)
+    if not outside(): g.shot('not-out'); return 'could not get out'
     say('  outside'); g.shot('outside')
     skip_scenes(g, limit=20)
     return 'done'
@@ -290,7 +287,7 @@ def main():
             r = do_inside(g, cur); say('  -> %s' % r); results.append((cur['name'], r)); time.sleep(3); continue
         if a.shrine is not None: pick = [s for s in shrines if s['n'] == a.shrine]
         else:
-            pick = sorted((s for s in shrines if s['n'] not in tried and s['kind'] not in SKIP_KINDS and not (s['cave'] or s['hidden'] or s['crystal'])
+            pick = sorted((s for s in shrines if s['n'] not in tried and s['kind'] not in SKIP_KINDS and not (s['cave'] or s['hidden'] or s['crystal']) and s['travel'][1] > -100
                            and states.get(s['n']) in ('Appear', 'Open', 'Enter')),   # caves: the flight would end in rock or a chasm
                           key=lambda s: xz(here, s['travel']))
         if not pick: say('nothing left'); break
