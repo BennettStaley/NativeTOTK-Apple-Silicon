@@ -1166,6 +1166,7 @@ static void as_tick_diagnose(uintptr_t actor, double now, double t) {
     if (as.unknown_seen) { as.unknown_seen = 0; as_abandon("UNKNOWN twice: no recovery fits", now); return; }
     if (as_recover(REC_UNKNOWN, now)) as_go(AS_R_UNKNOWN, now, "UNKNOWN: keys let go, B twice, noclip off, look again");
 }
+static void as_script_tick(uintptr_t actor, double now);   /* script mode (below) */
 static void autoshrine_tick(uintptr_t actor, double now) {
     int req = atomic_exchange(&as_request, 0);
     if (req == 3 && as.step != AS_OFF && as.step != AS_STOPPING) { as_end(0, "Stopped: from the menu or the input file", now, 0); return; }
@@ -1176,7 +1177,7 @@ static void autoshrine_tick(uintptr_t actor, double now) {
         fprintf(stderr, "[autoshrine] start: %s, chests %s\n", as.target >= 0 ? "one chosen shrine" : as.one ? "the nearest shrine" : "every shrine it can do, nearest first", chests ? "on" : "off");
         as_go(AS_PICK, now, "start");
     }
-    if (as.step == AS_OFF) return;
+    if (as.step == AS_OFF) { as_script_tick(actor, now); return; }
     double dt = now - as.last_tick; as.last_tick = now;
     if (dt > 0.1) dt = 0.1;
     if (atomic_exchange(&as_cancel, 0) && now - as.started > 2 && as.step != AS_STOPPING) {
@@ -1450,6 +1451,32 @@ static void autoshrine_tick(uintptr_t actor, double now) {
     }
 }
 /* Reads the shrines (and their names and story places) from the RomFS once, then asks the frame-end thread to start. */
+/* Script mode (scripts/autoshrine.py drives the game through the input file; the flow is edited there, no rebuild):
+   "autoshrine info N" prints shrine N's places, "autoshrine face X Y Z" turns Link to a point, "autoshrine walk X Y Z MS"
+   walks him toward it (WASD from the camera) for MS milliseconds, "autoshrine watch on|off" logs the map and event files
+   the game opens ("[as-file] ..."). The frame-end thread carries out face and walk. */
+static _Atomic int as_script_watch;
+static pthread_mutex_t as_cmd_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct { int kind; float to[3]; double until; } as_cmd;   /* kind 1 face, 2 walk */
+static int as_load_sync(void) {
+    int expected = 0;
+    if (atomic_compare_exchange_strong(&as_loaded, &expected, 1)) {
+        LandmarkRomfs rom = {runtime_romfs_file_count, runtime_romfs_file_name, runtime_romfs_host_read, runtime_romfs_zs_decompress};
+        int places = landmarks_load(&rom, as_mark), ready = places ? shrines_load(&rom, as_shrine) : 0;
+        atomic_store(&as_loaded, ready ? 2 : 3);
+    }
+    while (atomic_load(&as_loaded) == 1) usleep(50000);
+    return atomic_load(&as_loaded) == 2;
+}
+static void as_script_tick(uintptr_t actor, double now) {
+    pthread_mutex_lock(&as_cmd_lock); int kind = as_cmd.kind; float to[3]; memcpy(to, as_cmd.to, 12); double until = as_cmd.until;
+    if (kind == 1 || (kind == 2 && now >= until)) as_cmd.kind = 0;
+    pthread_mutex_unlock(&as_cmd_lock);
+    if (!kind) return;
+    if (kind == 1) { as_face(actor, to); fprintf(stderr, "[as-done] face\n"); return; }
+    if (now >= until) { as_walk(0, NULL); float at[3]; if (as_pos(actor, at)) fprintf(stderr, "[as-done] walk at %.2f,%.2f,%.2f\n", at[0], at[1], at[2]); else fprintf(stderr, "[as-done] walk\n"); return; }
+    as_walk(actor, to); atomic_store_explicit(&runtime_survey_pending, 1, memory_order_release);
+}
 static void *as_start_thread(void *arg) {
     int one = (int)(intptr_t)arg, expected = 0;
     if (atomic_compare_exchange_strong(&as_loaded, &expected, 1)) {
@@ -1508,12 +1535,43 @@ int runtime_autoshrine_command(const char *line) {
         atomic_store(&as_skip_reveal, arg[0] == 'x' ? AS_KEY_X : arg[0] == 'b' ? AS_KEY_B : 0); fprintf(stderr, "[autoshrine] skip: %s\n", arg[0] == 'n' ? "off" : arg[0] == 'x' ? "X" : "B");
     }
     else if (!strcmp(word, "status")) { char s[600]; runtime_autoshrine_status(s, sizeof s); fprintf(stderr, "[autoshrine] status: %s\n", s); }
+    else if (!strcmp(word, "watch")) { atomic_store(&as_script_watch, !strcmp(arg, "on")); fprintf(stderr, "[as-done] watch %s\n", arg); }
+    else if (!strcmp(word, "info") && arg[0]) {
+        int k = atoi(arg);
+        if (!as_load_sync() || k < 0 || k >= SHRINES) { fprintf(stderr, "[as-info] %d none\n", k); return 1; }
+        const ShrineInfo *si = &as_shrine[k]; float p[3], f[3];
+        #define AS_P(name, v) fprintf(stderr, " %s=%.2f,%.2f,%.2f", name, (v)[0], (v)[1], (v)[2])
+        fprintf(stderr, "[as-info] %d name=%s kind=%s chests=%d", k, as_mark[LANDMARK_FIRST_SHRINE + k].name, SHRINE_KIND_TEXT[si->kind], si->nchests);
+        AS_P("entrance", si->entrance); AS_P("lift", si->lift); AS_P("lift_floor", si->lift_floor); AS_P("start", si->start);
+        AS_P("goal", si->goal); AS_P("goal_exit", si->goal_exit); AS_P("goal_floor", si->goal_floor); AS_P("back", si->back); AS_P("back_floor", si->back_floor);
+        shrine_stand(si, SHRINE_AT_TRAVEL, 0, p, f); AS_P("travel", p);
+        shrine_stand(si, SHRINE_AT_ACTIVATE, 0, p, f); AS_P("activate", p);
+        for (int c = 0; c < si->nchests && c < 4; c++) { char n[16]; snprintf(n, sizeof n, "chest%d", c); shrine_stand(si, SHRINE_AT_CHEST, c, p, f); AS_P(n, p); }
+        #undef AS_P
+        fputc('\n', stderr);
+    }
+    else if ((!strcmp(word, "face") || !strcmp(word, "walk"))) {
+        float x, y, z; int ms = 0;
+        if (sscanf(line + 11 + strlen(word), "%f %f %f %d", &x, &y, &z, &ms) < 3) { fprintf(stderr, "[autoshrine] rejected: %s X Y Z%s\n", word, word[0] == 'w' ? " MS" : ""); return 1; }
+        pthread_mutex_lock(&as_cmd_lock);
+        as_cmd.kind = word[0] == 'f' ? 1 : 2; as_cmd.to[0] = x; as_cmd.to[1] = y; as_cmd.to[2] = z; as_cmd.until = now_seconds() + (ms > 0 ? ms : 1000) / 1000.0;
+        pthread_mutex_unlock(&as_cmd_lock);
+        atomic_store_explicit(&runtime_survey_pending, 1, memory_order_release);
+    }
     else fprintf(stderr, "[autoshrine] rejected: expected start, one, finish N, stop, status, chests on|off or skip x|b|none\n");
     return 1;
 }
 /* romfs.c, every file the game opens (path relative to the RomFS): which map is loading, and the goal's event. */
 void runtime_autoshrine_romfs(const char *path) {
-    if (!atomic_load_explicit(&as_active, memory_order_relaxed) || !path) return;
+    if (!path) return;
+    if (atomic_load_explicit(&as_script_watch, memory_order_relaxed)) {   /* script mode: every shrine map, the first surface map
+        file after a shrine's, and every event flow */
+        static int field_logged;
+        if (!strncmp(path, "Banc/SmallDungeon/", 18)) { field_logged = 0; fprintf(stderr, "[as-file] %s\n", path); }
+        else if (!strncmp(path, "Banc/MainField/", 15) && !field_logged) { field_logged = 1; fprintf(stderr, "[as-file] %s\n", path); }
+        else if (!strncmp(path, "Event/EventFlow/", 16)) fprintf(stderr, "[as-file] %s\n", path);
+    }
+    if (!atomic_load_explicit(&as_active, memory_order_relaxed)) return;
     if (!strncmp(path, "Banc/", 5)) atomic_store(&as_map_ns, runtime_now_ns());   /* any map file: a load is going on */
     if (!strncmp(path, "Banc/SmallDungeon/Dungeon", 25) && landmark_ends(path, "_Static.bcett.byml.zs")) {
         atomic_store(&as_inside_index, atoi(path + 25)); atomic_fetch_add(&as_seq_inside, 1);
