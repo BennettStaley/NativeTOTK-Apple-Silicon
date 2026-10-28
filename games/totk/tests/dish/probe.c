@@ -1,7 +1,7 @@
 /* Unit test for runtime/dish_give.h and the Dishes parts of runtime/spawn_list.h: the GameData name hash against values
    the game and the save editors use, request limits, the change-queue room check, and the actor list's dishes and
-   @effect lines (a menu that cannot give dishes leaves them out). Also map_pins.h and landmarks.h (towers and shrines:
-   a small map file, message file and save made here). Prints one JSON line; exit 1 on failure. */
+   @effect lines (a menu that cannot give dishes leaves them out). Also map_pins.h and landmarks.h (towers, shrines and
+   the story's places: a small map file, place list, message file and save made here; the story flags and the lock). Prints one JSON line; exit 1 on failure. */
 #include "dish_give.h"
 #include "spawn_list.h"
 #include "map_pins.h"
@@ -13,7 +13,7 @@ static int failures, checks;
 #define CHECK(cond, ...) do { checks++; if (!(cond)) { failures++; fprintf(stderr, "FAIL: " __VA_ARGS__); fputc('\n', stderr); } } while (0)
 
 /* A little-endian BYML / MSBT / SARC made here, as the game's files are laid out. */
-static uint8_t buf[0x400]; static size_t at;
+static uint8_t buf[0x800]; static size_t at;
 static uint32_t put(const void *p, size_t n) { uint32_t o = (uint32_t)at; memcpy(buf + at, p, n); at += n; return o; }
 static uint32_t put32(uint32_t v) { return put(&v, 4); }
 static void align(size_t a) { while (at % a) buf[at++] = 0; }
@@ -96,15 +96,16 @@ int main(void) {
     CHECK(map_pins_parse(sav, sizeof sav, pins, 4) == 1 && !strcmp(pins[0].colour, "Red") && pins[0].xyz[1] == 200.25f, "one red pin");
     sav[0] = 0; CHECK(map_pins_parse(sav, sizeof sav, pins, 4) == 0, "not a save");
 
-    /* landmarks.h: a map file with one tower, its door 5 m out along x, and one shrine entrance with its travel point */
+    /* landmarks.h: a map file with one tower, its door 5 m out along x, one shrine entrance with its travel point, a
+       temple's travel point and a Lightroot (not a travel point to land at) */
     static const char *const keys[] = {"Actors", "Dynamic", "DungeonIndexStr", "Gyaml", "TowerNo", "Translate"};
     static const char *const strs[] = {"DgnObj_WarpPoint_Zonau_A_01", "DgnObj_ZonauShrineEntrance_A_01", "Dungeon007", "FldObj_CannonDoor_A_01",
-                                       "FldObj_Cannon_A_01", "Tower03"};
+                                       "FldObj_Cannon_A_01", "Tower03", "DgnObj_WarpPoint_Zonau_A_02", "DgnObj_WarpPoint_Zonau_A_04"};
     at = 16; memcpy(buf, "YB\x07\0", 4);
-    uint32_t kt = byml_table(keys, 6), st = byml_table(strs, 6), actor[4];
-    const float pos[4][3] = {{100, 50, 200}, {105, 50.5f, 200}, {-10, 300, 40}, {-11.5f, 300.5f, 40}};
-    const uint32_t gy[4] = {4, 3, 1, 0};
-    for (int i = 0; i < 4; i++) {
+    uint32_t kt = byml_table(keys, 6), st = byml_table(strs, 8), actor[6];
+    const float pos[6][3] = {{100, 50, 200}, {105, 50.5f, 200}, {-10, 300, 40}, {-11.5f, 300.5f, 40}, {500, 1600, 500}, {510, 1600, 500}};
+    const uint32_t gy[6] = {4, 3, 1, 0, 6, 7};
+    for (int i = 0; i < 6; i++) {
         const uint8_t ft[3] = {0xD2, 0xD2, 0xD2}; const uint32_t fv[3] = {f32(pos[i][0]), f32(pos[i][1]), f32(pos[i][2])};
         uint32_t tr = byml_array(3, ft, fv), dyn = 0;
         if (i == 0) { const uint32_t k[] = {4}, v[] = {5}; const uint8_t t[] = {0xA0}; dyn = byml_dict(1, k, t, v); }
@@ -112,17 +113,46 @@ int main(void) {
         const uint32_t k[] = {1, 3, 5}, v[] = {dyn, gy[i], tr}; const uint8_t t[] = {0xC1, 0xA0, 0xC0};
         actor[i] = dyn ? byml_dict(3, k, t, v) : byml_dict(2, k + 1, t + 1, v + 1);
     }
-    const uint8_t at4[] = {0xC1, 0xC1, 0xC1, 0xC1};
-    uint32_t list = byml_array(4, at4, actor);
+    const uint8_t at6[] = {0xC1, 0xC1, 0xC1, 0xC1, 0xC1, 0xC1};
+    uint32_t list = byml_array(6, at6, actor);
     const uint32_t rk[] = {0}, rv[] = {list}; const uint8_t rt[] = {0xC0};
     uint32_t root = byml_dict(1, rk, rt, rv);
     memcpy(buf + 4, &kt, 4); memcpy(buf + 8, &st, 4); memcpy(buf + 12, &root, 4);
     static LandmarkScan scan; static Landmark lm[LANDMARKS];
-    CHECK(landmarks_scan_byml(buf, at, &scan) == 4 && scan.has_centre[2] && scan.has_entrance[7] && scan.ndoors == 1 && scan.nwarps == 1, "map actors");
+    CHECK(landmarks_scan_byml(buf, at, &scan) == 5 && scan.has_centre[2] && scan.has_entrance[7] && scan.ndoors == 1 && scan.nwarps == 1 && scan.ntravels == 1,
+          "map actors (the Lightroot left out)");
     CHECK(landmarks_scan_byml(buf, 8, &scan) == -1, "not a map file");
     CHECK(landmarks_place(&scan, lm) == 2 && lm[2].placed && !lm[0].placed && lm[LANDMARK_TOWERS + 7].placed, "two placed");
     CHECK(lm[2].at[0] == 103.5f && lm[2].at[1] == 51.5f && lm[2].at[2] == 200, "the tower: 1.5 m in from its door, 1 m up");
     CHECK(lm[LANDMARK_TOWERS + 7].at[0] == -11.5f && lm[LANDMARK_TOWERS + 7].at[1] == 302 && lm[LANDMARK_TOWERS + 7].at[2] == 40, "the shrine: its travel point, 1.5 m up");
+
+    /* the map's place list: City_BaseCamp with one marker, LargeDungeonWind with two, under two marker kinds */
+    static const char *const akeys[] = {"City", "Dungeon", "LocationName", "Trans"};
+    static const char *const astrs[] = {"Work/Location/City_BaseCamp.game__location__Location.gyml", "Work/Location/LargeDungeonWind.game__location__Location.gyml"};
+    at = 16; memset(buf, 0, sizeof buf); memcpy(buf, "YB\x07\0", 4);
+    uint32_t akt = byml_table(akeys, 4), ast = byml_table(astrs, 2), kinds[2];
+    const float apos[3][3] = {{-200, 100, -100}, {480, 1500, 500}, {490, 1490, 500}};
+    for (int kind = 0; kind < 2; kind++) {
+        uint32_t vec[2]; const uint8_t ft[3] = {0xD2, 0xD2, 0xD2}, vt[2] = {0xC0, 0xC0};
+        for (int m = 0; m < 1 + kind; m++) { const uint32_t fv[3] = {f32(apos[kind + m][0]), f32(apos[kind + m][1]), f32(apos[kind + m][2])}; vec[m] = byml_array(3, ft, fv); }
+        uint32_t trans = byml_array(1 + kind, vt, vec);
+        const uint32_t k[] = {2, 3}, v[] = {(uint32_t)kind, trans}; const uint8_t t[] = {0xA0, 0xC0};
+        uint32_t place = byml_dict(2, k, t, v); const uint8_t pt[] = {0xC1};
+        kinds[kind] = byml_array(1, pt, &place);
+    }
+    const uint32_t ak[] = {0, 1}; const uint8_t aty[] = {0xC0, 0xC0};
+    uint32_t aroot = byml_dict(2, ak, aty, kinds);
+    memcpy(buf + 4, &akt, 4); memcpy(buf + 8, &ast, 4); memcpy(buf + 12, &aroot, 4);
+    float mk[4][3];
+    CHECK(landmark_markers(buf, at, "City_BaseCamp", mk, 4) == 1 && mk[0][0] == -200 && mk[0][2] == -100, "Lookout Landing's marker");
+    CHECK(landmark_markers(buf, at, "LargeDungeonWind", mk, 4) == 2 && mk[1][1] == 1490, "the Wind Temple's two markers");
+    CHECK(landmark_markers(buf, at, "City_Base", mk, 4) == 0 && landmark_markers(buf, at, "HyruleCastle", mk, 4) == 0, "no partial names, no such place");
+    Landmark temple = {0};
+    CHECK(landmark_place_story(&scan, (const float (*)[3])mk, 2, &temple) && temple.at[0] == 500 && temple.at[1] == 1601.5f, "the temple lands at its travel point, 1.5 m up");
+    const float far[1][3] = {{-200, 100, -100}};
+    CHECK(!landmark_place_story(&scan, far, 1, &temple) && !temple.placed, "no travel point within 150 m: not placed");
+    const float island[3] = {394, 1937, 1260}, on[3] = {390, 2404, 1662}, low[3] = {275, 1565, 912}, below[3] = {400, 122, 1300}, off[3] = {1500, 2000, 1260};
+    CHECK(landmark_on_island(island, on) && landmark_on_island(island, low) && !landmark_on_island(island, below) && !landmark_on_island(island, off), "Great Sky Island");
 
     /* an MSBT with "Tower03" = "Ab" around a tag and a closing tag, inside a SARC */
     at = 0; memset(buf, 0, sizeof buf);
@@ -153,9 +183,63 @@ int main(void) {
     uint32_t end = 0xa3db7114; memcpy(save2 + fe, &end, 4);
     CHECK(dish_murmur3("IsActivateCannon.Tower01") == 0xb8fb6253 && dish_murmur3("DungeonState.Dungeon000") == 0x3eb899d5 && dish_murmur3("IsVisitLocation.Dungeon000") == 0xa487c021,
           "flag hashes (savegame-editors)");
-    CHECK(landmarks_state_parse(save2, sizeof save2, lm) == 12, "twelve flags");
+    LandmarkProgress pr;
+    CHECK(landmarks_state_parse(save2, sizeof save2, lm, &pr) == 12, "twelve flags");
+    CHECK(!pr.known && !pr.island_done && !pr.depths_found, "no story flags: nothing known");
     CHECK(lm[0].state == LANDMARK_DONE && lm[1].state == LANDMARK_FOUND && lm[2].state == LANDMARK_NOT_FOUND && lm[3].state == LANDMARK_UNKNOWN, "tower states");
     CHECK(lm[15].state == LANDMARK_DONE && lm[16].state == LANDMARK_FOUND && lm[17].state == LANDMARK_NOT_FOUND && lm[18].state == LANDMARK_UNKNOWN, "shrine states");
+
+    /* the story: flag hashes from savegame-editors' hashes.csv, then a save past Great Sky Island with the Wind Temple's quest
+       started and the temple visited, the Fire Temple done, the Lightning Temple's quest before the temple is found and no
+       Depths yet */
+    static const struct { const char *name; uint32_t hash; } story_flags[] = {
+        {"Step_MainChallenge", 0x3ee80d28}, {"IsGet.Parasail", 0x3ab92852}, {"IsVisitLocation.MinusField", 0xdd37b5c8},
+        {"Step_SageOfWind", 0x683b1363}, {"Step_SageOfFire", 0xeea87aec}, {"Step_SageOfZora", 0x16c8291d}, {"Step_SageOfGerudo", 0xc2bf4337},
+        {"Step_SageOfSoul", 0x2b47272e}, {"IsVisitLocation.LargeDungeonWind", 0x30979f76}, {"IsVisitLocation.City_BaseCamp", 0xc93f34c5},
+        {"IsVisitLocation.CheckPoint000", 0x7bce687d}, {"ArrivalPointState.CheckPoint000", 0x7983cce0}};
+    for (size_t i = 0; i < sizeof story_flags / sizeof *story_flags; i++)
+        CHECK(dish_murmur3(story_flags[i].name) == story_flags[i].hash, "murmur3(%s) = %08x, want %08x", story_flags[i].name, dish_murmur3(story_flags[i].name), story_flags[i].hash);
+    enum { LOOKOUT = LANDMARK_FIRST_STORY, WIND, FIRE, WATER, THUNDER, SOUL };
+    static uint8_t save3[0x400]; memcpy(save3, w, 4); size_t se = 0x28;
+    const struct { const char *name, *step; uint32_t value; } story[] = {
+        {"Step_MainChallenge", "LookingForZelda", 0}, {"IsGet.Parasail", NULL, 1}, {"IsVisitLocation.MinusField", NULL, 0},
+        {"IsVisitLocation.City_BaseCamp", NULL, 1}, {"Step_SageOfWind", "MountainHut", 0}, {"IsVisitLocation.LargeDungeonWind", NULL, 1},
+        {"Step_SageOfFire", "TouchSecretStone", 0}, {"Step_SageOfZora", "Ready", 0}, {"IsVisitLocation.LargeDungeonWater", NULL, 0},
+        {"Step_SageOfGerudo", "Underground", 0}, {"Step_SageOfSoul", "Ready", 0}, {"IsVisitLocation.CheckPoint005", NULL, 0},
+        {"ArrivalPointState.CheckPoint005", "Close", 0}, {"IsVisitLocation.Dungeon060", NULL, 0}};
+    for (size_t i = 0; i < sizeof story / sizeof *story; i++, se += 8) {
+        uint32_t h = dish_murmur3(story[i].name), v = story[i].step ? dish_murmur3(story[i].step) : story[i].value;
+        memcpy(save3 + se, &h, 4); memcpy(save3 + se + 4, &v, 4);
+    }
+    memcpy(save3 + se, &end, 4);
+    for (int k = 0; k < LANDMARKS; k++) { lm[k].placed = 1; lm[k].island = k == LANDMARK_FIRST_SHRINE + 60; lm[k].depths = k == FIRE || k == SOUL; }
+    landmarks_state_parse(save3, sizeof save3, lm, &pr);
+    CHECK(pr.known && pr.island_done && !pr.depths_found, "past the island, not in the Depths");
+    CHECK(lm[LOOKOUT].state == LANDMARK_FOUND && lm[WIND].state == LANDMARK_FOUND && lm[FIRE].state == LANDMARK_DONE && lm[WATER].state == LANDMARK_NOT_FOUND,
+          "story states");
+    CHECK(lm[LOOKOUT].opened && lm[WIND].opened && lm[FIRE].opened && !lm[WATER].opened && !lm[THUNDER].opened && !lm[SOUL].opened, "opened by the quests");
+    landmarks_lock(lm, &pr, 1);
+    CHECK(lm[LOOKOUT].lock == LANDMARK_OPEN && lm[WIND].lock == LANDMARK_OPEN && lm[FIRE].lock == LANDMARK_LOCK_DEPTHS && lm[WATER].lock == LANDMARK_LOCK_QUEST
+          && lm[THUNDER].lock == LANDMARK_LOCK_QUEST && lm[SOUL].lock == LANDMARK_LOCK_DEPTHS && lm[0].lock == LANDMARK_OPEN, "the lock past the island");
+    landmarks_lock(lm, &pr, 0);
+    int any = 0; for (int k = 0; k < LANDMARKS; k++) any |= lm[k].lock;
+    CHECK(!any, "the lock off: nothing locked");
+    const struct { const char *name, *step; } later[3][2] = {
+        {{"ArrivalPointState.CheckPoint005", "Open"}, {"Step_SageOfGerudo", "DungeonFind"}},   /* a Lightroot lit, the Lightning Temple found */
+        {{"Step_MainChallenge", "GoToBackOfTempleOfTimeAfterWD"}, {"IsGet.Parasail", NULL}},     /* back on Great Sky Island */
+        {{"Step_MainChallenge", "Ready"}, {"IsGet.Parasail", "1"}}};                              /* the paraglider alone */
+    for (int c = 0; c < 3; c++) {
+        for (int j = 0; j < 2; j++) {
+            uint32_t h = dish_murmur3(later[c][j].name), v = !later[c][j].step ? 0 : !strcmp(later[c][j].step, "1") ? 1 : dish_murmur3(later[c][j].step);
+            for (size_t i = 0x28; i < se; i += 8) if (!memcmp(save3 + i, &h, 4)) memcpy(save3 + i + 4, &v, 4);
+        }
+        landmarks_state_parse(save3, sizeof save3, lm, &pr); landmarks_lock(lm, &pr, 1);
+        if (c == 0) CHECK(pr.depths_found && lm[FIRE].lock == LANDMARK_OPEN && lm[THUNDER].lock == LANDMARK_OPEN && lm[SOUL].lock == LANDMARK_LOCK_QUEST,
+                          "a lit Lightroot opens the Depths, the found temple its row");
+        if (c == 1) CHECK(pr.known && !pr.island_done && lm[LANDMARK_FIRST_SHRINE + 60].lock == LANDMARK_OPEN && lm[0].lock == LANDMARK_LOCK_ISLAND
+                          && lm[LOOKOUT].lock == LANDMARK_LOCK_ISLAND && lm[WIND].lock == LANDMARK_LOCK_ISLAND, "on the island: only its places");
+        if (c == 2) CHECK(pr.island_done && lm[0].lock == LANDMARK_OPEN, "the paraglider: off the island");
+    }
 
     printf("{\"status\":\"%s\",\"probe\":\"probe-dish\",\"checked\":%d,\"failures\":%d}\n", failures ? "fail" : "pass", checks, failures);
     return failures != 0;

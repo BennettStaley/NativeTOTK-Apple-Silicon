@@ -33,9 +33,10 @@ typedef struct {
 
 /* The menu: four top tabs, each a row of sections. A section either lists the settings whose page is its name
    (SETTINGS_PAGES, in menu order: settings.txt is grouped the same way) or is a page of its own (Mods, Saves, Cheats,
-   Teleport, Spawn), which holds no settings, so Reset never touches mods, saves, cheats or the spawner's favorites. */
+   Teleport, Spawn), which holds no settings, so Reset never touches mods, saves, cheats or the spawner's favorites. The one
+   exception is Teleport's story lock (teleport.story_lock): the page shows it at its top, and Reset puts it back on. */
 static const char *const SETTINGS_PAGES[] = {"Display", "Frame rate", "Controls", "Audio", "Interface", "Image", "Effects",
-                                             "World detail", "Downloads", "World", "Camera"};
+                                             "World detail", "Downloads", "Teleport", "World", "Camera"};
 enum { SETTINGS_NPAGES = sizeof SETTINGS_PAGES / sizeof *SETTINGS_PAGES };
 static const char *const SETTINGS_TABS[] = {"Game", "Graphics", "Content", "Tools"};
 enum { SETTINGS_NTABS = sizeof SETTINGS_TABS / sizeof *SETTINGS_TABS };
@@ -203,6 +204,10 @@ static const SettingDef SETTINGS[] = {
      "TOTK_GYRO", SET_BOOL, SET_LIVE, SET_MAC, 1, 1, 0, 1, 1, NULL, NULL, 0, "Not on iPhone and iPad yet.", NULL, 0},
     {"audio.volume", "Audio", "Volume", NULL,
      NULL, SET_RANGE, SET_LIVE, SET_ALL, 100, 100, 0, 100, 5, "%", NULL, 0, NULL, NULL, 0},
+    /* Tools › Teleport (settings_panel_mac.h buildTeleport, landmarks.h landmarks_lock): places the newest save has not reached
+       in the story are greyed, with the reason, and cannot be flown to. Map pins never are. */
+    {"teleport.story_lock", "Teleport", "Only places the story has opened", "Greys out the places your last save has not reached in the story, so a teleport cannot skip ahead: everything off Great Sky Island until you leave it, the Depths until you have been down, a temple until its region's quest has started. Map pins are never locked.",
+     NULL, SET_BOOL, SET_LIVE, SET_MAC, 1, 1, 0, 1, 1, NULL, NULL, 0, "Teleport is on the Mac only.", NULL, 0},
     {"world.time_speed", "World", "Time of day speed", "How fast the day passes: the clock, the sun and the sky (version 1.4.3). Paused stops the time of day.",
      "TOTK_TIME_SPEED", SET_CHOICE, SET_LIVE, SET_ALL, 100, 100, 0, 0, 0, NULL, SET_TIME_SPEED, SET_N(SET_TIME_SPEED), NULL, NULL, 0},
 };
@@ -210,7 +215,8 @@ enum { SETTINGS_COUNT = sizeof SETTINGS / sizeof *SETTINGS };
 
 static inline int settings_in_tab(int i, int tab) {
     for (int k = 0; k < SETTINGS_NSECTIONS; k++)
-        if (SETTINGS_SECTIONS[k].tab == tab && SETTINGS_SECTIONS[k].kind == MENU_SETTINGS && !strcmp(SETTINGS[i].page, SETTINGS_SECTIONS[k].name)) return 1;
+        if (SETTINGS_SECTIONS[k].tab == tab && (SETTINGS_SECTIONS[k].kind == MENU_SETTINGS || SETTINGS_SECTIONS[k].kind == MENU_TELEPORT)
+            && !strcmp(SETTINGS[i].page, SETTINGS_SECTIONS[k].name)) return 1;
     return 0;
 }
 static inline int settings_index(const char *key) {
