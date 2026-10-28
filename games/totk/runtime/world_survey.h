@@ -37,5 +37,5 @@ void runtime_autoshrine_stop(void);
 void runtime_autoshrine_set_chests(int on);         /* open each shrine's chests on the way (off at every start) */
 int runtime_autoshrine_chests(void);
 int runtime_autoshrine_status(char *text, size_t size);   /* the status line; 1 while a run is on */
-int runtime_autoshrine_command(const char *line);   /* the input file's "autoshrine start | one | finish N | stop | status | chests on|off" */
+int runtime_autoshrine_command(const char *line);   /* the input file's "autoshrine start | one | finish N | stop | status | chests on|off | skip x|b|none" */
 void runtime_autoshrine_romfs(const char *path);    /* romfs.c: each file the game opens, relative to the RomFS */

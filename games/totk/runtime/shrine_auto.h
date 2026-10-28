@@ -17,7 +17,9 @@
    DmF_SY_SmallDungeonGoal, not cleared yet: the blessing (Touch, Light of Blessing, the "Get" screen), then
    EventTriggerSetDungeonClear and EventReserveBancChangeExitSmallDungeon: the game leaves the shrine by itself (boot event
    DmF_SY_SmallDungeon5Out: Link in front of the entrance, then an autosave; on Great Sky Island the island's story scenes
-   instead). Cleared already: a Yes / No question to leave. 4Return (the start lift) leaves without clearing.
+   instead). Cleared already: talk00 "Do you want to leave?", choices "I'm ready to go." (0: the default and what B picks) and
+   "I'll stay." (1); 0 leaves. The monk's lines (talk01..talk11) are messages that A or B advances. GetUI is where the
+   Light of Blessing is given (MelonSpeedruns/TotkRandomizer cuts it there, Event4 -> Event52, to remove the orb). 4Return (the start lift) leaves without clearing.
    The kind: Scene/Component/SmallDungeonParam/DungeonNNN.game__scene__SmallDungeonParam.bgyml Type (none: puzzle;
    Gimmick: puzzle; EnemyWithCombine: a fight; Enemy: Proving Grounds, the gear taken at the door and given back by the
    goal; Treasure: the reward of a challenge outside, Rauru's Blessing).
