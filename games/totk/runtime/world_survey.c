@@ -796,7 +796,7 @@ static const char *const AS_REC_TEXT[RECS] = {"MENU_OPEN", "RETURNED", "PROMPT_N
 static const int AS_REC_MAX[RECS] = {3, 2, 3, 3, 1};
 static struct {
     int step, stage, one, target, k, chest, done, after, tries, event, back, flight, phase, have_last, have_safe, inside;   /* inside: in the shrine's own map */
-    int walk, until_field, skips, approached, wd_have, goal_ok, moving;   /* walk: the WASD keys held (SHRINE_STICK_...); until_field / skips /
+    int walk, until_field, skips, approached, wd_have, goal_ok, moving, held;   /* held: the last stick probe found Link held by a scene */   /* walk: the WASD keys held (SHRINE_STICK_...); until_field / skips /
         moving: AS_SCENE's; approached: walked up to the prompt (a recovery did it); goal_ok: the altar's event was seen to start */
     int ret, rec[RECS], rec_kind, menu_fixing, unknown_seen, recovering, resume, abandoned_row, skipped, verify_k, gate_needed;
         /* ret: the state a recovery returns to; rec: each recovery's count for this shrine; recovering: walking out of an
@@ -1044,7 +1044,7 @@ static void as_pick(uintptr_t actor, double now) {
 }
 /* A cutscene (or a message): skipped at once and again every 0.8 s; until_field: the altar's (it ends with the surface's map). */
 static void as_scene(int after, int until_field, double now, const char *why) {
-    as.after = after; as.until_field = until_field; as.skips = 0; as.moving = 0;
+    as.after = after; as.until_field = until_field; as.skips = 0; as.moving = 0; as.held = 0;
     as_go(AS_SCENE, now, why);
 }
 static void as_after_inside(double now) {   /* step 4: the chests if asked, then onto SmallDungeonExit, by the altar's prompt */
@@ -1222,25 +1222,30 @@ static void autoshrine_tick(uintptr_t actor, double now) {
         if (as.after == AS_WALK && (atomic_load(&as_seq_inside) != as.seq_inside || (have && landmark_distance(at, s->start) < 60))) {
             uint32_t seen = as.seq_inside; as_stage(3); as_go(AS_LOADING, now, "the way in started during the gate's scene"); as.seq_inside = seen; return;
         }
-        if (as.until_field && !as.goal_ok && have && t < 4) {   /* the altar's event pulls him to it (in front of the monk) */
-            float was = landmark_distance(as.a_pos, s->goal), d = landmark_distance(at, s->goal);
+        if (as.until_field && !as.goal_ok) {   /* the altar's event moves him (in front of the monk; 9.7 m in a test, 2026-10-28):
+            nothing is pressed until it is seen, as X would jump and the stick walk him away while nothing plays */
             if (atomic_load(&as_seq_goal) != as.seq_goal) { as.goal_ok = 1; fprintf(stderr, "[autoshrine] the goal's event file opened\n"); }
-            else if (landmark_distance(at, as.a_pos) > 0.5f && d < was - 0.3f) { as.goal_ok = 1; fprintf(stderr, "[autoshrine] the altar pulled Link in (%.1f m closer)\n", was - d); }
+            else if (have && landmark_distance(at, as.a_pos) > 1.5f) { as.goal_ok = 1; fprintf(stderr, "[autoshrine] the altar's event moved Link %.1f m: the blessing has started\n", landmark_distance(at, as.a_pos)); }
+            else if (t > 6) { as_diagnose(AS_GOAL, now, "the altar's A started nothing (Link not moved by an event in 6 s)"); return; }
+            else return;
+            as.t0 = now; as.tries = 0; as.phase = 0; as.moving = 0; as.held = 1; t = 0;   /* the skipping starts now: he is held by it */
         }
         if (t > 120) { as_diagnose(as.after, now, "a scene did not end within 2 minutes"); return; }
         if (have) as_key(as.until_field ? AS_KEY_DOWN : AS_KEY_UP, 0.3);
         double c = t - 0.8 * as.tries; int reveal = atomic_load(&as_skip_reveal);
+        /* X (Switch X, the top button: "Skip X", shown as "Skip Y" with Xbox labels) only while the last probe found Link held:
+           in play the same button jumps. The first cycle only probes. */
         if (as.phase == 0) {
             if (have) memcpy(as.probe, at, 12);
-            if (reveal) { as_key((unsigned)reveal, 0.1); as.skips++; }
+            if (reveal && as.held) { as_key((unsigned)reveal, 0.1); as.skips++; }
             as.phase = 1;
-        } else if (as.phase == 1 && c >= 0.25) { if (reveal) as_key((unsigned)reveal, 0.1); as.phase = 2; }
-        else if (as.phase == 2 && c >= 0.5) { if (as.tries & 1) as_key(AS_KEY_B, 0.1); as.phase = 3; }
+        } else if (as.phase == 1 && c >= 0.25) { if (reveal && as.held) as_key((unsigned)reveal, 0.1); as.phase = 2; }
+        else if (as.phase == 2 && c >= 0.5) { if ((as.tries & 1) && as.held) as_key(AS_KEY_B, 0.1); as.phase = 3; }   /* B: a message or the item's Get screen */
         else if (as.phase == 3 && c >= 0.8) {
             float moved = have ? landmark_distance(at, as.probe) : 0;
-            as.moving = moved > 0.3f ? as.moving + 1 : 0;
+            as.moving = moved > 0.3f ? as.moving + 1 : 0; as.held = moved <= 0.3f;
             as.tries++; as.phase = 0;
-            if (as.moving >= 2 && (!as.until_field || t > 4)) {
+            if (as.moving >= 2 && (!as.until_field || t > 6)) {
                 char why[120]; snprintf(why, sizeof why, "Link walks again after %.1f s (%d skip tries)", t, as.skips);
                 if (as.until_field && !as.goal_ok) { as_diagnose(AS_GOAL, now, "the altar's A started nothing"); return; }
                 if (as.until_field) {   /* the altar's scene is over and he is still inside: ask the altar to leave */
