@@ -228,8 +228,11 @@ static inline int shrine_states_parse(const uint8_t *b, size_t n, uint8_t *state
    The approach (walking in): 1 m further out than the travel point on the line from the lift out through the entrance,
    facing the lift (face is where he walks to). The start lift's approach: 3 m back from its floor toward the shrine's
    start, facing the lift's prompt. Activating: 0.5 m out from AuthenticationPos (without it, 1.85 m in from the entrance),
-   facing in (a point 5 m further in). */
-enum { SHRINE_AT_GATE, SHRINE_AT_LIFT, SHRINE_AT_GOAL, SHRINE_AT_BACK, SHRINE_AT_CHEST, SHRINE_AT_APPROACH, SHRINE_AT_BACK_APPROACH, SHRINE_AT_ACTIVATE };
+   facing in (a point 5 m further in); a place he walks to, never one he is set down at: AuthenticationPos is inside the
+   closed entrance, and set down there the game fades out and puts him back (field test, 2026-10-28, Ukouh Shrine).
+   The travel point: where every shrine visit lands (the Shrines tab's Go, landmarks.h): the travel point 1.5 m up,
+   facing the entrance's AuthenticationPos. */
+enum { SHRINE_AT_GATE, SHRINE_AT_LIFT, SHRINE_AT_GOAL, SHRINE_AT_BACK, SHRINE_AT_CHEST, SHRINE_AT_APPROACH, SHRINE_AT_BACK_APPROACH, SHRINE_AT_ACTIVATE, SHRINE_AT_TRAVEL };
 static inline void shrine_unit_xz(const float from[3], const float to[3], float out[2]) {
     float dx = to[0] - from[0], dz = to[2] - from[2], l = sqrtf(dx * dx + dz * dz);
     out[0] = l > 1e-3f ? dx / l : 0; out[1] = l > 1e-3f ? dz / l : 1;
@@ -260,6 +263,14 @@ static inline void shrine_stand(const ShrineInfo *s, int where, int chest, float
         else { stand[0] = s->entrance[0] + 1.85f * in[0]; stand[1] = s->entrance[1] + 0.45f; stand[2] = s->entrance[2] + 1.85f * in[1]; }
         stand[0] -= 0.5f * in[0]; stand[2] -= 0.5f * in[1];
         face[0] = stand[0] + 5 * in[0]; face[1] = stand[1]; face[2] = stand[2] + 5 * in[1];
+        break;
+    }
+    case SHRINE_AT_TRAVEL: {
+        float in[2]; shrine_unit_xz(s->entrance, s->lift, in);
+        if (s->has_warp) memcpy(stand, s->warp, 12);
+        else { stand[0] = s->entrance[0] - 1.9f * in[0]; stand[1] = s->entrance[1]; stand[2] = s->entrance[2] - 1.9f * in[1]; }
+        stand[1] += 1.2f;   /* 1.5 m up with the 0.3 below */
+        if (s->has_auth) memcpy(face, s->auth, 12); else memcpy(face, s->entrance, 12);
         break;
     }
     case SHRINE_AT_BACK_APPROACH: {
