@@ -1470,10 +1470,17 @@ static int as_load_sync(void) {
 }
 static void as_script_tick(uintptr_t actor, double now) {
     pthread_mutex_lock(&as_cmd_lock); int kind = as_cmd.kind; float to[3]; memcpy(to, as_cmd.to, 12); double until = as_cmd.until;
-    if (kind == 1 || (kind == 2 && now >= until)) as_cmd.kind = 0;
+    if (kind == 1 || kind == 3 || (kind == 2 && now >= until)) as_cmd.kind = 0;
     pthread_mutex_unlock(&as_cmd_lock);
     if (!kind) return;
     if (kind == 1) { as_face(actor, to); fprintf(stderr, "[as-done] face\n"); return; }
+    if (kind == 3) {
+        float at[3] = {0}, rot[9] = {0}, cam[3] = {0}, right[3] = {0}; uint64_t fr = 0;
+        int have = as_pos(actor, at) && read_mem(actor + ACTOR_ROT, rot, sizeof rot), camok = dm_gfx_camera(cam, right, &fr);
+        fprintf(stderr, "[as-pose] %s pos=%.2f,%.2f,%.2f fwd=%.3f,%.3f cam=%.2f,%.2f,%.2f right=%.3f,%.3f%s\n", have ? "ok" : "none", at[0], at[1], at[2],
+                rot[2], rot[8], cam[0], cam[1], cam[2], right[0], right[2], camok ? "" : " nocam");
+        return;
+    }
     if (now >= until) { as_walk(0, NULL); float at[3]; if (as_pos(actor, at)) fprintf(stderr, "[as-done] walk at %.2f,%.2f,%.2f\n", at[0], at[1], at[2]); else fprintf(stderr, "[as-done] walk\n"); return; }
     as_walk(actor, to); atomic_store_explicit(&runtime_survey_pending, 1, memory_order_release);
 }
@@ -1535,6 +1542,10 @@ int runtime_autoshrine_command(const char *line) {
         atomic_store(&as_skip_reveal, arg[0] == 'x' ? AS_KEY_X : arg[0] == 'b' ? AS_KEY_B : 0); fprintf(stderr, "[autoshrine] skip: %s\n", arg[0] == 'n' ? "off" : arg[0] == 'x' ? "X" : "B");
     }
     else if (!strcmp(word, "status")) { char s[600]; runtime_autoshrine_status(s, sizeof s); fprintf(stderr, "[autoshrine] status: %s\n", s); }
+    else if (!strcmp(word, "pose")) {   /* Link's place and facing (his local +z, level) and the camera's place and right vector */
+        dm_gfx_camera_want(1); pthread_mutex_lock(&as_cmd_lock); as_cmd.kind = 3; pthread_mutex_unlock(&as_cmd_lock);
+        atomic_store_explicit(&runtime_survey_pending, 1, memory_order_release);
+    }
     else if (!strcmp(word, "watch")) { atomic_store(&as_script_watch, !strcmp(arg, "on")); fprintf(stderr, "[as-done] watch %s\n", arg); }
     else if (!strcmp(word, "info") && arg[0]) {
         int k = atoi(arg);
