@@ -312,9 +312,40 @@ def do_shrine(g, s, state):
     return do_inside(g, s)
 
 
+USE_EVENT = True   # the altar's own event started by name (ctl event; verified 2026-10-28, Kisinona); --altar walks to it instead
+
+
 def do_inside(g, s):   # inside: the altar (its floor point, facing it), its scene skipped, out
     say('  inside %s' % s['name'])
     skip_scenes(g, limit=20)
+    if USE_EVENT:
+        free_since = None; end = time.time() + 15   # the arrival scene holds the event manager: wait until Link is free 2 s
+        while time.time() < end:
+            st = g.state()
+            if st and not st['event']:
+                free_since = free_since or time.time()
+                if time.time() - free_since >= 2: break
+            else: free_since = None
+            time.sleep(0.3)
+        g.send('ctl event DmF_SY_SmallDungeonGoal'); m = g.wait(r'\[ctl-done\] event .*', 5)
+        say('  %s' % (m.group(0) if m else 'no answer to ctl event'))
+        if not m or 'refused' in m.group(0): say('  refused; the altar instead'); return do_altar(g, s)
+        st = None
+        for _ in range(10):
+            st = g.state()
+            if st and st['event']: break
+            time.sleep(0.3)
+        if st and st['event']:
+            say('  the blessing started (event)')
+            outside = lambda st: st.get('map', '').startswith('MainField')
+            if skip_scenes(g, until=outside, limit=90) == 'until':
+                say('  outside'); skip_scenes(g, limit=15); return 'done'
+            say('  the event did not take Link out; the altar instead')
+        else: say('  no event; the altar instead')
+    return do_altar(g, s)
+
+
+def do_altar(g, s):
     out = toward(s['goal_floor'], s['goal'], -3.0)   # 3 m further out along the altar's own front (altar -> its floor point)
     place(g, out, s['goal'])
     if not prompt_at(g, s['goal_floor'], 'altar', look=s['goal']): g.shot('altar-no-scene'); return 'altar: A got no scene'
@@ -330,8 +361,9 @@ def do_inside(g, s):   # inside: the altar (its floor point, facing it), its sce
 
 
 def main():
-    ap = argparse.ArgumentParser(); ap.add_argument('--run', required=True); ap.add_argument('--shrine', type=int); ap.add_argument('--count', type=int, default=3)
+    ap = argparse.ArgumentParser(); ap.add_argument('--run', required=True); ap.add_argument('--shrine', type=int); ap.add_argument('--count', type=int, default=3); ap.add_argument('--altar', action='store_true')
     a = ap.parse_args()
+    global USE_EVENT; USE_EVENT = not a.altar
     g = Game(a.run); g.send('autoshrine watch on'); g.wait(r'\[as-done\] watch', 10)
     need = ('travel', 'entrance', 'lift', 'lift_floor', 'start', 'goal', 'goal_floor', 'back', 'back_floor')
     shrines = []
