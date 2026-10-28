@@ -1,4 +1,4 @@
-/* The places Mac Tools › Teleport flies to: the 15 Skyview Towers, the 152 shrines and the story's places (Lookout Landing,
+/* The places Mac Tools › Teleport, Towers and Shrines fly to: the 15 Skyview Towers, the 152 shrines and the story's places (Lookout Landing,
    the five temples), read from the game's own RomFS and the player's newest save; nothing of the game is kept in the port.
    Places: the static actors of the surface and the Depths (the Banc/MainField and Banc/MinusField files ending
    _Static.bcett.byml.zs, BYML v7). A tower is FldObj_Cannon_A_01 with Dynamic.TowerNo "Tower01".."Tower15" and its door
@@ -61,6 +61,7 @@ static const LandmarkGroup LANDMARK_GROUPS[] = {{"Story", LANDMARK_FIRST_STORY, 
                                                 {"Shrines", LANDMARK_FIRST_SHRINE, LANDMARK_SHRINES, 1}};
 enum { LANDMARK_NGROUPS = sizeof LANDMARK_GROUPS / sizeof *LANDMARK_GROUPS };
 static inline int landmark_is_story(int k) { return k >= LANDMARK_FIRST_STORY && k < LANDMARKS; }
+static inline int landmark_is_shrine(int k) { return k >= LANDMARK_FIRST_SHRINE && k < LANDMARK_FIRST_STORY; }
 
 static inline void landmark_label(int k, char *out, size_t size) {
     if (k < LANDMARK_TOWERS) snprintf(out, size, "Tower%02d", k + 1);

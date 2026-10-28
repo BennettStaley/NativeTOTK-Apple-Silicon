@@ -1,4 +1,4 @@
-/* Auto shrine (Mac Tools › Teleport › Complete shrines automatically; world_survey.c runs it): what a run needs of each of
+/* Auto shrine (Mac Tools › Shrines › Complete shrines automatically; world_survey.c runs it): what a run needs of each of
    the 152 shrines, read from the game's own RomFS, and the run's pure choices (which shrines it can do, which one is next,
    where Link stands for each step). The game completes each shrine itself; nothing here writes a flag.
    What the files say (1.4.3, read 2026-10-27: the Banc map files and the Event/EventFlow flows):

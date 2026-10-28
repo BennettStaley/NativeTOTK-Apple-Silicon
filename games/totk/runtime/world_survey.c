@@ -189,8 +189,12 @@ int runtime_noclip_on(void) { return 0; }
 void runtime_noclip_set_speed(float v) { (void)v; }
 int runtime_noclip_goto(const float xyz[3]) { (void)xyz; return 0; }
 float runtime_noclip_speed(void) { return 0; }
+const int runtime_noclip_speeds[NOCLIP_NSPEEDS] = {5, 12, 25, 50, 100};
+void runtime_noclip_step_speed(int dir) { (void)dir; }
+uint64_t runtime_noclip_taken(void) { return 0; }
 int runtime_autoshrine_available(void) { return 0; }   /* auto shrine: the TOTK shrines only */
 int runtime_autoshrine_start(int one) { (void)one; return 0; }
+int runtime_autoshrine_finish(int shrine) { (void)shrine; return 0; }
 void runtime_autoshrine_stop(void) { }
 void runtime_autoshrine_set_chests(int on) { (void)on; }
 int runtime_autoshrine_chests(void) { return 0; }
@@ -735,7 +739,7 @@ static int force_at(uintptr_t actor, const float xyz[3]) {
     return 1;
 }
 
-/* ---- Auto shrine (Tools › Teleport; shrine_auto.h has what the game's files say): one shrine after another, the nearest
+/* ---- Auto shrine (Tools › Shrines; shrine_auto.h has what the game's files say): one shrine after another, the nearest
    first. For each: noclip to the shrine (the gate's A first while it has never been opened), A on the entrance lift, the
    game's own entry; then optionally each chest (A in front of it), then A at the altar: the game plays the blessing,
    marks the shrine Clear and leaves it by itself. If it does not, the start lift (A) leaves. Back outside, the autosave
@@ -755,6 +759,7 @@ static ShrineInfo as_shrine[SHRINES];
 static Landmark as_mark[LANDMARKS];   /* names, Great Sky Island and the Depths for the story lock (landmarks.h) */
 static _Atomic int as_loaded;         /* 0 not read, 1 reading, 2 read, 3 not this game */
 static _Atomic int as_request;        /* 1 run, 2 one shrine, 3 stop: for the frame-end thread */
+static _Atomic int as_want = -1;      /* with 2: that shrine (runtime_autoshrine_finish), -1 the nearest */
 static _Atomic int as_chests, as_cancel;
 static _Atomic uint32_t as_seq_inside, as_seq_field, as_seq_goal;   /* RomFS opens: a shrine's map, the surface's map, the goal's event */
 static _Atomic int as_inside_index = -1, as_watch_field;   /* watch_field: log the next surface map file */
@@ -764,7 +769,7 @@ enum { AS_OFF, AS_PICK, AS_MOVE, AS_GATE, AS_ENTER, AS_INSIDE, AS_CHEST, AS_GOAL
 static const char *const AS_STEP_TEXT[] = {"stopped", "choosing the next shrine", "flying", "opening the gate", "entering", "waiting for the shrine to load",
                                            "opening a chest", "at the altar", "leaving by the start lift", "back outside", "waiting for the autosave", "setting Link down"};
 static struct {
-    int step, one, k, chest, done, after, tries, event, back, flight, phase, have_last, have_safe, keyn, inside;   /* inside: in the shrine's own map */
+    int step, one, target, k, chest, done, after, tries, event, back, flight, phase, have_last, have_safe, keyn, inside;   /* inside: in the shrine's own map */
     double started, t0, phase_t, last_tick, still_since, save_time;
     float stand[3], face[3], last[3], safe[3];
     uint32_t seq_inside, seq_field, seq_goal;
@@ -894,7 +899,12 @@ static void as_pick(uintptr_t actor, double now) {
         if (count[r]) o += (size_t)snprintf(as.left_out + o, sizeof as.left_out - o, "%s%d %s", o ? ", " : "", count[r], SHRINE_SKIP_TEXT[r]);
     fprintf(stderr, "[autoshrine] %d shrines to do; %d DungeonState flags in the save; left out: %s\n", count[SHRINE_GO], found, as.left_out[0] ? as.left_out : "none");
     if (as.one && as.done) { as_end(1, "the shrine is done", now, 0); return; }
-    int k = shrine_next(as_shrine, skip, at);
+    if (as.target >= SHRINES) as.target = -1;
+    if (as.target >= 0 && skip[as.target] != SHRINE_GO) {   /* the shrine chosen on the Shrines tab, which the run cannot do */
+        char why[160]; snprintf(why, sizeof why, "%s is left out: %s", as_mark[LANDMARK_FIRST_SHRINE + as.target].name, SHRINE_SKIP_TEXT[skip[as.target]]);
+        as.k = -1; as_end(0, why, now, 0); return;
+    }
+    int k = as.target >= 0 ? as.target : shrine_next(as_shrine, skip, at);
     if (k < 0) { as.k = -1; as_end(1, "no shrine left to do", now, 0); return; }
     as.k = k;
     const ShrineInfo *s = &as_shrine[k];
@@ -958,9 +968,9 @@ static void autoshrine_tick(uintptr_t actor, double now) {
     int req = atomic_exchange(&as_request, 0);
     if (req == 3 && as.step != AS_OFF && as.step != AS_STOPPING) { as_end(0, "stopped from the menu or the input file", now, 0); return; }
     if ((req == 1 || req == 2) && as.step == AS_OFF) {
-        int chests = atomic_load(&as_chests); memset(&as, 0, sizeof as); as.k = -1; as.one = req == 2; as.started = now; as.last_tick = now;
+        int chests = atomic_load(&as_chests); memset(&as, 0, sizeof as); as.k = -1; as.one = req == 2; as.target = atomic_exchange(&as_want, -1); as.started = now; as.last_tick = now;
         atomic_store(&as_cancel, 0); dm_gfx_camera_want(1);
-        fprintf(stderr, "[autoshrine] start: %s, chests %s\n", as.one ? "the nearest shrine" : "every shrine it can do, nearest first", chests ? "on" : "off");
+        fprintf(stderr, "[autoshrine] start: %s, chests %s\n", as.target >= 0 ? "one chosen shrine" : as.one ? "the nearest shrine" : "every shrine it can do, nearest first", chests ? "on" : "off");
         as_step(AS_PICK, now);
     }
     if (as.step == AS_OFF) return;
@@ -1091,6 +1101,12 @@ static void *as_start_thread(void *arg) {
     atomic_store_explicit(&runtime_survey_pending, 1, memory_order_release);
     return NULL;
 }
+int runtime_autoshrine_finish(int shrine) {
+    if (shrine < 0 || shrine >= SHRINES || atomic_load(&as_active)) return 0;
+    atomic_store(&as_want, shrine);
+    if (runtime_autoshrine_start(1)) return 1;
+    atomic_store(&as_want, -1); return 0;
+}
 int runtime_autoshrine_start(int one) {
     if (!noclip_force) { fprintf(stderr, "[autoshrine] not started: needs noclip (1.0.0 or 1.4.3)\n"); return 0; }
     int idle = 0;
@@ -1118,9 +1134,10 @@ int runtime_autoshrine_command(const char *line) {
     if (!strcmp(word, "start")) runtime_autoshrine_start(0);
     else if (!strcmp(word, "one")) runtime_autoshrine_start(1);
     else if (!strcmp(word, "stop")) runtime_autoshrine_stop();
+    else if (!strcmp(word, "finish") && arg[0]) runtime_autoshrine_finish(atoi(arg));   /* "autoshrine finish N": Dungeon N */
     else if (!strcmp(word, "chests") && (!strcmp(arg, "on") || !strcmp(arg, "off"))) runtime_autoshrine_set_chests(arg[1] == 'n');
     else if (!strcmp(word, "status")) { char s[600]; runtime_autoshrine_status(s, sizeof s); fprintf(stderr, "[autoshrine] status: %s\n", s); }
-    else fprintf(stderr, "[autoshrine] rejected: expected start, one, stop, status or chests on|off\n");
+    else fprintf(stderr, "[autoshrine] rejected: expected start, one, finish N, stop, status or chests on|off\n");
     return 1;
 }
 /* romfs.c, every file the game opens (path relative to the RomFS): which map is loading, and the goal's event. */

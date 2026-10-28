@@ -66,7 +66,7 @@ static NSWindow *settings_window(void);   /* frontend.m: the game window */
     BOOL onBar, confirmReset;             /* the focus is on the section bar (the top level); Reset everything… asks */
     NSTimer *pollTimer, *meterTimer;   /* meterTimer: the GPU memory line, once a second */
     uint64_t padPrev; double padRepeatAt; int padDir;
-    BOOL cheatsUnavailableShown, cheatDbAsked, groupShown[LANDMARK_NGROUPS];   /* groupShown: a Teleport category's folded list is open */
+    BOOL cheatsUnavailableShown, cheatDbAsked;
     Landmark marks[LANDMARKS];   /* the places with the last save's state and the story lock (landmarks.h), when the tab is built */
     MapPin pins[MAP_PINS_MAX]; int npins;   /* the Teleport tab's map pin rows (map_pins.h), read when the tab is built */
     NSString *autoShrineShown;   /* the auto shrine status the Teleport tab shows (rebuilt when it changes) */
@@ -77,7 +77,7 @@ static Landmark landmark_places[LANDMARKS];
 static int landmarks_read;   /* 0 not yet, 1 reading, 2 read, 3 none in this game; main thread */
 enum { PANEL_WIDTH = 480, PANEL_MARGIN = 16, PAGE_STEP = 8 /* rows per LT / RT on a pane without row frames */,
        SAVES_ROW = -1, CHEATS_FOLDER_ROW = -2, CHEATS_OFF_ROW = -3, CHEATS_RESTART_ROW = -4, CHEATS_DB_ROW = -5, CHEATS_UNAVAILABLE_ROW = -6,
-       CHEATS_NOCLIP_ROW = -7, CHEATS_NOCLIP_SPEED_ROW = -8, CHEATS_AUTOSHRINE_ROW = -9, CHEATS_AUTOSHRINE_CHESTS_ROW = -10, CHEATS_GROUP_ROW = -20 /* - g: Teleport category g's Show / Hide */,
+       CHEATS_NOCLIP_ROW = -7, CHEATS_NOCLIP_SPEED_ROW = -8, CHEATS_AUTOSHRINE_ROW = -9, CHEATS_AUTOSHRINE_CHESTS_ROW = -10, CHEATS_GROUP_ROW = -20 /* the places while the game's map is read */,
        CHEATS_PIN_ROW = -100 /* - k: map pin k */, CHEATS_LANDMARK_ROW = -200 /* - k: place k (landmarks.h) */,
        CHEAT_ROW = -1000 /* - k: cheat k, or the choice whose first variant is k */ };
 static NSString *const BAR_HINT = @"←→ sections   ↓ open   Q E tabs   R reset tab   ⇧R reset all   Esc close\n"
@@ -622,17 +622,15 @@ static int cheat_choice_members(int leader, int *all, int *usable, int max, int 
     speed.target = self; speed.action = @selector(noclipSpeedChosen:);
     [self addCheatsRow:[self cheatsRow:@"Noclip speed" detail:@"How fast Link flies (← → change it)" color:nil control:speed] id:CHEATS_NOCLIP_SPEED_ROW];
 }
-/* ---- the Teleport tab: the story lock, noclip, then a heading per category (map pins, the story's places, the Skyview
-   Towers, the shrines; landmarks.h LANDMARK_GROUPS); each Go flies Link there with noclip ---- */
+/* ---- the Teleport tab: the story lock, noclip, the map pins and the story's places (landmarks.h LANDMARK_GROUPS[0]); each Go
+   flies Link there with noclip ---- */
 - (void)buildTeleport {
     if (!runtime_noclip_available()) {
         [self addCheatsRow:[self cheatsRow:@"Teleport" detail:@"Not available in this game version: teleporting flies Link there with noclip, which needs the 1.0.0 or 1.4.3 build." color:nil control:nil] id:CHEATS_UNAVAILABLE_ROW];
         return;
     }
-    int lock = settings_index("teleport.story_lock");
-    if (lock >= 0) { NSView *row = [self rowFor:&SETTINGS[lock] index:lock]; [list addArrangedSubview:row]; [rows addObject:row]; [rowSetting addObject:@(lock)]; }
+    BOOL lockOn = [self addStoryLockRow];
     [self addNoclipRows];
-    if (runtime_autoshrine_available()) [self addAutoShrineRows];
     const char *profile = getenv("TOTK_PROFILE_DIR");
     [self cheatsHeading:@"Map pins" detail:@"Never locked: you placed them." problem:nil big:YES];
     npins = profile ? map_pins_read(profile, pins, MAP_PINS_MAX, NULL, 0) : -1;
@@ -645,7 +643,24 @@ static int cheat_choice_members(int leader, int *all, int *usable, int max, int 
     if (npins <= 0)
         [self addCheatsRow:[self cheatsRow:@"Teleport to a map pin" detail:npins < 0 ? @"No save yet." :
                              @"No map pins in the last save: place a pin on the map, then save (or wait for an autosave)." color:nil control:nil] id:CHEATS_PIN_ROW - MAP_PINS_MAX];
-    [self buildLandmarks:profile lock:lock >= 0 && settings_get("teleport.story_lock")];
+    [self buildLandmarks:profile lock:lockOn group:0];
+}
+/* The story lock's switch (teleport.story_lock) at the top of Teleport, Towers and Shrines; YES while it is on. */
+- (BOOL)addStoryLockRow {
+    int lock = settings_index("teleport.story_lock");
+    if (lock >= 0) { NSView *row = [self rowFor:&SETTINGS[lock] index:lock]; [list addArrangedSubview:row]; [rows addObject:row]; [rowSetting addObject:@(lock)]; }
+    return lock >= 0 && settings_get("teleport.story_lock");
+}
+/* ---- the Towers and Shrines tabs: one category of landmarks.h each (LANDMARK_GROUPS g), the story lock above it; Shrines
+   also has auto shrine, and a Finish per shrine ---- */
+- (void)buildPlaces:(int)g {
+    if (!runtime_noclip_available()) {
+        [self addCheatsRow:[self cheatsRow:@(LANDMARK_GROUPS[g].title) detail:@"Not available in this game version: teleporting flies Link there with noclip, which needs the 1.0.0 or 1.4.3 build." color:nil control:nil] id:CHEATS_UNAVAILABLE_ROW];
+        return;
+    }
+    BOOL lockOn = [self addStoryLockRow];
+    if (landmark_is_shrine(LANDMARK_GROUPS[g].first) && runtime_autoshrine_available()) [self addAutoShrineRows];
+    [self buildLandmarks:getenv("TOTK_PROFILE_DIR") lock:lockOn group:g];
 }
 /* Auto shrine (world_survey.c, shrine_auto.h): Start / Stop, the chests switch, and the run's status under them. */
 - (void)addAutoShrineRows {
@@ -668,9 +683,10 @@ static int cheat_choice_members(int leader, int *all, int *usable, int max, int 
     if (runtime_autoshrine_start(0)) [self hide];
 }
 - (void)autoShrineChestsSwitched:(NSSwitch *)s { runtime_autoshrine_set_chests(s.state == NSControlStateValueOn); [self.window makeFirstResponder:self]; }
-/* A category's rows: the story's places as they are; the long lists folded behind a Show / Hide row, what the newest save
-   has not done yet first, by name. Locked places (the story lock) stay listed, greyed with the reason and no Go. */
-- (void)buildLandmarks:(const char *)profile lock:(BOOL)lockOn {
+/* Category only's rows: the story's places as they are; the towers and shrines what the newest save has not done yet first,
+   by name. Locked places (the story lock) stay listed, greyed with the reason and no Go. A shrine also has Finish (auto shrine
+   for that shrine alone; → on the row). */
+- (void)buildLandmarks:(const char *)profile lock:(BOOL)lockOn group:(int)only {
     if (!landmarks_read) {
         landmarks_read = 1;
         dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
@@ -680,13 +696,13 @@ static int cheat_choice_members(int leader, int *all, int *usable, int max, int 
             dispatch_async(dispatch_get_main_queue(), ^{
                 if (placed) memcpy(landmark_places, got, sizeof landmark_places);
                 free(got); landmarks_read = placed ? 2 : 3;
-                if (self.superview && self.kind == MENU_TELEPORT) [self rebuildKeepingPlace];
+                if (self.superview && (self.kind == MENU_TELEPORT || self.kind == MENU_TOWERS || self.kind == MENU_SHRINES)) [self rebuildKeepingPlace];
             });
         });
     }
     if (landmarks_read == 1) {
-        [self cheatsHeading:@"Places" detail:nil problem:nil big:YES];
-        [self addCheatsRow:[self cheatsRow:@"Teleport to a temple, Skyview Tower or shrine" detail:@"Reading the game's map…" color:nil control:nil] id:CHEATS_GROUP_ROW];
+        [self cheatsHeading:@(LANDMARK_GROUPS[only].title) detail:nil problem:nil big:YES];
+        [self addCheatsRow:[self cheatsRow:@"Reading the game's map…" detail:nil color:nil control:nil] id:CHEATS_GROUP_ROW];
         return;
     }
     if (landmarks_read != 2) return;
@@ -695,7 +711,7 @@ static int cheat_choice_members(int leader, int *all, int *usable, int max, int 
     int saved = profile ? landmarks_state_read(profile, marks, &progress) : -1;
     if (saved < 0) progress = (LandmarkProgress){0, 0, 0};
     landmarks_lock(marks, &progress, lockOn);
-    for (int g = 0; g < LANDMARK_NGROUPS; g++) {
+    for (int g = only; g == only && g < LANDMARK_NGROUPS; g++) {
         const LandmarkGroup *group = &LANDMARK_GROUPS[g];
         int done = 0, known = 0, locked = 0;
         NSMutableArray<NSNumber *> *order = [NSMutableArray array];
@@ -709,7 +725,8 @@ static int cheat_choice_members(int leader, int *all, int *usable, int max, int 
             int x = (m[a.intValue].state == LANDMARK_DONE), y = (m[b.intValue].state == LANDMARK_DONE);
             return x != y ? (x < y ? NSOrderedAscending : NSOrderedDescending) : [@(m[a.intValue].name) localizedStandardCompare:@(m[b.intValue].name)];
         }];
-        BOOL towers = group->first == 0, story = landmark_is_story(group->first);
+        BOOL towers = group->first == 0, story = landmark_is_story(group->first), shrines = landmark_is_shrine(group->first);
+        char autoLine[600]; BOOL running = shrines && runtime_autoshrine_status(autoLine, sizeof autoLine);
         NSString *count = !known ? (saved < 0 ? @"No save yet: shown by name." : @"The last save does not say which are done: shown by name.")
                         : [NSString stringWithFormat:story ? @"%d of %lu completed in the last save." : towers ? @"%d of %lu activated in the last save; the rest first."
                                                                                                      : @"%d of %lu completed in the last save; the rest first.", done, (unsigned long)order.count];
@@ -718,26 +735,24 @@ static int cheat_choice_members(int leader, int *all, int *usable, int max, int 
             count = [count stringByAppendingString:saved < 0 ? @" Nothing is locked without a save." : @" The last save does not say where the story is: nothing is locked."];
         NSString *lands = story ? @"Lands at the place's travel point; flies you there with noclip, as a map pin does."
                         : towers ? @"Lands inside the tower by its door; flies you there with noclip, as a map pin does."
-                                 : @"Lands at the shrine's travel point; flies you there with noclip, as a map pin does.";
+                                 : @"Go lands at the shrine's travel point (noclip, as a map pin does); Finish (→ on the row) completes that shrine alone, as auto shrine does.";
         [self cheatsHeading:@(group->title) detail:[NSString stringWithFormat:@"%@ %@", count, lands] problem:nil big:YES];
-        if (group->fold) {
-            BOOL shown = groupShown[g];
-            NSButton *show = [self cheatsButton:shown ? @"Hide" : @"Show" action:@selector(toggleGroup:)]; show.tag = g;
-            [self addCheatsRow:[self cheatsRow:[NSString stringWithFormat:@"%lu %s", (unsigned long)order.count, towers ? "towers" : "shrines"]
-                                        detail:shown ? @"Hide folds the list again." : @"Show lists them, each with its Go."
-                                         color:nil control:show] id:CHEATS_GROUP_ROW - g];
-            if (!shown) continue;
-        }
         for (NSNumber *n in order) {
             int k = n.intValue; const Landmark *l = &marks[k];
             static const char *const tower_state[] = {"", "Not activated", "Found, not activated", "Activated"}, *const shrine_state[] = {"", "Not found yet", "Found, not completed", "Completed"},
                               *const story_state[] = {"", "Not visited yet", "Visited", "Completed"};
             const char *state = (story ? story_state : towers ? tower_state : shrine_state)[l->state];
             NSButton *go = [self cheatsButton:@"Go" action:@selector(landmarkGo:)]; go.tag = k; go.enabled = l->lock == LANDMARK_OPEN;
+            NSView *control = go;
+            if (shrines) {
+                NSButton *finish = [self cheatsButton:@"Finish" action:@selector(shrineFinish:)]; finish.tag = k;
+                finish.enabled = l->lock == LANDMARK_OPEN && l->state != LANDMARK_DONE && !running;
+                NSStackView *both = [NSStackView stackViewWithViews:@[go, finish]]; both.spacing = 6; control = both;
+            }
             NSString *detail = [NSString stringWithFormat:@"%s%s%.0f, %.0f, %.0f%s", state, *state ? " · " : "", l->at[0], l->at[1], l->at[2], l->depths ? " · in the Depths" : ""];
             if (l->lock != LANDMARK_OPEN) detail = [NSString stringWithFormat:@"%s · %@", LANDMARK_LOCK_TEXT[l->lock], detail];
             [self addCheatsRow:[self cheatsRow:@(l->name) detail:detail color:l->lock != LANDMARK_OPEN ? NSColor.tertiaryLabelColor : l->state == LANDMARK_DONE ? NSColor.systemGreenColor : nil
-                                       control:go] id:CHEATS_LANDMARK_ROW - k];
+                                       control:control] id:CHEATS_LANDMARK_ROW - k];
             if (l->lock != LANDMARK_OPEN) rows.lastObject.alphaValue = 0.55;
         }
     }
@@ -799,14 +814,11 @@ static int cheat_choice_members(int leader, int *all, int *usable, int max, int 
     if (runtime_noclip_goto(marks[k].at)) [self hide];   /* at: already above the floor (landmarks_place) */
 }
 - (void)landmarkGo:(NSButton *)b { [self goToLandmark:(int)b.tag]; }
-- (void)toggleLandmarkGroup:(int)g {
-    if (g < 0 || g >= LANDMARK_NGROUPS || !LANDMARK_GROUPS[g].fold || landmarks_read != 2) return;
-    groupShown[g] = !groupShown[g]; [self rebuildKeepingPlace];
+- (void)finishShrine:(int)k {   /* auto shrine for that shrine alone */
+    if (!landmark_is_shrine(k) || !marks[k].placed || marks[k].lock != LANDMARK_OPEN || marks[k].state == LANDMARK_DONE) return;
+    if (runtime_autoshrine_finish(k - LANDMARK_FIRST_SHRINE)) [self hide];
 }
-- (void)toggleGroup:(NSButton *)b {
-    NSUInteger at = [rowSetting indexOfObject:@(CHEATS_GROUP_ROW - (int)b.tag)]; if (at != NSNotFound) { focus = at; onBar = NO; }
-    [self toggleLandmarkGroup:(int)b.tag];
-}
+- (void)shrineFinish:(NSButton *)b { [self finishShrine:(int)b.tag]; }
 - (void)noclipSwitched:(NSSwitch *)s { runtime_noclip_set(s.state == NSControlStateValueOn); [self rebuildKeepingPlace]; }
 - (void)noclipSpeedChosen:(NSPopUpButton *)b { runtime_noclip_set_speed((float)b.selectedTag); [self.window makeFirstResponder:self]; }
 - (void)stepNoclipSpeed:(int)dir {
@@ -886,6 +898,8 @@ static int cheat_choice_members(int leader, int *all, int *usable, int max, int 
     }
     if (kind == MENU_CHEATS) [self buildCheats];
     else if (kind == MENU_TELEPORT) [self buildTeleport];
+    else if (kind == MENU_TOWERS) [self buildPlaces:1];
+    else if (kind == MENU_SHRINES) [self buildPlaces:2];
     else if (kind == MENU_SAVES) {
         NSView *saves = [self savesRow];
         [list addArrangedSubview:saves]; [rows addObject:saves]; [rowSetting addObject:@(SAVES_ROW)];
@@ -948,7 +962,7 @@ static NSPopUpButton *settings_find_popup(NSView *v) {
 - (void)meterTick {
     if (!self.superview) return;
     [self refreshStatus];
-    if (self.kind == MENU_TELEPORT && autoShrineShown) {   /* the auto shrine status line follows the run */
+    if (self.kind == MENU_SHRINES && autoShrineShown) {   /* the auto shrine status line follows the run */
         char line[600]; runtime_autoshrine_status(line, sizeof line);
         if (![autoShrineShown isEqualToString:@(line)]) [self rebuildKeepingPlace];
     }
@@ -1043,8 +1057,10 @@ static NSTextField *settings_help_label(NSView *v) {   /* a setting row's help t
     if (i == CHEATS_AUTOSHRINE_ROW) { if (!dir) [self autoShrineStartStop]; return; }
     if (i == CHEATS_AUTOSHRINE_CHESTS_ROW) { runtime_autoshrine_set_chests(dir ? dir > 0 : !runtime_autoshrine_chests()); [self rebuildKeepingPlace]; return; }
     if (i <= CHEATS_PIN_ROW && i > CHEATS_PIN_ROW - MAP_PINS_MAX - 1) { if (!dir) [self goToPin:CHEATS_PIN_ROW - i]; return; }
-    if (i <= CHEATS_GROUP_ROW && i > CHEATS_GROUP_ROW - LANDMARK_NGROUPS) { if (!dir) [self toggleLandmarkGroup:CHEATS_GROUP_ROW - i]; return; }
-    if (i <= CHEATS_LANDMARK_ROW && i > CHEATS_LANDMARK_ROW - LANDMARKS) { if (!dir) [self goToLandmark:CHEATS_LANDMARK_ROW - i]; return; }
+    if (i <= CHEATS_LANDMARK_ROW && i > CHEATS_LANDMARK_ROW - LANDMARKS) {   /* A: Go; → on a shrine: Finish */
+        if (!dir) [self goToLandmark:CHEATS_LANDMARK_ROW - i]; else if (dir > 0) [self finishShrine:CHEATS_LANDMARK_ROW - i];
+        return;
+    }
     if (i == CHEATS_RESTART_ROW) { if (!dir && runtime_front_can_restart()) [self restartGame]; return; }
     if (i == CHEATS_DB_ROW) { if (!dir) [self updateCheatList]; return; }
     if (i == CHEATS_UNAVAILABLE_ROW) { if (!dir) [self toggleCheatsUnavailable]; return; }
