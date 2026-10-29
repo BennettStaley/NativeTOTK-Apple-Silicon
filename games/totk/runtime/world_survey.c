@@ -188,6 +188,7 @@ void runtime_noclip_set(int on) { (void)on; }
 int runtime_noclip_on(void) { return 0; }
 void runtime_noclip_set_speed(float v) { (void)v; }
 int runtime_noclip_goto(const float xyz[3]) { (void)xyz; return 0; }
+int runtime_player_pos(float xyz[3]) { (void)xyz; return 0; }
 float runtime_noclip_speed(void) { return 0; }
 const int runtime_noclip_speeds[NOCLIP_NSPEEDS] = {5, 12, 25, 50, 100};
 void runtime_noclip_step_speed(int dir) { (void)dir; }
@@ -855,6 +856,10 @@ static void as_stage(int stage) {
 }
 static void as_key(unsigned code, double seconds) { runtime_input_lease(code, (unsigned)(seconds * 1000)); }
 static int as_pos(uintptr_t actor, float xyz[3]) { return actor && read_mem(actor + ACTOR_POS, xyz, 12) && valid_xyz(xyz); }
+/* A loading save reads back as the origin (0, -0.15, 0): no place then (see as_pick). */
+int runtime_player_pos(float xyz[3]) {
+    return survey_main && as_pos(player_actor(), xyz) && (fabsf(xyz[0]) >= 1 || fabsf(xyz[2]) >= 1);
+}
 static float as_xz(const float a[3], const float b[3]) { float x = a[0] - b[0], z = a[2] - b[2]; return sqrtf(x * x + z * z); }
 /* Link at xyz facing face (level): forceSetMatrix with a turn about the vertical; his local +z (the matrix's third column) is
    where he faces, as noclip reads it. */

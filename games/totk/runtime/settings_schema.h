@@ -40,7 +40,7 @@ static const char *const SETTINGS_PAGES[] = {"Display", "Frame rate", "Controls"
 enum { SETTINGS_NPAGES = sizeof SETTINGS_PAGES / sizeof *SETTINGS_PAGES };
 static const char *const SETTINGS_TABS[] = {"Game", "Graphics", "Content", "Tools"};
 enum { SETTINGS_NTABS = sizeof SETTINGS_TABS / sizeof *SETTINGS_TABS };
-enum { MENU_SETTINGS, MENU_MODS, MENU_SAVES, MENU_CHEATS, MENU_SPAWN, MENU_TELEPORT, MENU_TOWERS, MENU_SHRINES };
+enum { MENU_SETTINGS, MENU_MODS, MENU_SAVES, MENU_CHEATS, MENU_SPAWN, MENU_TELEPORT, MENU_TOWERS, MENU_SHRINES, MENU_LIGHTROOTS };
 typedef struct { int tab; const char *name; int kind; } SettingsSection;
 static const SettingsSection SETTINGS_SECTIONS[] = {
     {0, "Display", MENU_SETTINGS}, {0, "Frame rate", MENU_SETTINGS}, {0, "Controls", MENU_SETTINGS}, {0, "Audio", MENU_SETTINGS},
@@ -48,7 +48,7 @@ static const SettingsSection SETTINGS_SECTIONS[] = {
     {1, "Image", MENU_SETTINGS}, {1, "Effects", MENU_SETTINGS}, {1, "World detail", MENU_SETTINGS},
     {2, "Mods", MENU_MODS}, {2, "Saves", MENU_SAVES}, {2, "Downloads", MENU_SETTINGS},
     {3, "Cheats", MENU_CHEATS}, {3, "Teleport", MENU_TELEPORT}, {3, "Towers", MENU_TOWERS},
-    {3, "Shrines", MENU_SHRINES}, {3, "Spawn", MENU_SPAWN}, {3, "World", MENU_SETTINGS}, {3, "Camera", MENU_SETTINGS},
+    {3, "Shrines", MENU_SHRINES}, {3, "Lightroots", MENU_LIGHTROOTS}, {3, "Spawn", MENU_SPAWN}, {3, "World", MENU_SETTINGS}, {3, "Camera", MENU_SETTINGS},
 };
 enum { SETTINGS_NSECTIONS = sizeof SETTINGS_SECTIONS / sizeof *SETTINGS_SECTIONS };
 /* The first section of a tab and how many it has. */
@@ -205,7 +205,7 @@ static const SettingDef SETTINGS[] = {
      "TOTK_GYRO", SET_BOOL, SET_LIVE, SET_MAC, 1, 1, 0, 1, 1, NULL, NULL, 0, "Not on iPhone and iPad yet.", NULL, 0},
     {"audio.volume", "Audio", "Volume", NULL,
      NULL, SET_RANGE, SET_LIVE, SET_ALL, 100, 100, 0, 100, 5, "%", NULL, 0, NULL, NULL, 0},
-    /* Tools › Teleport, Towers and Shrines (settings_panel_mac.h buildTeleport / buildPlaces, landmarks.h landmarks_lock): places the newest save has not reached
+    /* Tools › Teleport, Towers, Shrines and Lightroots (settings_panel_mac.h buildTeleport / buildPlaces, landmarks.h landmarks_lock): places the newest save has not reached
        in the story are greyed, with the reason, and cannot be flown to. Map pins never are. */
     {"teleport.story_lock", "Teleport", "Only places the story has opened", "Greys out the places your last save has not reached in the story, so a teleport cannot skip ahead: everything off Great Sky Island until you leave it, the Depths until you have been down, a temple until its region's quest has started. Map pins are never locked.",
      NULL, SET_BOOL, SET_LIVE, SET_MAC, 1, 1, 0, 1, 1, NULL, NULL, 0, "Teleport is on the Mac only.", NULL, 0},
