@@ -1198,16 +1198,21 @@ static NSTextField *settings_help_label(NSView *v) {   /* a setting row's help t
 
 /* ---- controller ---- */
 
+/* The face buttons are the game's (2026-10-28): A, B, X and Y are the buttons the game reads as the Switch's A, B, X and
+   Y under the controller type (gamepad_layout.h gamepad_face_bits, as gamepad.m maps them; layout-file remaps aside), so
+   on an Xbox controller A is the right button and B the bottom one, as in the game, not GameController's names. */
 - (void)poll {
-    uint64_t now = 0;
+    uint64_t now = 0; int type = runtime_gamepad_type(NULL);
     for (GCController *c in GCController.controllers) {
         GCExtendedGamepad *p = c.extendedGamepad; if (!p) continue;
         if (p.dpad.up.isPressed) now |= 1; if (p.dpad.down.isPressed) now |= 2;
         if (p.dpad.left.isPressed) now |= 4; if (p.dpad.right.isPressed) now |= 8;
-        if (p.buttonA.isPressed) now |= 16; if (p.buttonB.isPressed) now |= 32;
+        uint64_t face = gamepad_face_bits(p.buttonA.isPressed, p.buttonB.isPressed, p.buttonX.isPressed, p.buttonY.isPressed,
+                                          gamepad_type_face_by_position(type, c.productCategory.UTF8String, c.vendorName.UTF8String));
+        if (face & GAMEPAD_SWITCH_A) now |= 16; if (face & GAMEPAD_SWITCH_B) now |= 32;
         if (p.leftShoulder.isPressed) now |= 64; if (p.rightShoulder.isPressed) now |= 128;
         if (p.buttonMenu.isPressed) now |= 256;
-        if (p.buttonX.isPressed) now |= 512; if (p.buttonY.isPressed) now |= 1024;
+        if (face & GAMEPAD_SWITCH_X) now |= 512; if (face & GAMEPAD_SWITCH_Y) now |= 1024;
         if (p.leftTrigger.value > 0.5f) now |= 2048; if (p.rightTrigger.value > 0.5f) now |= 4096;
         /* the sticks are left to the game (runtime_input_hold): the menu navigates with the d-pad only */
     }
