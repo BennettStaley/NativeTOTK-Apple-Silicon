@@ -1598,6 +1598,25 @@ static uintptr_t ctl_component(uintptr_t actor, unsigned index) {
     uintptr_t list = actor ? read_ptr(actor + ACTOR_COMPONENTS) : 0;
     return list ? read_ptr(list + index * 8u) : 0;
 }
+#if defined(TOTK_GAME_V143)
+/* Noclip's own god mode (2026-10-28): a player held in the air by a teleport was killed there (an enemy, the cold or
+   the heat), with no health cheat on. While noclip is on, and for NOCLIP_GUARD_S seconds after it goes off (the landing),
+   Link's life is set back to his maximum whenever it drops, as the cheat list's Inf. Health does (current +0x8 = max
+   +0x18 of the life object, see ctl state's hp). A single blow larger than all his hearts can still kill between two
+   frames. Writes go through mach_vm_write, so a stale pointer fails instead of faulting. */
+enum { NOCLIP_GUARD_S = 8 };
+static void noclip_guard(uintptr_t actor) {
+    static double until; static unsigned refills; double now = now_seconds();
+    if (atomic_load(&noclip_wanted)) until = now + NOCLIP_GUARD_S;
+    if (now >= until || !actor) return;
+    uintptr_t life_component = ctl_component(actor, COMPONENT_LIFE), life = life_component ? read_ptr(life_component + 0x1830) : 0;
+    int32_t hp[2];
+    if (!life || !read_mem(life + 0x8, &hp[0], 4) || !read_mem(life + 0x18, &hp[1], 4)) return;
+    if (hp[1] < 4 || hp[1] > 400 || hp[0] >= hp[1] || hp[0] < 0) return;   /* quarter hearts: 1 to 100 hearts */
+    if (mach_vm_write(mach_task_self(), life + 0x8, (vm_offset_t)&hp[1], 4) == KERN_SUCCESS && (!refills++ || refills % 50 == 0))
+        fprintf(stderr, "[noclip] life %d -> %d quarter hearts (%s; %u refills)\n", hp[0], hp[1], atomic_load(&noclip_wanted) ? "noclip on" : "landing", refills);
+}
+#endif
 static void ctl_state(const char *tag) {
     char line[900]; size_t o = 0;
     #define CTL_ADD(...) do { if (o < sizeof line) o += (size_t)snprintf(line + o, sizeof line - o, __VA_ARGS__); } while (0)
@@ -1963,6 +1982,7 @@ void runtime_survey_tick(uint64_t frame) {
     if (!survey_left) { noclip_tick(actor); autoshrine_tick(actor, now_seconds()); }   /* a scripted move wins */
 #if defined(TOTK_GAME_V143)
     event_tick();   /* "ctl event": outside the survey lock, it calls into the game */
+    noclip_guard(actor);
 #endif
     runtime_spawn_tick(actor, frame);   /* outside the survey lock: it calls into the game */
     /* cleared before the spawn queue is looked at again, so a spawn queued meanwhile (it sets waiting, then pending) is
