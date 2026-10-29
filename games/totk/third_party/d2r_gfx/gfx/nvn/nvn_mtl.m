@@ -4674,6 +4674,25 @@ static void rt_usage_note_image_bind(int tid, unsigned long long ser, id<MTLText
     MLOG("[rt-usage] image bind tid=%d ser=%llu %lux%lu Metal format %lu usage %#lx", tid, ser,
          (unsigned long)t.width, (unsigned long)t.height, (unsigned long)t.pixelFormat, (unsigned long)t.usage);
 }
+/* TOTK_LOST_RT_LOG=1 (diagnostic, off by default; 2026-10-28, characters drawn pitch black in a Depths boss arena while
+   the walls stay lit): a serial the GPU has rendered into (g_gpu_owned) is given a new, empty Metal texture by tex_mtl.
+   Its storage entry was dropped while the game still uses it (the release of render targets idle since a size change,
+   the idle storage sweep, a finalised pool). Made again as a render target (attachment_texture) it is drawn before it
+   is read; made for sampling or a copy, what the GPU rendered into it is gone and reads as zero (black colour, depth 0).
+   One line per texture for the first 300, then every 500th, with the frame of the latest size change and the number
+   of render targets released so far (TOTK_RT_EVICT=0 keeps them). */
+static _Thread_local int g_tex_attach_ctx;   // attachment_texture is asking: the new texture is about to be drawn into
+static int lost_rt_log_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("TOTK_LOST_RT_LOG"); on = e && atoi(e) != 0; } return on; }
+static void lost_rt_note(const tex_t *t, id<MTLTexture> mt) {
+    if (!lost_rt_log_on() || !gpu_owned(t->serial)) return;
+    static _Atomic uint64_t n_rt, n_read; int as_rt = g_tex_attach_ctx > 0;
+    uint64_t k = atomic_fetch_add(as_rt ? &n_rt : &n_read, 1) + 1, all = atomic_load(&n_rt) + atomic_load(&n_read);
+    if (all > 300 && all % 500) return;
+    MLOG("[lost-rt] frame %llu: GPU-rendered texture ser=%llu %ux%ux%u target %d levels %u NVN format %#x (Metal %lu) made again empty %s (%llu such, %llu as render targets, %llu for reads so far); latest size change at frame %llu, %llu render targets released so far",
+         (unsigned long long)atomic_load(&g_cur_frame), (unsigned long long)t->serial, t->d.width, t->d.height, t->d.depth, (int)t->d.target, t->d.levels, t->d.format, (unsigned long)mt.pixelFormat,
+         as_rt ? "as a render target: drawn again before it is read" : "for sampling or a copy: its rendered contents are LOST",
+         (unsigned long long)k, (unsigned long long)atomic_load(&n_rt), (unsigned long long)atomic_load(&n_read), (unsigned long long)rt_changed_frame(), (unsigned long long)g_stor_rt_evicted);
+}
 static void *tex_mtl_p(const tex_t *ct) {
     tex_t *t = (tex_t *)ct; BOTW_TEX_FOLLOW(t)
     if (!t || !t->serial) return NULL;
@@ -4778,6 +4797,7 @@ static void *tex_mtl_p(const tex_t *ct) {
         res_add(mt);
         stor_publish(t, mt);
         rt_usage_note_create(t, mt);
+        lost_rt_note(t, mt);   // TOTK_LOST_RT_LOG
     }
     serial_put(t->serial, mt);
     if (serial_is_dead(t->serial)) dead_put_note(t->serial);
@@ -5606,7 +5626,7 @@ static MTLPixelFormat attachment_format(const tex_t *t, const view_t *v, int has
     return (MTLPixelFormat)pf;
 }
 static id<MTLTexture> attachment_texture(const tex_t *t, const view_t *v, int has_v) {
-    __unsafe_unretained id<MTLTexture> b0 = BOTW_ATTACH_TEX_U(t); if (!b0) return nil;   // TOTK: held by the serial table (tex_mtl); the common answer takes no retain
+    g_tex_attach_ctx++; __unsafe_unretained id<MTLTexture> b0 = BOTW_ATTACH_TEX_U(t); g_tex_attach_ctx--; if (!b0) return nil;   // TOTK: held by the serial table (tex_mtl); the common answer takes no retain. g_tex_attach_ctx: TOTK_LOST_RT_LOG
     MTLPixelFormat bpf = b0.pixelFormat, pf = attachment_format(t, v, has_v, bpf);
     if (pf == bpf) return b0;
     id<MTLTexture> base = b0;
