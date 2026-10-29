@@ -4905,7 +4905,8 @@ static struct { uint32_t cfmt[8], dfmt, sfmt, samples; int hd, hs; NSUInteger tw
 #define MFX_ROLE_MOTION 1   // TOTK_OBJ_MOTION: an opaque G-buffer draw writing its motion to attachment 6 (totk_objmv.h)
 #define MFX_ROLE_UI 2
 #define MFX_ROLE_UI_OPAQUE 3
-static struct { uint64_t canvas, last_c0, swap[4]; uint32_t swap_w, swap_h; int nswap, scene_done, ui_cleared, depth_done, want_cam, role; uint64_t frames; } g_mfx;
+static struct { uint64_t canvas, last_c0, swap[4]; uint32_t swap_w, swap_h; int nswap, scene_done, ui_cleared, depth_done, want_cam, role; uint64_t frames;
+                uint64_t gbuf_pass; int cam_tries; } g_mfx;   // gbuf_pass: g_pass.serial of the last G-buffer pass (the camera may come from a later draw of it)
 /* The UI-layer composite (totk_ui_layer.h): its textures while interpolation is off, this frame's canvas and scene copy. */
 static struct {
     id<MTLTexture> scene, ui, ui2;   // ours while interpolation is off (pp_tex); TOTK_MFX's own while it is on
@@ -5663,7 +5664,7 @@ static void mfx_pass_setup(MTL4RenderPassDescriptor *pd, int ui) {   // ui 2: th
     if (ui != 2) {
     if (!g_mfx.depth_done && dt && c0 && dt.pixelFormat == MTLPixelFormatDepth32Float && dt.width == c0.width && dt.height == c0.height && dt.width >= 320) {
         int nc = 0; for (int i = 0; i < R.rt.n && i < 8; i++) nc += pd.colorAttachments[i].texture != nil;
-        if (nc >= 3) { mfx_note_depth(dt); om_note_depth(dt); g_mfx.depth_done = 1; g_mfx.want_cam = 1; }
+        if (nc >= 3) { mfx_note_depth(dt); om_note_depth(dt); g_mfx.depth_done = 1; g_mfx.want_cam = 1; g_mfx.gbuf_pass = g_pass.serial; g_mfx.cam_tries = 0; }
     }
     om_pass_setup(pd);   // TOTK_OBJ_MOTION: the motion attachment of passes into the G-buffer depth
     if (g_pass.objmv) mfx_queue_residency();
@@ -12953,7 +12954,12 @@ static void camfeed_note(const float *cam) {
     g_camfeed.frame = atomic_load(&g_cur_frame); g_camfeed.ok = 1;
     pthread_mutex_unlock(&g_camfeed.mu);
 }
+/* The G-buffer pass's first draw does not always bind the camera block (log 2026-10-28: some passes begin with a 256-byte
+   block at vertex uniform 1, and frames whose depth was found went without a camera). While the G-buffer pass that set
+   want_cam is still open its next draws are tried too, at most MFX_CAM_TRIES (a try that fails is two compares). */
+#define MFX_CAM_TRIES 64
 static void mfx_take_camera(void) {
+    int want = g_mfx.want_cam;
     g_mfx.want_cam = 0; g_camfeed.take = 0;
     const p_bind_buf *u = &S.ubo[0][MFX_CAM_SLOT]; float cam[84];
     if (u->addr && u->size == MFX_CAM_SIZE) {
@@ -12966,8 +12972,12 @@ static void mfx_take_camera(void) {
         long f = (long)atomic_load(&g_cur_frame);
         if (c0 >= 0 && f >= c0 && f <= c1) MLOG("[mfx] camera F%ld pass %llu block %#llx size %.0fx%.0f near %g fov %.4f yaw %.3f pos %.3f %.3f %.3f vp0 %.5f %.5f %.5f %.3f",
             f, g_stat_pass, (unsigned long long)u->addr, cam[72], cam[73], cam[56], cam[70], atan2(cam[2], cam[0]) * 180 / M_PI, cam[47], cam[51], cam[55], cam[12], cam[13], cam[14], cam[15]);
-    } else { static int said; if (said++ < 5) MLOG("[mfx] G-buffer pass %llu: vertex uniform 1 is %#llx / %llu bytes, not the 2368-byte camera block (frame %llu)", g_stat_pass,
-                                                 (unsigned long long)u->addr, (unsigned long long)u->size, (unsigned long long)atomic_load(&g_cur_frame)); }
+    } else {
+        int retry = want && rp_active() && g_pass.serial == g_mfx.gbuf_pass && ++g_mfx.cam_tries < MFX_CAM_TRIES;
+        if (retry) g_mfx.want_cam = 1;
+        static int said; if (said++ < 5) MLOG("[mfx] G-buffer pass %llu: vertex uniform 1 is %#llx / %llu bytes, not the 2368-byte camera block (frame %llu)%s", g_stat_pass,
+                                              (unsigned long long)u->addr, (unsigned long long)u->size, (unsigned long long)atomic_load(&g_cur_frame), retry ? "; the pass's next draw is tried" : "");
+    }
 }
 static void draw_inner(const p_draw *dw, const p_draw_idx *di);
 /* Diagnostic DM_NVN_NANDRAW=<first>-<last frame> (log DM_NVN_NANDRAW_LOG, default analysis/nandraw.tsv): after every
