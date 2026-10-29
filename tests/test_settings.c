@@ -105,7 +105,7 @@ int main(void) {
     unsetenv("TOTK_FOG"); unsetenv("TOTK_SHADOW_RES");
     /* World page (runtime/world_patch.h): the time of day in percent, paused included; the render distance in 25 % steps. */
     /* The menu: Game, Graphics, Content, Tools; every settings page is exactly one section of them, in the same order. */
-    expect(SETTINGS_NTABS == 4 && !strcmp(SETTINGS_TABS[0], "Game") && !strcmp(SETTINGS_TABS[3], "Tools"), "four top tabs");
+    expect(SETTINGS_NTABS == 5 && !strcmp(SETTINGS_TABS[0], "Game") && !strcmp(SETTINGS_TABS[3], "Tools") && !strcmp(SETTINGS_TABS[4], "Places"), "five top tabs");
     {
         int seen = 0, last_tab = 0;
         for (int k = 0; k < SETTINGS_NSECTIONS; k++) {
@@ -120,7 +120,7 @@ int main(void) {
             seen++;
         }
         expect(seen == SETTINGS_NPAGES, "every settings page is a section");
-        for (int t = 0; t < SETTINGS_NTABS; t++) expect(settings_tab_sections(t) >= 3 && settings_tab_sections(t) <= 5, "three to five sections a tab");
+        for (int t = 0; t < SETTINGS_NTABS; t++) expect(settings_tab_sections(t) >= 3 && settings_tab_sections(t) <= 6, "three to six sections a tab (short names: the bar fits six)");
         expect(SETTINGS_SECTIONS[settings_tab_first(3) + 1].kind == MENU_SPAWN, "Tools: Cheats, then Spawn");
         int tabs_of[SETTINGS_COUNT];
         for (int i = 0; i < SETTINGS_COUNT; i++) { tabs_of[i] = 0; for (int t = 0; t < SETTINGS_NTABS; t++) tabs_of[i] += settings_in_tab(i, t); }

@@ -50,7 +50,7 @@ static const SettingsSection SETTINGS_SECTIONS[] = {
     {2, "Mods", MENU_MODS}, {2, "Saves", MENU_SAVES}, {2, "Downloads", MENU_SETTINGS},
     {3, "Cheats", MENU_CHEATS}, {3, "Spawn", MENU_SPAWN}, {3, "World", MENU_SETTINGS}, {3, "Camera", MENU_SETTINGS},
     {4, "Teleport", MENU_TELEPORT}, {4, "Towers", MENU_TOWERS}, {4, "Shrines", MENU_SHRINES}, {4, "Lightroots", MENU_LIGHTROOTS},
-    {4, "Dragon's Tears", MENU_TEARS}, {4, "Koroks", MENU_KOROKS},
+    {4, "Tears", MENU_TEARS}, {4, "Koroks", MENU_KOROKS},
 };
 enum { SETTINGS_NSECTIONS = sizeof SETTINGS_SECTIONS / sizeof *SETTINGS_SECTIONS };
 /* The first section of a tab and how many it has. */
