@@ -10,7 +10,8 @@
    - B spins while packets keep coming and sleeps on a semaphore after RS_SPIN_NS of nothing; A signals it when it
      publishes to a sleeping B (store / fence / load on both sides, so a wake-up cannot be lost).
    - rs_sync() (A) waits until B consumed everything: before any encoder A opens on the command buffer itself, before a
-     command buffer is ended / committed, and at the end of the submission. It spins; B is awake by then.
+     command buffer is ended / committed, and at the end of the submission. It spins; B is awake by then. Past
+     RS_WAIT_SPIN_NS it sleeps in short steps and never gives up on a B that is still encoding (rs_wait).
    - Objects: pipeline / depth-stencil states and the pass descriptor are retained for the packet and released by B
      after use (probes build pipeline states that go away right after the pass; the game's live in caches).
    No GPU ordering, resource retirement or uniform snapshot policy changes: B only encodes what A decided, in A's order. */
@@ -18,6 +19,8 @@
 #include <TargetConditionals.h>
 #include <sched.h>
 #include <dispatch/dispatch.h>
+#include <mach/mach.h>
+#include <mach/thread_policy.h>
 
 enum {
     RS_PSO, RS_DSS, RS_VIEWPORT, RS_SCISSOR, RS_CULL, RS_WINDING, RS_FILL,
@@ -31,13 +34,24 @@ enum { RS_SPIN_NS = 200000 };   /* B waits (wfe) this long on an empty queue bef
                                    for that long, so B sleeps in the frame gap and wakes (~30 us) at the next submission. The waits are wfe / sev,
                                    not a hot spin: with a hot spin (2 ms yield loop) the visible-mode GPU time rose 8.9 -> 9.3 ms (analysis/rs3v-*,
                                    rs4v-* with 200 us): CPU power taken from the GPU's budget. */
+/* A's waits for B (rs_sync, a full ring) wfe for RS_WAIT_SPIN_NS - a replay's waits are microseconds (mean 8-22 us,
+   longest 0.7-13 ms per 1800 submissions) - then sleep 100 us at a time, so a real-time A does not hold a core B needs.
+   A stall is logged after RS_STALL_NS with both threads' scheduler state; A gives up only when B encoded nothing for
+   RS_DEAD_NS. 2026-10-24 (fork sunsssyc b265f28): the former 2 s limit aborted the game 8 times, 7 of them with the app
+   not focal (App Nap: every thread at priority 4 for seconds). B was never stuck in an encoder call: at the abort its
+   last clock read was 0.9-3.7 s old (not scheduled), and twice B had drained a second before A, itself not scheduled,
+   woke, saw 2 s gone and aborted without looking at `consumed` again. */
+enum { RS_WAIT_SPIN_NS = 1000000 };
+#define RS_STALL_NS 2000000000ull
+#define RS_DEAD_NS 60000000000ull
 static nvn_encode_fifo g_rs_fifo;
 static _Atomic int g_rs_on = -1;
 static _Atomic int g_rs_sleeping;          /* B announced it is about to sleep (seq_cst handshake with the publisher) */
 static dispatch_semaphore_t g_rs_sem;
 static int g_rs_created, g_rs_configured, g_rs_active;
 static id g_rs_sentinel;                   /* what A sees as the encoder while B owns the pass */
-static uint64_t g_rs_passes, g_rs_packets, g_rs_syncs, g_rs_sync_ns, g_rs_sync_max_ns, g_rs_full_waits, g_rs_full_ns, g_rs_subs;
+static uint64_t g_rs_passes, g_rs_packets, g_rs_syncs, g_rs_sync_ns, g_rs_sync_max_ns, g_rs_full_waits, g_rs_full_ns, g_rs_subs, g_rs_stalls;
+static mach_port_t g_rs_b_thread;          /* B, for the stall line */
 static _Atomic uint64_t g_rs_b_sleeps, g_rs_b_passes, g_rs_b_busy_ns;   /* busy: from the first packet after an idle spell to the next idle spell */
 static int g_rs_probe_negative;
 static int tbdr_on(void);
@@ -107,6 +121,7 @@ static void *rs_worker(void *unused) {
     (void)unused;
     pthread_setname_np("TOTK encode stage");
     pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    g_rs_b_thread = pthread_mach_thread_np(pthread_self());
     id<MTL4RenderCommandEncoder> enc = nil; id<MTL4ArgumentTable> vt = nil, ft = nil;
     uint64_t idle_since = 0, busy_since = 0;
     for (;;) {
@@ -137,10 +152,44 @@ static inline void rs_publish(void) {
     __builtin_arm_sev();
     if (atomic_load_explicit(&g_rs_sleeping, memory_order_seq_cst)) dispatch_semaphore_signal(g_rs_sem);
 }
+int dm_focus_now(void); int runtime_front_window_visible(void);   /* weak definitions further down in nvn_mtl.m */
+/* Run state (1 runnable, 3 waiting), scheduled / base priority, real-time policy, CPU time, and (another thread) where it is. */
+static void rs_thread_desc(char *s, size_t n, mach_port_t th, int where) {
+    thread_extended_info_data_t x; mach_msg_type_number_t c = THREAD_EXTENDED_INFO_COUNT;
+    if (!th || thread_info(th, THREAD_EXTENDED_INFO, (thread_info_t)&x, &c) != KERN_SUCCESS) { snprintf(s, n, "?"); return; }
+    thread_time_constraint_policy_data_t rt; mach_msg_type_number_t rc = THREAD_TIME_CONSTRAINT_POLICY_COUNT; boolean_t def = 1;
+    int is_rt = thread_policy_get(th, THREAD_TIME_CONSTRAINT_POLICY, (thread_policy_t)&rt, &rc, &def) == KERN_SUCCESS && !def;
+    arm_thread_state64_t st; mach_msg_type_number_t sc = ARM_THREAD_STATE64_COUNT; Dl_info di = {0};
+    if (where && thread_get_state(th, ARM_THREAD_STATE64, (thread_state_t)&st, &sc) == KERN_SUCCESS) dladdr((void *)(uintptr_t)arm_thread_state64_get_pc(st), &di);
+    snprintf(s, n, "state %d priority %d/%d%s CPU %.1f ms%s%s", x.pth_run_state, x.pth_curpri, x.pth_priority, is_rt ? " real-time" : "",
+             (double)(x.pth_user_time + x.pth_system_time) / 1e6, di.dli_sname ? " in " : "", di.dli_sname ? di.dli_sname : "");
+}
+static void rs_stall_log(uint64_t waited, uint64_t target, uint64_t seen, uint64_t start) {
+    char b[200], a[200]; mach_port_t self = mach_thread_self();
+    rs_thread_desc(b, sizeof b, g_rs_b_thread, 1); rs_thread_desc(a, sizeof a, self, 0); mach_port_deallocate(mach_task_self(), self);
+    int vis = runtime_front_window_visible();
+    MLOG("[nvn] encode stage stalled %.1f s (stall %llu): waiting for packet %llu, encoded %llu (%llu during this wait); encode thread%s %s; replay thread %s; app %s, window %s",
+         (double)waited / 1e9, (unsigned long long)g_rs_stalls + 1, (unsigned long long)target, (unsigned long long)seen, (unsigned long long)(seen - start),
+         atomic_load(&g_rs_sleeping) ? " (sleeping)" : "", b, a, dm_focus_now() == 1 ? "focal" : "not focal", vis > 0 ? "visible" : vis == 0 ? "covered" : "visibility unknown");
+}
+/* A: wait until B has consumed `target` packets. Progress before the clock: A itself may not have run for seconds. */
+static void rs_wait(uint64_t target) {
+    uint64_t t0 = rs_now(), start = atomic_load_explicit(&g_rs_fifo.consumed, memory_order_acquire), seen = start, moved = t0, next_log = t0 + RS_STALL_NS;
+    int logged = 0;
+    while (seen < target) {
+        if (rs_now() - t0 < RS_WAIT_SPIN_NS) __builtin_arm_wfe(); else usleep(100);
+        uint64_t c = atomic_load_explicit(&g_rs_fifo.consumed, memory_order_acquire), now = rs_now();
+        if (c != seen) { seen = c; moved = now; }
+        else if (now - moved >= RS_DEAD_NS) MDIE("render stream: the encode stage encoded nothing for 60 s (%llu of %llu packets)", (unsigned long long)seen, (unsigned long long)target);
+        if (seen < target && now >= next_log) { rs_stall_log(now - t0, target, seen, start); logged = 1; next_log = now + 5 * RS_STALL_NS; }
+    }
+    if (logged) { g_rs_stalls++; MLOG("[nvn] encode stage stall over: waited %.1f s this time, the game goes on", (double)(rs_now() - t0) / 1e9); }
+}
 static void rs_put(nvn_encode_packet p, int publish) {
     if (!nvn_encode_fifo_push(&g_rs_fifo, &p)) {   /* ring full: B is behind; wait for it (counted: this is A time lost to B) */
         uint64_t t0 = rs_now(); g_rs_full_waits++;
-        do { rs_publish(); __builtin_arm_wfe(); } while (!nvn_encode_fifo_push(&g_rs_fifo, &p));
+        rs_publish(); rs_wait(g_rs_fifo.produced - NVN_ENCODE_FIFO_CAP + 1);
+        if (!nvn_encode_fifo_push(&g_rs_fifo, &p)) MDIE("render stream: ring still full after the encode stage drained");
         g_rs_full_ns += rs_now() - t0;
     }
     if (publish) rs_publish();
@@ -157,11 +206,8 @@ static void rs_sync(void) {
     if (!g_rs_created) return;
     if (g_rs_active) MDIE("render stream: sync inside a streamed pass");
     rs_publish();
-    uint64_t t0 = rs_now(), produced = g_rs_fifo.produced;
-    while (atomic_load_explicit(&g_rs_fifo.consumed, memory_order_acquire) != produced) {
-        __builtin_arm_wfe();
-        if ((rs_now() - t0) > 2000000000ull) MDIE("render stream: the encode stage did not drain in 2 s");
-    }
+    uint64_t t0 = rs_now();
+    rs_wait(g_rs_fifo.produced);
     uint64_t dt = rs_now() - t0; g_rs_syncs++; g_rs_sync_ns += dt; if (dt > g_rs_sync_max_ns) g_rs_sync_max_ns = dt;
     if (totk_tl_on()) totk_tl(TL_RS_JOIN, dt, g_rs_syncs);
 }
