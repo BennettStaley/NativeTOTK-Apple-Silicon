@@ -118,7 +118,9 @@ class StateReportSources(unittest.TestCase):
         hle = (NVN/'hle_nvn.c').read_text()
         self.assertEqual(re.findall(r'.*\bsr_frame\(o\);', hle), ['    if (totk_sr_on()) sr_frame(o);'])
         mtl = (NVN/'nvn_mtl.m').read_text()
-        self.assertEqual(re.findall(r'.*g_taa_last, ', mtl), ['                if (totk_sr_on()) atomic_store(&g_taa_last, '])
+        stores = re.findall(r'.*g_taa_last, ', mtl)   # key 5's encode and the temporal upscale (tup_dock)
+        self.assertEqual(len(stores), 2)
+        for s in stores: self.assertRegex(s, r'^\s+if \(totk_sr_on\(\)\) atomic_store\(&g_taa_last, $')
         front = (TOTK/'runtime/frontend.m').read_text() + (TOTK/'runtime/settings_panel.h').read_text()   # weak, checked: tests include them
         names = re.findall(r'extern void (totk_sr_\w+)\([^;]*\) __attribute__\(\(weak_import\)\);', front)
         self.assertEqual(sorted(names), sorted(set(re.findall(r'\b(totk_sr_\w+)\(', front))))

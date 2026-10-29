@@ -104,7 +104,19 @@ int main(int argc, char **argv) {
             totk_sr_start("botw", "1.9.0"); totk_sr_picture(1, 1);
             run_frames(0.8);
             expect(labels(G), @[L1], "first graphics state");
-            for (int i = 0; i < 30; i++) { totk_sr_view(2000 + 10 * i, 1700, 120, 0); run_frames(0.01); }   // a window dragged larger
+            // a window dragged larger: 30 sizes, two frames each, half a second on one 120 Hz schedule. Paced per frame
+            // (usleep), a slow runner stretched it past MAXWAIT_NS, and a configuration still changing then is reported.
+            uint64_t d0 = now_ns();
+            for (int i = 0; i < 30; i++) {
+                totk_sr_view(2000 + 10 * i, 1700, 120, 0);
+                for (int k = 1; k <= 2; k++) {
+                    frame(120, SR_CAP_UNCAPPED, 0, 1);
+                    uint64_t next = d0 + (uint64_t)(2 * i + k) * 1000000000ull / 120, now = now_ns();
+                    if (next > now) usleep((useconds_t)((next - now) / 1000));
+                }
+            }
+            drain();
+            if (now_ns() - d0 >= MAXWAIT_NS) { fprintf(stderr, "FAIL drag merged: the drag took %.2f s, the runner stalled\n", (now_ns() - d0) / 1e9); exit(1); }
             fake_pic = (totk_sr_gfx){.out_w = 2560, .out_h = 1440, .upscale = 2, .taa = 1, .fi_mode = MFX_50};
             totk_sr_view(3840, 2160, 160, 1);   // full screen on another display
             upscaling = antialiasing = 1;
@@ -132,6 +144,11 @@ int main(int argc, char **argv) {
             for (double t = 0; t < 0.8; t += 1 / 120.0) { frame(120, SR_CAP_UNCAPPED_INTERVAL, 0, 1); usleep(8333); }
             drain();
             expect(@[last(G)[1]], @[@"1920x1080 | 21:9 | cap 120/game interval | present thread (display link stalled) | fullscreen@160Hz"], "aspect, path");
+            fake_pic = (totk_sr_gfx){.out_w = 2560, .out_h = 1440, .temporal = 1};   // TOTK_MFX_TEMPORAL
+            for (double t = 0; t < 0.8; t += 1 / 120.0) { frame(120, SR_CAP_UNCAPPED_INTERVAL, 0, 1); usleep(8333); }
+            drain();
+            expect(@[last(G)[1]], @[@"2560x1440 | MetalFX temporal | cap 120/game interval | fullscreen@160Hz"], "temporal");
+            assert([last(G)[2][@"temporalUpscaling"] isEqualToString:@"on"] && [last(G)[2][@"upscaling"] isEqualToString:@"off"]);
         } else if (!strcmp(scenario, "toggle")) {   // flag state_reporting 0 / 1 within one session
             totk_sr_start("totk", "1.4.3"); drain(); totk_sr_picture(1, 1); run_frames(0.8);
             totk_sr_set(0); drain(); run_frames(0.3);

@@ -35,6 +35,7 @@ int runtime_spawn_command(const char *line){(void)line;return 0;}
 uint64_t runtime_gamepad_held(void){return 0;}
 int runtime_setting_word(const char *name,char *word,size_t size){(void)name;(void)word;(void)size;return 0;}   // no rumble.txt / gyro.txt
 void runtime_setting_save(const char *name,const char *word,const char *what){(void)name;(void)word;(void)what;}   // nothing is saved here
+void runtime_setting_remove(const char *name){(void)name;}
 void dm_gfx_set_flag(const char *name,int v){(void)name;(void)v;runtime_fail("unexpected runtime flag in unit probe");}
 void dm_gfx_querylog_next(long n){(void)n;runtime_fail("unexpected query log in unit probe");}
 void dm_gfx_anomdump(void){runtime_fail("unexpected anomaly dump in unit probe");}

@@ -30,6 +30,10 @@ The list holds identifiers only, never game data. Each build makes the shaders f
 | `B` | pipeline key, vertex border, fragment border, flags | That render pipeline with the sampler border colours Metal lacks, emulated in its shaders (`-` for a stage without). The warm-up builds the patched shaders and the pipeline. |
 | `T` | pipeline key, tile reads, flags | That render pipeline with the fragment variant that reads the draw's own colour attachments from the tile, `<argument id>:<attachment>;` per read (`nvn_mtl.m warm_tileread`). Before 2026-10-26 only `pso_user.tsv` had these, so every new install built them in play (all 58 a 5-minute route built in the world with the list). |
 
+- **Pipeline key:** the runtime's 544-byte `pso_skey` (`nvn_pso_skey.h`). The Tears of the Kingdom and Breath of the
+  Wild lists keep it packed: `<vertex variant>:<fragment variant>:<the other 384 bytes in hex>`, each run of four or
+  more zero bytes written `z<count in hex>.`. This is about a quarter of the hex size. Contribution files and the
+  exported warm-up lists use plain hex; `shader_list.py` reads both.
 - **Shader key:** the SHA-256 of the shader's NVN control section and code, computed the same way as the runtime.
 - **Deps:** the translator's `deps` as compact, sorted JSON. They record the texture, image, attribute and fragment
   output types the shader depends on.
@@ -149,6 +153,24 @@ Title rows (`t`) of either game must be recorded in a cache that has the prepare
 row's shader by its file name, and the seed names its variants by their bind-state answers, not as a cache translated
 on the spot would): run the game with `DM_PSO_MANIFEST=off`, an empty `DM_NVN_SHMAP` folder and
 `TOTK_SHADER_SEED_DIR=<prepared seed>`, then `shader_list.py merge --title ... <profile>/pso_user.tsv`.
+
+## Other games
+
+Every other game that records a contribution file keeps its own list, `games/<game>/assets/shader_list.tsv`, never
+Tears of the Kingdom's (2026-10-28): Super Mario Odyssey (`odyssey`), Super Smash Bros. Ultimate (`ssbu`), Super Mario
+Bros. Wonder (`wonder`) and Mario vs. Donkey Kong (`mvdk`). Each game's own `totk_shader_contrib.h` names it: the
+contribution file `shader-list-contribution-<game>.txt` (Wonder and Mario vs. Donkey Kong, in the clone's
+`shader-list-contribution/` folder; Odyssey and Smash write `shader-list-contribution.txt` in their own data folder), the
+[issue form of the other games](https://github.com/ly05010419/MacNativeGames/issues/new?template=shader-list-other.yml)
+with the game filled in (label `shader-list-other`), and an automatic submission titled `Shader list (<game>): ...`.
+Before that the files of Wonder and Mario vs. Donkey Kong were `shader-list-contribution-botw.txt` and their issues were
+titled `Shader list: ... (Wonder 1.2.1)`, like Tears of the Kingdom's.
+
+`collect_shader_issues.py` gives an issue to the game its title, its form's game field or an older title's
+`(<data folder> <version>)` names. There is no seed of those games here, so such an issue gives its game every row that
+is not Tears of the Kingdom's or Breath of the Wild's, and no default variants are dropped; a plain `Shader list:` issue
+holding their shaders finds them by the keys already in their lists. Odyssey's and Smash's builds read their lists
+(their own `prepare_shader_seed.py`); Wonder's and Mario vs. Donkey Kong's do not yet, so their lists only collect for now.
 
 ## Merging what players sent (maintainers)
 

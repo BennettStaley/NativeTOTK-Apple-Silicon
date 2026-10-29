@@ -26,6 +26,17 @@ The 1.4.3 port has separately passed scene loading, movement/jumps, menus/map, s
 
 The 1.2.1 port (October 19) passed the same rewrite verification (600 of 600 negative controls) and the loader, RomFS and startup probes. On an M4 Mac it loaded saves in the 1.0.0 and 1.1.2 formats and passed movement/jumps, menus/map/quick menus, manual save and reload in a new process, fall death and retry, and the three key-3 picture modes; the packaged app was also opened through its launcher. See [the 1.2.1 test record](v1.2.1-port.md); this is not full-game or long-session certification.
 
+**CPU and GPU time in four places (1.4.3, October 28, main at `e13f030`).** Apple M4 Mac mini, 16 GB, macOS 26.5.2; a 1920×1080 window, scene at 1920×1080 (the game's dynamic resolution sometimes drops it to 1720×968 or 1536×864), default settings (frame cap 240, no frame lock, no MetalFX); Link standing still, 90 s after the automatic load, from the test save of each place. Medians of the game's own 300-frame timing lines, the first five windows after the load left out. "Submission CPU" is the replay thread's CPU per frame; "NVN submit + present" is the game side's.
+
+| Place | Frame p50 / p95 | GPU p50 / p95 | Submission CPU | NVN submit + present | Draws per frame |
+|---|---|---|---|---|---|
+| Grassland (field) | 11.02 / 11.93 ms (about 91 fps) | 9.57 / 10.38 ms | 4.32 ms | 4.30 ms | about 3,670 |
+| Lookout Landing, bird tower (town) | 11.92 / 12.96 ms (about 84 fps) | 9.89 / 10.69 ms | 5.22 ms | 5.19 ms | about 4,290 |
+| Lasitakiwak Shrine, inside | 9.73 / 10.87 ms (about 103 fps) | 8.44 / 9.29 ms | 4.91 ms | 4.78 ms | about 11,950 |
+| Room of Awakening, the opening altar | 9.48 / 10.51 ms (about 105 fps) | 7.64 / 8.55 ms | 2.05 ms | 1.95 ms | about 1,030 |
+
+The GPU is the limit in all four (GPU 81–87 % of the frame; submission 2–5 ms runs alongside it). In the shrine, where the submission thread used to be the bottleneck (October 21: 7.0 ms per frame, frame 11.8–11.9 ms), it is now 4.9 ms and the frame 9.7 ms.
+
 ## Breath of the Wild
 
 What works on 1.6.0 (October 20, an M4 Mac, a Great Plateau save): title, the add-on content list, loading and saving, the plateau at about 90–120 fps (the game advances by real time; held-button repeats count by real time too), the two DLC packs mounted and read, key 1 (overlays), key 2 (MetalFX frame interpolation: off → 30+30 → half the refresh rate → unlimited, every game frame interpolated on the plateau) and key 3 (MetalFX 2K on / off: MetalFX replaces the game's own upscale of the 1600x900 picture into the 1080p canvas and the window output above 1080p); a 30-minute session on the plateau at about 95 fps with memory steady (+170 MB). Since October 23 (Mac): key 2 works again (its scene detection had kept a shader key from before an October 20 change and found no frame, #177) and gives what moves with the camera, such as Link, no camera motion, so he no longer shakes at 30+30; key 3's MetalFX again replaces the game's own upscale; key 4 switches 21:9 as on 1.9.0 (1.6.0's camera writes 16:9 every frame, so the game's own write is changed); key 5 smooths edges (#178). Key 3 now cycles off → MetalFX 2K → native 2K → off as on Tears of the Kingdom 1.4.3 (native 2K renders the scene and the canvas at 2560x1440; the app starts with a 2560x1440 swapchain and bigger heaps, `TOTK_OUTPUT_RES=0` keeps the shipped 1080p only). Not yet: the DLC quests themselves (only verified as mounted and read). This is an early port: expect rough edges.

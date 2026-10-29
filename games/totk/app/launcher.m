@@ -26,7 +26,8 @@
 #include "settings_schema.h"
 #include "totk_shader_contrib.h"   // the shared shader list contribution and its reminder
 #import "save_package.h"           // .totksave: saves sent from another Mac or an iPhone / iPad
-#include "contrib_submit.h"        // its "Submit automatically" (gh): run_tool, gh_path, contrib_submit
+#include "contrib_submit.h"        // its "Submit automatically" (gh): run_tool, gh_path, contrib_submit; shared with the settings panel
+#include "update_notice.h"
 
 static void show_error(NSString *detail) {
     NSAlert *alert = [NSAlert new];
@@ -281,6 +282,56 @@ static BOOL make_dir(NSString *path) {
     return [NSFileManager.defaultManager createDirectoryAtPath:path withIntermediateDirectories:YES attributes:nil error:nil];
 }
 
+/* build_app.py --mac-game-data library: the app carries no RomFS image. A folder holds it when its romfs.bin (in it, or in
+   <folder>/<version>) has the size the build pinned (romfs-config.txt) and a romfs.sha256 beside it, if any, names the
+   pinned image: the build copies to romfs.bin.partial first, so a romfs.bin of the full size is a complete copy. Its hash
+   is checked by the runtime at the first start (TOTK_ROMFS_PROOF_DIR). Returns the folder of the image, or nil. */
+static NSString *game_data_in(NSString *folder, unsigned long long size, NSString *sha) {
+    if (!folder.length) return nil;
+    for (NSString *place in @[[folder stringByAppendingPathComponent:@TOTK_GAME_DIR], folder]) {
+        NSDictionary *image = [NSFileManager.defaultManager attributesOfItemAtPath:[place stringByAppendingPathComponent:@"romfs.bin"] error:nil];
+        if (!image || image.fileSize != size) continue;
+        NSString *mark = [NSString stringWithContentsOfFile:[place stringByAppendingPathComponent:@"romfs.sha256"] encoding:NSUTF8StringEncoding error:nil];
+        mark = [mark stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+        if (!mark.length || [mark caseInsensitiveCompare:sha] == NSOrderedSame) return place;
+    }
+    return nil;
+}
+
+/* No folder holds the image (the app copied to another Mac, or its disk not connected): ask where it is, and keep the
+   answer for the next starts (defaults MNGGameDataFolder.<version>). The image is read where it is, never moved or
+   copied. Returns its folder, or nil to quit. */
+static NSString *game_data_ask(NSArray<NSString *> *looked, unsigned long long size, NSString *sha) {
+    [NSApplication sharedApplication]; [NSApp activateIgnoringOtherApps:YES];
+    for (;;) {
+        NSAlert *alert = [NSAlert new];
+        alert.messageText = @"Where is the game data?";
+        alert.informativeText = [NSString stringWithFormat:@"This app keeps its game data (romfs.bin, %.1f GB) outside the app, and it is not in %@. If it is on a disk that is not connected, connect it and choose Try Again; otherwise choose the folder it is in. The game reads it where it is, without moving or copying it.",
+                                     size / 1e9, [looked componentsJoinedByString:@", "]];
+        [alert addButtonWithTitle:@"Choose Folder…"];
+        [alert addButtonWithTitle:@"Try Again"];
+        [alert addButtonWithTitle:@"Quit"];
+        NSModalResponse choice = [alert runModal];
+        if (choice == NSAlertThirdButtonReturn) return nil;
+        if (choice == NSAlertSecondButtonReturn) {
+            for (NSString *folder in looked) { NSString *found = game_data_in(folder, size, sha); if (found) return found; }
+            continue;
+        }
+        NSOpenPanel *panel = [NSOpenPanel openPanel];
+        panel.canChooseFiles = NO; panel.canChooseDirectories = YES; panel.allowsMultipleSelection = NO;
+        panel.message = @("Choose the folder that holds romfs.bin (or the folder that holds its " TOTK_GAME_DIR " folder).");
+        panel.prompt = @"Choose";
+        if ([panel runModal] != NSModalResponseOK || !panel.URL) continue;
+        NSString *found = game_data_in(panel.URL.path, size, sha);
+        if (found) {
+            [NSUserDefaults.standardUserDefaults setObject:found forKey:@"MNGGameDataFolder." TOTK_GAME_DIR];
+            return found;
+        }
+        note([NSString stringWithFormat:@"%@ holds no romfs.bin of this version (%llu bytes).",
+              panel.URL.path, size]);
+    }
+}
+
 int main(int argc, char **argv) {
     @autoreleasepool {
         NSString *root = [NSBundle.mainBundle.resourcePath stringByAppendingPathComponent:@"totk"];
@@ -334,6 +385,7 @@ int main(int argc, char **argv) {
         }
         for (NSString *package in packages)
             if (!import_package(package, profile, [data stringByAppendingPathComponent:@"save-backups"])) return 0;
+        mng_update_notice(data);
 #if defined(TOTK_GAME_V112) || defined(TOTK_GAME_V121) || defined(TOTK_GAME_V143)
         NSString *backup = [profile stringByAppendingFormat:@"-before-%s", TOTK_GAME_VERSION];
         NSFileManager *fm = NSFileManager.defaultManager;
@@ -378,7 +430,33 @@ int main(int argc, char **argv) {
         setenv("TOTK_SHADER_CACHE", cache.fileSystemRepresentation, 1);
         setenv("TOTK_GAME_SLOT_DIR", slot.fileSystemRepresentation, 1);
         setenv("TOTK_ROMFS_PROOF_DIR", data.fileSystemRepresentation, 1);   // the app bundle stays read-only
+        BOOL stored = [NSFileManager.defaultManager fileExistsAtPath:[root stringByAppendingPathComponent:@"game-data.json"]];
         game_data(root, YES);   // the game data outside the app: its folders (and the RomFS record next to the image)
+        /* build_app.py --mac-game-data library: the app carries no RomFS image, so a new build is a few hundred MB and
+           copies to another Mac without it. It is looked for in the folder chosen at an earlier start (game_data_ask), the
+           folder the build put it in (Info.plist MNGGameDataFolder, e.g. on another disk), and <data>/GameData; with none
+           holding it, the player is asked. An app with its own image uses that. */
+        NSFileManager *files = NSFileManager.defaultManager;
+        if (!stored && ![files fileExistsAtPath:@"extracted/" TOTK_GAME_DIR "/romfs/romfs.bin"]) {
+            NSString *pins = [NSString stringWithContentsOfFile:@"build/game-data/" TOTK_GAME_DIR "/romfs-config.txt" encoding:NSUTF8StringEncoding error:nil];
+            unsigned long long size = 0; NSString *sha = @"";
+            for (NSString *line in [pins componentsSeparatedByString:@"\n"]) {
+                NSArray<NSString *> *kv = [line componentsSeparatedByString:@" "];
+                if (kv.count != 2) continue;
+                if ([kv[0] isEqualToString:@"ROMFS_IMAGE_SIZE"]) size = strtoull(kv[1].UTF8String, NULL, 10);
+                if ([kv[0] isEqualToString:@"ROMFS_IMAGE_SHA256"]) sha = kv[1];
+            }
+            if (!size) { show_error(@"The game files are missing from this app. Build it again with build_app.py."); return 1; }
+            NSMutableArray<NSString *> *places = [NSMutableArray array];
+            for (id place in @[[NSUserDefaults.standardUserDefaults stringForKey:@"MNGGameDataFolder." TOTK_GAME_DIR] ?: @"",
+                               [NSBundle.mainBundle objectForInfoDictionaryKey:@"MNGGameDataFolder"] ?: @"",
+                               [data stringByAppendingPathComponent:@"GameData"]])
+                if ([place isKindOfClass:NSString.class] && [place length] && ![places containsObject:place]) [places addObject:place];
+            NSString *library = nil;
+            for (NSString *place in places) if ((library = game_data_in(place, size, sha))) break;
+            if (!library && !(library = game_data_ask(places, size, sha))) return 0;
+            setenv("TOTK_ROMFS_DATA", library.fileSystemRepresentation, 1);   // runtime/romfs.c
+        }
         setenv("TOTK_SHARED_FONTS", "extracted/firmware/shared-fonts", 1);
         /* Player mods (runtime/mods.h): one folder per mod in <data>/mods, mods.txt for the order; a TOTK_MODS_DIR already
            set wins (a test's own folder). The older single folder <data>/mods/<version> with its manifest.tsv still loads. */

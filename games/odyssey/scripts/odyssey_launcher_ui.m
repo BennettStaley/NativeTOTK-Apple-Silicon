@@ -69,13 +69,19 @@ static void set_graphics(NSString *k, NSString *v) { if (!g_gfx[k]) [g_gfx_order
     logo.frame = NSMakeRect(40, 540, 128, 128); logo.imageScaling = NSImageScaleProportionallyUpOrDown; [v addSubview:logo];
     NSTextField *title = [NSTextField labelWithString:@"Super Mario Odyssey"]; title.font = [NSFont systemFontOfSize:26 weight:NSFontWeightBold];
     title.frame = NSMakeRect(184, 618, 340, 34); [v addSubview:title];
-    NSTextField *sub = [NSTextField wrappingLabelWithString:@"Version 1.3.0, native on Apple silicon.\nBuilt from your own game files: do not share this app."];
+    /* The game's version from its update's Control data (scripts/extract_app_icon.py writes Resources/game-version.txt):
+       1.3.0 and 1.4.1 share their executables, so only that file tells them apart. */
+    NSString *ver = [[NSString stringWithContentsOfFile:[NSBundle.mainBundle.resourcePath stringByAppendingPathComponent:@"game-version.txt"]
+                                               encoding:NSUTF8StringEncoding error:nil]
+                     stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    NSString *head = ver.length ? [NSString stringWithFormat:@"Version %@, native on Apple silicon.", ver] : @"Native on Apple silicon.";
+    NSTextField *sub = [NSTextField wrappingLabelWithString:[head stringByAppendingString:@"\nBuilt from your own game files: do not share this app."]];
     sub.textColor = NSColor.secondaryLabelColor; sub.frame = NSMakeRect(184, 560, 340, 50); [v addSubview:sub];
 
     CGFloat y = 510;
     [self header:@"Graphics" in:v y:y]; y -= 34;
-    [self row:@"Resolution (render size)" key:@"resolution" titles:@[@"1600 × 900 (the game's own)", @"1920 × 1080", @"2240 × 1260"]
-       tokens:@[@"1600x900", @"1920x1080", @"2240x1260"] current:g_gfx[@"resolution"] in:v y:y]; y -= 32;
+    [self row:@"Resolution (render size)" key:@"resolution" titles:@[@"1600 × 900 (the game's own)", @"1920 × 1080", @"2240 × 1260", @"2560 × 1440"]
+       tokens:@[@"1600x900", @"1920x1080", @"2240x1260", @"2560x1440"] current:g_gfx[@"resolution"] in:v y:y]; y -= 32;
     [self row:@"Anti-aliasing" key:@"aa" titles:@[@"Off", @"FXAA", @"SMAA"] tokens:@[@"off", @"fxaa", @"smaa"] current:g_gfx[@"aa"] in:v y:y]; y -= 32;
     [self row:@"Upscaler" key:@"upscaler" titles:@[@"MetalFX", @"FSR 1", @"Lanczos", @"Bilinear"] tokens:@[@"metalfx", @"fsr1", @"lanczos", @"bilinear"]
        current:g_gfx[@"upscaler"] in:v y:y]; y -= 32;

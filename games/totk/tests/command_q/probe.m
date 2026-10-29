@@ -20,6 +20,10 @@ void runtime_gamepad_settings_enable(int on){(void)on;}
 int runtime_gamepad_settings_requested(void){return 0;}
 #endif
 #ifndef FRONTEND_REAL_GAMEPAD
+int runtime_gamepad_settings_button(void){return -1;}
+void runtime_gamepad_settings_button_set(int physical){(void)physical;}
+#endif
+#ifndef FRONTEND_REAL_GAMEPAD
 static int textCaptureFixture;
 #endif
 #ifndef FRONTEND_REAL_GAMEPAD
@@ -35,7 +39,14 @@ int runtime_setting_word(const char *n,char *s,size_t z){(void)n;(void)s;(void)z
 void runtime_setting_save(const char *n,const char *s,const char *w){(void)n;(void)s;(void)w;}
 #endif
 #ifndef FRONTEND_REAL_GAMEPAD
+int runtime_shared_setting_word(const char *n,char *s,size_t z){(void)n;(void)s;(void)z;return 0;}
+void runtime_shared_setting_save(const char *n,const char *s,const char *w){(void)n;(void)s;(void)w;}
+#endif
+#ifndef FRONTEND_REAL_GAMEPAD
 int runtime_gamepad_type(int *detected){if(detected)*detected=-1;return 0;}
+#endif
+#ifndef FRONTEND_REAL_GAMEPAD
+int runtime_gamepad_battery_percent(void){return -1;}
 #endif
 #ifndef FRONTEND_REAL_GAMEPAD
 int runtime_mouse_enabled(void){return 0;}
@@ -52,6 +63,24 @@ void runtime_mouse_button(int button,int down){(void)button;(void)down;}
 #ifndef FRONTEND_REAL_GAMEPAD
 void runtime_mouse_release(void){}
 #endif
+#ifndef FRONTEND_REAL_GAMEPAD
+void runtime_setting_remove(const char *n){(void)n;}
+#endif
+#ifndef FRONTEND_REAL_GAMEPAD
+void runtime_controller_map_get(uint16_t *map,uint8_t *modes){controller_map_default(map,modes);}
+#endif
+#ifndef FRONTEND_REAL_GAMEPAD
+void runtime_controller_map_set(const uint16_t *map,const uint8_t *modes){(void)map;(void)modes;}
+#endif
+#ifndef FRONTEND_REAL_GAMEPAD
+void runtime_controller_map_reset(void){}
+#endif
+/* runtime/input.c's keyboard and mouse layout (the settings panel's key bindings). */
+static KeyMap probeKeyMap;static int probeKeyMapSet;
+void runtime_keymap_get(KeyMap *out){if(!probeKeyMapSet){keymap_default(&probeKeyMap);probeKeyMapSet=1;}*out=probeKeyMap;}
+void runtime_keymap_set(const KeyMap *map){probeKeyMap=*map;probeKeyMapSet=1;}
+void runtime_keymap_reset(void){keymap_default(&probeKeyMap);probeKeyMapSet=1;}
+void runtime_input_mouse(int button,int down){(void)button;(void)down;}
 void runtime_oe_push_message(uint32_t message){(void)message;}
 void hle_bind_system_event(void *event,int autoclear){(void)event;(void)autoclear;}
 void hle_signal_system_event(void *event){(void)event;}
@@ -80,6 +109,9 @@ int runtime_gamepad_type_set(int type){return type;}
 #endif
 #ifndef FRONTEND_REAL_GAMEPAD
 int runtime_mouse_set(int on){return on;}
+int runtime_mouse_sensitivity(void){return 50;}
+int runtime_mouse_sensitivity_locked(void){return 0;}
+void runtime_mouse_sensitivity_set(int sensitivity){(void)sensitivity;}
 #endif
 void nvn_fps_lock_set(int fps){(void)fps;}
 /* TOTK_STATE_REPORTING (gfx/nvn/totk_state_report.m): frontend.m declares them weak, the linker still wants them. */
@@ -102,6 +134,7 @@ int runtime_triggers_available(void){return 0;}
 int runtime_triggers_locked(void){return 0;}
 int runtime_triggers_choice(void){return 0;}
 void runtime_triggers_choose(int on){(void)on;}
+void runtime_triggers_release(void){fprintf(stderr,"[probe] triggers released\n");}   /* the window's close lets the DualSense go */
 int fps_overlay_value(void){return 0;}   /* the HUD's FPS graph (PR #940) */
 
 static NSEvent *key(NSEventModifierFlags flags){

@@ -7,10 +7,11 @@
      5  upscaler       MetalFX / FSR 1 / Lanczos / bilinear   the game picture to the window
      6  textures       game / 4x / 8x / 16x          anisotropic filtering of the game's mipmapped samplers (the game's
                                                      texture sizes are fixed by its data; this is how sharp they look at an angle)
-     7  resolution     1600x900 / 1920x1080 / 2240x1260   the game's render size, at the next launch (runtime/game_patches.c
-                                                     patch_render_res plus the quality table; the launcher reads the file).
-                                                     2400x1350 and 2560x1440 stop the game in its SDK (26 October): a limit
-                                                     not yet found
+     7  resolution     1600x900 / 1920x1080 / 2240x1260 / 2560x1440   the game's render size, at launch (runtime/game_patches.c
+                                                     patch_render_res, with the render target pool and the game's memory heap
+                                                     grown, plus the quality table; the launcher reads the file). Before the
+                                                     memory heap grew too (#1076), 2400x1350 and 2560x1440 stopped the game
+                                                     in its SDK (26 October)
    Keys 3-5 act while 60+60 is on (the user's choice); with it off the picture stays the default (MetalFX, no filter).
    ODYSSEY_GFX_ALWAYS=1 lifts that (measurements). ODYSSEY_GFX_SETTINGS=<file> keeps the choices across launches as
    "name=value" lines (aa, cas, upscaler, textures, resolution); ODYSSEY_AA / _CAS / _UPSCALER / _TEXTURES override them,
@@ -29,11 +30,11 @@ static const char *const gx_title[GX_N] = {"Anti-aliasing", "Sharpen (CAS)", "Up
 static const char *const gx_key[GX_N] = {"aa", "cas", "upscaler", "textures", "resolution"};
 static const char *const gx_token[GX_N][4] = {
     {"off", "fxaa", "smaa", "taa"}, {"off", "on"}, {"metalfx", "fsr1", "lanczos", "bilinear"},
-    {"game", "4x", "8x", "16x"}, {"1600x900", "1920x1080", "2240x1260"}};
+    {"game", "4x", "8x", "16x"}, {"1600x900", "1920x1080", "2240x1260", "2560x1440"}};
 static const char *const gx_label[GX_N][4] = {
     {"off", "FXAA", "SMAA", "TAA"}, {"off", "on"}, {"MetalFX", "FSR 1", "Lanczos", "bilinear"},
-    {"game default", "4x anisotropic", "8x anisotropic", "16x anisotropic"}, {"1600x900", "1920x1080", "2240x1260"}};
-static const int gx_ready[GX_N] = {3, 2, 4, 4, 3};   // values a key cycles through (TAA joins when it exists)
+    {"game default", "4x anisotropic", "8x anisotropic", "16x anisotropic"}, {"1600x900", "1920x1080", "2240x1260", "2560x1440"}};
+static const int gx_ready[GX_N] = {3, 2, 4, 4, 4};   // values a key cycles through (TAA joins when it exists)
 static _Atomic int g_gx[GX_N];
 static int g_gx_res_now;                             // the resolution this launch runs at (TOTK_RENDER_RES, set by the launcher)
 static _Atomic int g_samp_flush;                      // key 6: the sampler cache rebuilds with the new filtering

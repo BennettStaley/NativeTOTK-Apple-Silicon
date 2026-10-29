@@ -101,8 +101,11 @@ static NSString *par_dir(void) {
 }
 static NSString *par_file(NSString *name) { return [par_dir() stringByAppendingFormat:@"/%@.metalarchive", name]; }
 static NSString *par_keys_file(NSString *name) { return [par_dir() stringByAppendingFormat:@"/%@.keys", name]; }
+// 5 (2026-10-29): border and tile-read pipelines are keyed with their variant (nvn_mtl.m pso_archive_key); files of 4 held
+// some under the plain pipeline's key, which then missed in every session.
+#define PAR_SCHEMA 5
 static NSDictionary *par_identity(id<MTLDevice> dev) {
-    return @{@"schema": @4, @"chain": @DMSH_CHAIN, @"gpu": dev.name ?: @"?",
+    return @{@"schema": @PAR_SCHEMA, @"chain": @DMSH_CHAIN, @"gpu": dev.name ?: @"?",
              @"os": NSProcessInfo.processInfo.operatingSystemVersionString ?: @"?"};
 }
 static NSString *par_hash(const void *bytes, size_t n) {
@@ -187,6 +190,57 @@ static uint64_t par_load_dir(NSUInteger *files) {
     }
     return bytes;
 }
+/* Pipelines the Mac compiled for this device's GPU while packaging (2026-10-29; ios/tools/device_pipelines.py, run by
+   build_ipa.py): flat in the seed folder, since a pushed seed is one stream of files (install_device.py write_pack):
+   pipelines-<GPU architecture>.json (schema, chain, arch), .tsv (key, file name) and pipelines-<arch>-<name>.metalarchive.
+   Read where they are. A first start then takes the lists' pipelines from them and fills nothing, as a second start
+   would (Breath of the Wild 1.6.0, iPhone 14: 12,453 pipelines filled in 567.8 s on the device). Only for the translation
+   chain and the architecture they name (MTLDevice.architecture); the device's own files win. TOTK_PIPELINE_PREBUILT=0
+   ignores them. Called under par_open_dir's once, after par_load_dir. Returns how many keys they added. */
+static NSString *g_par_pre_base;              // <seed>/pipelines-<arch>-
+static NSMutableSet<NSString *> *g_par_pre;   // their file names (g_par_mu)
+static _Atomic uint64_t g_par_pre_hit, g_par_pre_miss;
+static __thread int par_last_pre;             // par_archive_for's archive was one of them
+static NSString *par_pre_file(NSString *name) { return [g_par_pre_base stringByAppendingFormat:@"%@.metalarchive", name]; }
+static NSUInteger par_load_prebuilt(id<MTLDevice> dev) {
+    g_par_pre = [NSMutableSet set];
+    const char *off = getenv("TOTK_PIPELINE_PREBUILT"), *seed = getenv("TOTK_SHADER_SEED_DIR");
+    NSString *arch = dev.architecture.name, *dir = seed && *seed ? @(seed) : nil;
+#if !TARGET_OS_IPHONE
+    /* The Mac app's own seed (build_app.py mac_pipelines). With the fork's game-data folders the launcher names the
+       shaders folder's seed, but mac_pipelines still writes the pipelines into the app's build/shader-seed: look there
+       first. */
+    NSString *own = exe_rel("shader-seed");
+    if (!dir || (arch.length && [NSFileManager.defaultManager fileExistsAtPath:
+            [own stringByAppendingPathComponent:[NSString stringWithFormat:@"pipelines-%@.json", arch]]])) dir = own;
+#endif
+    if ((off && !strcmp(off, "0")) || !dir.length || !arch.length) return 0;
+    NSString *base = [dir stringByAppendingPathComponent:[@"pipelines-" stringByAppendingString:arch]];
+    NSData *jd = [NSData dataWithContentsOfFile:[base stringByAppendingString:@".json"]];
+    NSDictionary *stamp = jd ? [NSJSONSerialization JSONObjectWithData:jd options:0 error:nil] : nil;
+    if (![stamp isKindOfClass:NSDictionary.class]) {
+        NSMutableArray *other = [NSMutableArray array];
+        for (NSString *n in [NSFileManager.defaultManager contentsOfDirectoryAtPath:dir error:nil] ?: @[])
+            if ([n hasPrefix:@"pipelines-"] && [n hasSuffix:@".json"]) [other addObject:[[n substringFromIndex:10] stringByDeletingPathExtension]];
+        if (other.count) MLOG("pipeline archive: the app's Mac-built pipelines are for %s, this device's GPU is %s; the first start fills its own as before",
+                              [other componentsJoinedByString:@", "].UTF8String, arch.UTF8String);
+        return 0;
+    }
+    if (![stamp[@"schema"] isEqual:@PAR_SCHEMA] || ![stamp[@"chain"] isEqual:@DMSH_CHAIN] || ![stamp[@"arch"] isEqual:arch]) {
+        MLOG("[red] pipeline archive: the app's Mac-built pipelines do not match (schema %s / chain %s / GPU %s, here %d / %s / %s): not used", [[stamp[@"schema"] description] UTF8String],
+             [[stamp[@"chain"] description] UTF8String], [[stamp[@"arch"] description] UTF8String], PAR_SCHEMA, DMSH_CHAIN, arch.UTF8String);
+        return 0;
+    }
+    NSString *index = [NSString stringWithContentsOfFile:[base stringByAppendingString:@".tsv"] encoding:NSUTF8StringEncoding error:nil];
+    NSUInteger n = 0;
+    for (NSString *line in [index componentsSeparatedByString:@"\n"]) {
+        NSArray<NSString *> *c = [line componentsSeparatedByString:@"\t"];
+        if (c.count != 2 || !c[0].length || !c[1].length || [c[1] containsString:@"/"] || g_par_where[c[0]]) continue;
+        [g_par_have addObject:c[0]]; g_par_where[c[0]] = c[1]; [g_par_pre addObject:c[1]]; n++;
+    }
+    g_par_pre_base = [base stringByAppendingString:@"-"];
+    return n;
+}
 // Once: the folder of this OS version, GPU and chain, and the keys it has files for.
 static void par_open_dir(id<MTLDevice> dev) {
     static dispatch_once_t once;
@@ -207,10 +261,12 @@ static void par_open_dir(id<MTLDevice> dev) {
         }
         [fm createDirectoryAtPath:par_dir() withIntermediateDirectories:YES attributes:nil error:nil];
         [[NSJSONSerialization dataWithJSONObject:par_identity(dev) options:NSJSONWritingSortedKeys error:nil] writeToFile:stamp_path atomically:YES];
-        NSUInteger files = 0; uint64_t bytes = par_load_dir(&files);
+        NSUInteger files = 0; uint64_t bytes = par_load_dir(&files), own = g_par_have.count, pre = par_load_prebuilt(dev);
         g_par_on = 1; g_par_valid = g_par_have.count > 0;
-        if (g_par_valid) MLOG("pipeline archive: %lu pipelines in %lu files (%.1f MB total), each file opened only when used", (unsigned long)g_par_have.count, (unsigned long)files, bytes / 1048576.0);
-        else MLOG("pipeline archive: none yet; this run %s", par_fill_light() ? "collects the pipeline list into the archive in the background (not resident)" : "collects during play (written in the background while the game is idle)");
+        if (pre) MLOG("pipeline archive: the app brings %llu pipelines the Mac compiled for this GPU (%s), so the first start fills nothing; %llu of this Mac's own",
+                      (unsigned long long)pre, dev.architecture.name.UTF8String, (unsigned long long)own);
+        if (g_par_valid && own) MLOG("pipeline archive: %llu pipelines in %lu files (%.1f MB total), each file opened only when used", (unsigned long long)own, (unsigned long)files, bytes / 1048576.0);
+        else if (!g_par_valid) MLOG("pipeline archive: none yet; this run %s", par_fill_light() ? "collects the pipeline list into the archive in the background (not resident)" : "collects during play (written in the background while the game is idle)");
     });
 }
 // The archive with this pipeline's code, or nil (no file yet; off).
@@ -219,18 +275,40 @@ static id<MTLBinaryArchive> par_archive_for(id<MTLDevice> dev, NSString *key) {
     if (!g_par_on || !key) return nil;
     pthread_mutex_lock(&g_par_mu);
     NSString *name = g_par_where[key];
+    int pre = name && [g_par_pre containsObject:name];
     id<MTLBinaryArchive> a = name ? g_par_open[name] : nil;
     if (!a && name) {
-        MTLBinaryArchiveDescriptor *d = [MTLBinaryArchiveDescriptor new]; d.url = [NSURL fileURLWithPath:par_file(name)];
+        MTLBinaryArchiveDescriptor *d = [MTLBinaryArchiveDescriptor new]; d.url = [NSURL fileURLWithPath:pre ? par_pre_file(name) : par_file(name)];
         NSError *e = nil; a = [dev newBinaryArchiveWithDescriptor:d error:&e];
         if (a) g_par_open[name] = a;
-        else {   // unreadable: its pipelines are compiled again and written to new files
+        else {   // unreadable: its pipelines are compiled again and written to new files (the app's own files stay)
             for (NSString *k in [g_par_where allKeysForObject:name]) { [g_par_have removeObject:k]; [g_par_where removeObjectForKey:k]; }
-            [NSFileManager.defaultManager removeItemAtPath:par_file(name) error:nil]; [NSFileManager.defaultManager removeItemAtPath:par_keys_file(name) error:nil];
+            if (pre) [g_par_pre removeObject:name];
+            else { [NSFileManager.defaultManager removeItemAtPath:par_file(name) error:nil]; [NSFileManager.defaultManager removeItemAtPath:par_keys_file(name) error:nil]; }
         }
     }
     pthread_mutex_unlock(&g_par_mu);
+    par_last_pre = a && pre;
     return a;
+}
+/* A pipeline from par_archive_for's file was found there (hit) or not: for the files the app brought (par_load_prebuilt). */
+static void par_pre_note(int hit) {
+    if (par_last_pre) atomic_fetch_add(hit ? &g_par_pre_hit : &g_par_pre_miss, 1);
+}
+/* Before a fill: if this system's Metal took less than half of what it looked up in the app's files (an iOS update whose
+   compiler no longer takes their code; a wrong architecture is never loaded), they are dropped, so the fill builds those
+   pipelines on the device and writes them into its own files, as without them. */
+static void par_pre_check(void) {
+    uint64_t hit = atomic_load(&g_par_pre_hit), miss = atomic_load(&g_par_pre_miss);
+    if (miss < 16 || miss <= hit) return;
+    pthread_mutex_lock(&g_par_mu);
+    NSUInteger n = 0;
+    for (NSString *k in g_par_where.allKeys) if ([g_par_pre containsObject:g_par_where[k]]) { [g_par_have removeObject:k]; [g_par_where removeObjectForKey:k]; n++; }
+    for (NSString *name in g_par_pre) [g_par_open removeObjectForKey:name];
+    [g_par_pre removeAllObjects];
+    pthread_mutex_unlock(&g_par_mu);
+    MLOG("[red] pipeline archive: this device's Metal does not take the app's Mac-built pipelines (%llu found, %llu not found): dropping those %lu, filling them here instead",
+         (unsigned long long)hit, (unsigned long long)miss, (unsigned long)n);
 }
 /* The thread's batch: an archive being filled and its keys (par_write), written as one file by par_flush_thread. Kept in
    the thread's dictionary; every thread that writes (par_write_in_place) flushes before it does other work. Adding compiles

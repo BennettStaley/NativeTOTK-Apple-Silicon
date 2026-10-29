@@ -483,8 +483,10 @@ static void crash(int num,siginfo_t *info,void *context) {
   if((insn&~31u)==0xd53b0020u){if(rt!=31)u->uc_mcontext->__ss.__x[rt]=HOST_CTR_EL0;u->uc_mcontext->__ss.__pc+=4;return;}   /* mrs Xt, CTR_EL0 */
   if((insn&~31u)==0xd50b7e20u){uintptr_t a=rt==31?0:(uintptr_t)u->uc_mcontext->__ss.__x[rt];sys_dcache_flush((void *)(a&~(uintptr_t)127),128);u->uc_mcontext->__ss.__pc+=4;return;}   /* dc civac, Xt */
  }
- if((num==SIGBUS||num==SIGSEGV)&&runtime_fault_guard){sigjmp_buf *g=runtime_fault_guard;runtime_fault_guard=NULL;siglongjmp(*g,1);}   /* guarded host read of guest memory (uniform snapshot copies) */
+ /* The graphics layer's write tracking first: a guarded write (WriteTexels) to a page it keeps read-only is its fault to
+    resolve, not a lost page (2026-10-29: the guard took it first and dropped a 17 MiB texture's update). */
  if(runtime_gfx_fault(info->si_addr,(u->uc_mcontext->__es.__esr>>6)&1,context))return;
+ if((num==SIGBUS||num==SIGSEGV)&&runtime_fault_guard){sigjmp_buf *g=runtime_fault_guard;runtime_fault_guard=NULL;siglongjmp(*g,1);}   /* guarded host access to guest memory (uniform snapshot copies, texture reads, ReadTexels / WriteTexels) */
  /* Everything above is a recoverable fault; from here on it is a crash, and only the first crashing thread goes on to print (crash_gate.h; exits if the dump takes 15 s) */
  crash_gate(num,15);
  uint64_t pc=u->uc_mcontext->__ss.__pc,fp=u->uc_mcontext->__ss.__fp;
@@ -636,7 +638,7 @@ static void abort_report(int num) {
  signal(SIGABRT,SIG_DFL);raise(SIGABRT);
 }
 int main(int argc,char **argv) {
- need(argc==3,"usage: totk-native rewritten-dir probe|boot");
+ need(argc==3||(argc>3&&!strcmp(argv[2],"pipeline-archive")),"usage: totk-native rewritten-dir probe|boot (pipeline-archive <list>...)");
  /* One game or GPU probe at a time (memory, GPU time): wait for the slot before anything is loaded. */
  if(!strcmp(argv[2],"boot")||!strncmp(argv[2],"probe-gpu",9))runtime_game_slot_acquire(argv[2]);
  /* The player's settings (runtime/settings.c): TOTK_SETTINGS from the Mac launcher; the iOS app loaded them already. */
@@ -655,6 +657,7 @@ int main(int argc,char **argv) {
  for(unsigned i=0;i<NM;i++)if(!strcmp(modules[i].name,"main")){runtime_game_patches(&modules[i]);runtime_cheats_launch(&modules[i]);}
 #if !TARGET_OS_IPHONE
  if(!strcmp(argv[2],"export-ios")){const char *out=getenv("TOTK_EXPORT_IOS");need(out!=NULL,"export-ios needs TOTK_EXPORT_IOS=<dir>");export_ios_text(argv[1],out);return 0;}
+ if(!strcmp(argv[2],"pipeline-archive"))return mtl_pipeline_archive_tool(argc-3,argv+3);   // packaging: the device's pipelines made on the Mac (ios/tools/build_ipa.py)
 #endif
  verify_identity(!strcmp(argv[2],"probe-identity-negative"));
  for(unsigned i=0;i<NM;i++){seal(&modules[i]);check_permissions(&modules[i]);}

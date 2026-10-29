@@ -130,7 +130,7 @@ translated into Metal libraries ahead of time; then run the build command again 
 
 | Setting | Choices | What it does |
 |---|---|---|
-| Resolution (render size) | 1600 × 900 (the game's own) / 1920 × 1080 / 2240 × 1260 | How many pixels the game draws: sharper and the best edge smoothing higher up, at the most GPU time |
+| Resolution (render size) | 1600 × 900 (the game's own) / 1920 × 1080 / 2240 × 1260 / 2560 × 1440 | How many pixels the game draws: sharper and the best edge smoothing higher up, at the most GPU time |
 | Anti-aliasing | Off / FXAA / SMAA | Smooths jagged edges before the upscale; SMAA looks better, FXAA is nearly free |
 | Upscaler | MetalFX / FSR 1 / Lanczos / Bilinear | How the picture is enlarged to the screen; bilinear is the cheapest and softest |
 | Texture filtering | Game default / 4× / 8× / 16× anisotropic | Keeps floors and walls sharp at an angle |

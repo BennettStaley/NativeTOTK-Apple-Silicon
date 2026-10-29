@@ -1,6 +1,7 @@
-/* The Mac controller's haptics and motion sensors for the game's HD rumble and six-axis sensor (runtime/hid_feedback.c),
-   2026-10-17. On by default (TOTK_RUMBLE=0 / TOTK_GYRO=0, or rumble.txt / gyro.txt saying off, turn them off), and only on
-   macOS (iOS: stubs, never on).
+/* The controller's haptics and motion sensors for the game's HD rumble and six-axis sensor (runtime/hid_feedback.c),
+   2026-10-17. On by default (TOTK_RUMBLE=0 / TOTK_GYRO=0, or rumble.txt / gyro.txt saying off, turn them off), on macOS and
+   iOS. The raw HID fallback for a controller whose GameController motion stays all zeros needs IOKit, so it is macOS only;
+   the DualSense's trigger resistance reads the game's memory, so it is macOS only too.
    Rumble: each of the game's two vibration devices (left, right) is a Core Haptics engine on that handle of the
    controller (GCHapticsLocalityLeftHandle / RightHandle; a DualSense has both) playing a long continuous event. The
    game's value (two bands, each an amplitude 0..1 at a frequency) sets the event's intensity (TOTK_RUMBLE_GAIN, else
@@ -17,33 +18,25 @@
 #include <TargetConditionals.h>
 #include <math.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "runtime.h"
 #include "feedback_settings.h"
 
-#if !TARGET_OS_OSX
-int runtime_triggers_available(void) { return 0; }
-int runtime_triggers_locked(void) { return 1; }
-int runtime_triggers_choice(void) { return 0; }
-void runtime_triggers_choose(int on) { (void)on; }
-void runtime_feedback_attach(GCController *c) { (void)c; }
-void runtime_feedback_detach(GCController *c) { (void)c; }
-void runtime_feedback_quiet(void) {}
-void runtime_rumble_set(unsigned side, float al, float fl, float ah, float fh) { (void)side; (void)al; (void)fl; (void)ah; (void)fh; }
-int runtime_rumble_gain_locked(void) { return 1; }
-float runtime_rumble_gain(void) { return 1; }
-void runtime_rumble_gain_set(float g) { (void)g; }
-#else
 #import <CoreHaptics/CoreHaptics.h>
+
 #include <mach/mach.h>
+#include <mach/mach_time.h>
+#if TARGET_OS_OSX
+#import <AppKit/AppKit.h>   /* NSApp.active: R2 resists only while the app is in front */
 #include <mach/mach_vm.h>
 #include "bow_state.h"
 #include "game_version.h"   /* Tears of the Kingdom 1.4.3's scene slot and actor name offsets, for the bow state */
-#include <mach/mach_time.h>
-#include "hid_imu.h"
 #import <IOKit/hid/IOHIDManager.h>
+#endif
+#include "hid_imu.h"
 
 /* ---- rumble ----
    Simple pattern players (CHHapticPatternPlayer) only: on macOS 26.5.2 (25F84) the advanced player (looping) never gets
@@ -52,7 +45,7 @@ void runtime_rumble_gain_set(float g) { (void)g; }
    -4810). Simple players and AHAP data play fine there (2026-10-17, DualSense, intensity 0). So each handle plays one
    30-second continuous event whose intensity and sharpness follow the game through dynamic parameters, and a fresh
    player takes over after 25 s. */
-enum { RUMBLE_TICK_MS = 10, RUMBLE_STALE_MS = 250, RUMBLE_HOLD_MS = 150, RUMBLE_EVENT_S = 30, RUMBLE_RENEW_MS = 25000 };
+enum { RUMBLE_TICK_MS = 10, RUMBLE_SLOW_MS = 1000, RUMBLE_STALE_MS = 250, RUMBLE_HOLD_MS = 150, RUMBLE_EVENT_S = 30, RUMBLE_RENEW_MS = 25000 };
 static dispatch_queue_t rumbleQueue;
 static dispatch_source_t rumbleTimer;
 static GCController *rumblePad;                     /* rumbleQueue */
@@ -67,6 +60,9 @@ static float want[2][4] = {{0, 160, 0, 320}, {0, 160, 0, 320}};
 static uint64_t wantAt[2], wantCount, wantCountLogged;
 static float strongest;
 static _Atomic float gain = 1.0f;   /* the rumble queue reads it; the settings panel sets it */
+/* Idle rumble ticks once a second instead of 100 times: a connected controller should not keep the CPU waking while
+   the game sends nothing. A new value switches back to 100 Hz. */
+static _Atomic int rumbleSlow;
 
 void runtime_rumble_set(unsigned side, float al, float fl, float ah, float fh) {
     if (side > 1) return;
@@ -74,6 +70,12 @@ void runtime_rumble_set(unsigned side, float al, float fl, float ah, float fh) {
     want[side][0] = al; want[side][1] = fl; want[side][2] = ah; want[side][3] = fh; wantAt[side] = runtime_now_ns(); wantCount++;
     float a = al > ah ? al : ah; if (a > strongest) strongest = a;
     pthread_mutex_unlock(&wantLock);
+    if (a > 0.02f && rumbleQueue && atomic_load_explicit(&rumbleSlow, memory_order_relaxed)) {
+        atomic_store_explicit(&rumbleSlow, 0, memory_order_relaxed);
+        dispatch_async(rumbleQueue, ^{
+            dispatch_source_set_timer(rumbleTimer, dispatch_time(DISPATCH_TIME_NOW, 0), RUMBLE_TICK_MS * NSEC_PER_MSEC, 2 * NSEC_PER_MSEC);
+        });
+    }
 }
 void runtime_feedback_quiet(void) {
     pthread_mutex_lock(&wantLock); wantAt[0] = wantAt[1] = 0; pthread_mutex_unlock(&wantLock);
@@ -137,6 +139,9 @@ static BOOL start_player(int side, float intensity, float sharpness, uint64_t no
     if (!playing[side]) { playing[side] = YES; playingSince[side] = now; }
     return YES;
 }
+/* The two HID rumble paths and the HID motion below are macOS only (IOKit); iOS gets the Core Haptics and GameController
+   paths above, as Apple's GameController API is the only controller HID access there. */
+#if TARGET_OS_OSX
 /* ---- rumble written straight to a Switch Pro Controller (2026-10-19) ----
    The 8BitDo controller in Switch mode (057e:2009) gets GCDeviceHaptics with both handles, Core Haptics plays without an
    error (a BOTW session: amplitude 0.20, "played left 0.5 s / right 0.5 s"), yet the controller never vibrates. So a
@@ -324,9 +329,15 @@ static void hid_rumble_detach(GCController *c) {   /* main queue */
         if (m) CFRelease(m);
     });
 }
+static BOOL hid_rumble_active(void) { return rumbleHid || hidRumbleDevice; }   /* a HID path, not Core Haptics */
+#else
+static void hid_rumble_attach(GCController *c) { (void)c; }
+static void hid_rumble_detach(GCController *c) { (void)c; }
+static BOOL hid_rumble_active(void) { return NO; }
+#endif
 static void rumble_tick(void) {   /* rumbleQueue, every 10 ms */
     uint64_t now = runtime_now_ns();
-    for (int side = 0; side < 2 && !rumbleHid; side++) {
+    for (int side = 0; side < 2 && !hid_rumble_active(); side++) {
         float v[4]; uint64_t at;
         pthread_mutex_lock(&wantLock); memcpy(v, want[side], sizeof v); at = wantAt[side]; pthread_mutex_unlock(&wantLock);
         float intensity = at && now - at < RUMBLE_STALE_MS * 1000000ull ? intensity_of(v) : 0, sharpness = sharpness_of(v);
@@ -345,14 +356,30 @@ static void rumble_tick(void) {   /* rumbleQueue, every 10 ms */
         if (!playing[side] || now - playerSince[side] > RUMBLE_RENEW_MS * 1000000ull) start_player(side, intensity, sharpness, now);
         else if (fabsf(intensity - sentIntensity[side]) > 0.01f || fabsf(sharpness - sentSharpness[side]) > 0.02f) send_params(players[side], side, intensity, sharpness);
     }
+#if TARGET_OS_OSX
     if (rumbleHid) rumble_tick_hid(now);           /* a Switch Pro Controller (PR #920) */
     if (hidRumbleDevice) hid_rumble_tick(now);     /* a HID pad from the profile table (PR #149) */
+#endif
+    BOOL busy = playing[0] || playing[1];
+    for (int side = 0; side < 2; side++) {
+        pthread_mutex_lock(&wantLock); uint64_t at = wantAt[side]; pthread_mutex_unlock(&wantLock);
+        if (at && now - at < RUMBLE_STALE_MS * 1000000ull) busy = YES;
+    }
+    int slow = atomic_load_explicit(&rumbleSlow, memory_order_relaxed);
+    if (busy && slow) {
+        atomic_store_explicit(&rumbleSlow, 0, memory_order_relaxed);
+        dispatch_source_set_timer(rumbleTimer, dispatch_time(DISPATCH_TIME_NOW, 0), RUMBLE_TICK_MS * NSEC_PER_MSEC, 2 * NSEC_PER_MSEC);
+    } else if (!busy && !slow) {
+        atomic_store_explicit(&rumbleSlow, 1, memory_order_relaxed);
+        dispatch_source_set_timer(rumbleTimer, dispatch_time(DISPATCH_TIME_NOW, RUMBLE_SLOW_MS * NSEC_PER_MSEC),
+                                  RUMBLE_SLOW_MS * NSEC_PER_MSEC, 100 * NSEC_PER_MSEC);
+    }
     static uint64_t lastLog; if (!lastLog) lastLog = now;
     if (now - lastLog >= 30000000000ull) {
         pthread_mutex_lock(&wantLock); uint64_t n = wantCount - wantCountLogged; float peak = strongest; wantCountLogged = wantCount; strongest = 0; pthread_mutex_unlock(&wantLock);
         for (int side = 0; side < 2; side++) if (playing[side]) { playedNs[side] += now - playingSince[side]; playingSince[side] = now; }
         if (n) fprintf(stderr, "[rumble] last 30 s: %llu values from the game, strongest amplitude %.2f, played left %.1f s / right %.1f s%s\n",
-                       (unsigned long long)n, peak, playedNs[0] / 1e9, playedNs[1] / 1e9, rumbleHid || hidRumbleDevice ? " (HID)" : rumblePad.haptics ? "" : " (no controller with haptics)");
+                       (unsigned long long)n, peak, playedNs[0] / 1e9, playedNs[1] / 1e9, hid_rumble_active() ? " (HID)" : rumblePad.haptics ? "" : " (no controller with haptics)");
         playedNs[0] = playedNs[1] = 0; lastLog = now;
     }
 }
@@ -417,7 +444,7 @@ static void motion_sample(GCMotion *m) {   /* the controller's handler queue */
     runtime_motion_feed(acc, gyro, runtime_now_ns());
 }
 
-/* ---- motion straight from a Switch Pro Controller's HID reports (2026-10-19) ----
+/* ---- motion straight from a Switch Pro Controller's HID reports (2026-10-19; macOS only) ----
    An 8BitDo controller in Switch mode (057e:2009 "Pro Controller" over Bluetooth) gets a GCMotion with hasRotationRate,
    and GameController delivers its samples (33 a second) -- but every one is exactly zero, moved or not, while the same
    controller's raw 0x30 reports carry live six-axis data (gyro up to 550 deg/s, about 1 G at rest) and its SPI factory
@@ -428,6 +455,7 @@ static void motion_sample(GCMotion *m) {   /* the controller's handler queue */
    calibration (the user calibration at 0x8026 when it has its 0xB2A1 magic, else the factory one at 0x6020), as SDL:
    G = raw * 4 / (sensitivity - origin), deg/s = (raw - origin) * 936 / (sensitivity - origin); until it arrives the
    sensor's nominal ranges, 8 G and 2000 deg/s over 32768. */
+#if TARGET_OS_OSX
 static IOHIDManagerRef hidManager;   /* main queue */
 static IOHIDDeviceRef hidDevice;     /* main queue: open while motion or rumble uses it */
 static BOOL hidMotion, hidRumble;    /* main queue: which of them does (motion: a Switch pad's IMU, or hid_imu_start's pad) */
@@ -435,10 +463,17 @@ static const HidImuProfile *imuProfile;   /* main run loop: the pad hid_imu_star
 static GCController *hidRumblePad;   /* main queue */
 static dispatch_queue_t hidOut;      /* every output report, in order; the packet counter is its own */
 static uint8_t hidPacket;            /* hidOut */
-static uint8_t hidReport[64];
+static uint8_t hidReport[128];   /* room for the DS4's 78-byte report, the largest */
 static BOOL hidJoyConRight; /* local: paired original Joy-Con uses the right IMU */
 static uint64_t hidLast;
 static BOOL hidUserCalibration;
+/* The IMU-on subcommand can be lost (a controller drops subcommands sent close together, and a Joy-Con a Switch has
+   used can keep its IMU off), and then every 0x30 report carries six zero axes -- which a working sensor never reads.
+   While that lasts it is sent again, every 2 s, at most HID_IMU_RETRIES times; the first nonzero sample ends it. */
+enum { HID_IMU_RETRIES = 5 };
+static uint64_t hidZeroSince, hidImuTriedAt;   /* main run loop; reset by hid_motion_start */
+static int hidImuRetries;
+static BOOL hidImuLive;
 static double hidAccScale[3] = {8.0 / 32768, 8.0 / 32768, 8.0 / 32768}, hidGyroScale[3] = {2000.0 / 32768, 2000.0 / 32768, 2000.0 / 32768}, hidGyroOrigin[3];
 static int16_t le16(const uint8_t *p) { return (int16_t)(p[0] | p[1] << 8); }
 /* Output report `id`: the packet counter, then `body` (0x01: rumble for both sides, subcommand, its argument; 0x10: rumble). */
@@ -503,6 +538,21 @@ static void hid_report(void *ctx, IOReturn result, void *sender, IOHIDReportType
         p[9] | (p[10] & 15) << 8, (p[10] >> 4) | p[11] << 4);
     uint64_t now = runtime_now_ns(), step = hidLast && now - hidLast < 50000000ull ? (now - hidLast) / 3 : 5000000ull;
     hidLast = now;
+    if (!hidImuLive) {
+        BOOL zero = YES;
+        for (int i = 13; i < 13 + 36 && zero; i++) zero = !p[i];
+        if (!zero) {
+            hidImuLive = YES;
+            if (hidImuRetries) fprintf(stderr, "[gyro] six-axis sensor on after %d resend%s of the IMU-on subcommand\n", hidImuRetries, hidImuRetries == 1 ? "" : "s");
+        } else if (!hidZeroSince) hidZeroSince = now;
+        else if (hidImuRetries < HID_IMU_RETRIES && now - hidZeroSince > 1000000000ull && now - hidImuTriedAt > 2000000000ull) {
+            hidImuTriedAt = now; ++hidImuRetries;
+            static const uint8_t imuOn[1] = {0x01};
+            hid_subcommand(0x40, imuOn, sizeof imuOn);
+            fprintf(stderr, "[gyro] six-axis sensor reads all zeros: IMU-on subcommand sent again (%d of %d)%s\n", hidImuRetries, HID_IMU_RETRIES,
+                    hidImuRetries == HID_IMU_RETRIES ? "; not sent again after this one" : "");
+        }
+    }
     for (int k = 0; k < 3; k++) {
         const uint8_t *s = p + 13 + 12 * k;
         double raw[6];
@@ -557,6 +607,7 @@ static void hid_motion_start(void) {   /* main queue */
         return;
     }
     hidMotion = YES; hidLast = 0; hidUserCalibration = NO;
+    hidZeroSince = hidImuTriedAt = 0; hidImuRetries = 0; hidImuLive = NO;
     motionPad.motion.valueChangedHandler = nil;   /* sensors stay active: GameController keeps the IMU reporting */
     runtime_motion_deadzone_default(1.2); runtime_motion_live(1);
     fprintf(stderr, "[gyro] %s: reading the six-axis sensor from its HID reports (right Joy-Con for a paired set)\n", name);
@@ -594,7 +645,20 @@ static void hid_rumble_stop(void) {   /* main queue */
     });
     hid_close_unused();
 }
+#else
+static void hid_motion_start(void) {
+    static int logged;
+    if (!logged) { logged = 1; fprintf(stderr, "[gyro] GameController reports no motion for this controller; the raw HID fallback is macOS only\n"); }
+}
+static void hid_motion_stop(void) {}
+#endif
 
+/* The trigger resistance follows the bow, which is read from the game's memory: macOS only (iOS: stubs, never on). */
+#if TARGET_OS_OSX
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+#include "bow_state.h"
+#include "game_version.h"   /* Tears of the Kingdom 1.4.3's scene slot and actor name offsets, for the bow state */
 /* ---- DualSense adaptive triggers ----
    R2 (ZR: draw the bow) resists like a bowstring, more the further it is pressed, but only while Link is drawing the
    bow; at any other time both triggers are slack, and L2 never resists. The game sends a controller nothing for this, so
@@ -603,13 +667,18 @@ static void hid_rumble_stop(void) {   /* main queue */
    It follows the draw within a frame; over Bluetooth the controller takes another 30-45 ms, so the very start of the pull
    is slack. On by default: dualsense-triggers.txt next to controls.txt saying "off" turns it off (TOTK_DUALSENSE_TRIGGERS
    =on / off overrides the file; an agent's test session, TOTK_SLOT_OWNER claude / codex, leaves it off unless set).
-   macOS drops a controller's trigger effects while the app is in the background, so they are sent again when it is
-   active again; the triggers go back to off when the controller goes away or the game ends. Known limit: Tears of the
-   Kingdom keeps the bow drawn while its menu is open (Breath of the Wild does not), so R2 keeps resisting there until
-   the menu closes. TOTK_TRIGGER_LOG=1 logs every change of the triggers' mode and status (diagnostics). */
+   R2 resists only while bow_resists (bow_state.h) says so, and lets go the moment one part does not: the draw ends, a menu
+   pauses the world (Tears of the Kingdom: BOW_PAUSED; Breath of the Wild's timer drops to 0), the state cannot be read (a
+   load, the title screen), the settings panel or the on-screen keyboard takes the controller (until its buttons are
+   released), or the app leaves the front (it lets go then, as macOS would, and sends the state again when it is back).
+   Both triggers go back to off when the controller goes away (another DualSense still connected takes the bow), when the
+   settings turn them off, or when the game ends. TOTK_TRIGGER_LOG=1 logs every change of the triggers' mode and status,
+   and why R2 holds or lets go (diagnostics). */
 enum { BOW_POLL_MS = 10 };
 static GCDualSenseGamepad *triggerPad;   /* main queue */
-static BOOL bowDrawn;                    /* main queue: what R2 shows */
+static int bowState = BOW_UNKNOWN;       /* main queue: the bow thread's last reading */
+static BOOL gameInput = YES, appActive;  /* main queue: the game gets the controllers; the app is in front */
+static BOOL r2Resists;                   /* main queue: what R2 was last set to */
 static int triggerChoice = -1;   /* main queue: the settings panel's pick, or the file's word once read; -1 not yet */
 static int triggers_wanted(void) {
     const char *e = getenv("TOTK_DUALSENSE_TRIGGERS"), *owner = getenv("TOTK_SLOT_OWNER");
@@ -653,38 +722,55 @@ static int bow_state_now(void) {   /* the bow thread only */
     return BOW_UNKNOWN;
 #endif
 }
-static void triggers_r2(void) {   /* main queue: R2 as the bow is */
+/* main queue: R2 as bow_resists says; sent when that changes, or always (force: a new pad, the app active again, whose
+   effects macOS dropped) */
+static void triggers_r2(BOOL force) {
     if (!triggerPad) return;
-    if (bowDrawn) [triggerPad.rightTrigger setModeSlopeFeedbackWithStartPosition:0.05f endPosition:0.95f startStrength:0.2f endStrength:0.8f];
+    BOOL resists = bow_resists(bowState, gameInput, appActive);
+    if (resists == r2Resists && !force) return;
+    if (resists) [triggerPad.rightTrigger setModeSlopeFeedbackWithStartPosition:0.05f endPosition:0.95f startStrength:0.2f endStrength:0.8f];
     else [triggerPad.rightTrigger setModeOff];
+    if (resists != r2Resists && getenv("TOTK_TRIGGER_LOG"))
+        fprintf(stderr, "[triggers] R2 %s\n", resists ? "bowstring" : !appActive ? "slack: the app is not in front" :
+                !gameInput ? "slack: the settings panel or keyboard has the controller" : bowState == BOW_PAUSED ? "slack: the game is paused" :
+                bowState == BOW_UNKNOWN ? "slack: no bow state" : "slack: the bow is not drawn");
+    r2Resists = resists;
 }
 static void triggers_send(void) {   /* main queue: both triggers, at attach and when the app is active again */
     if (!triggerPad) return;
     [triggerPad.leftTrigger setModeOff];
-    triggers_r2();
+    triggers_r2(YES);
 }
 static void triggers_off(void) {
     if (!triggerPad) return;
-    [triggerPad.leftTrigger setModeOff]; [triggerPad.rightTrigger setModeOff]; triggerPad = nil;
+    [triggerPad.leftTrigger setModeOff]; [triggerPad.rightTrigger setModeOff]; triggerPad = nil; r2Resists = NO;
 }
-static void triggers_at_exit(void) { if (triggerPad) { triggers_off(); usleep(50000); } }   /* let the report reach the controller */
-/* The bow thread: every 10 ms the bow's state; R2 changes only when it does. A line the first time the state can be read
-   (the world is up), and every 30 s one with the draws that ended, if any. */
+/* The game ends: both triggers off, and a moment for the report to reach the controller. At exit, and when the window
+   closes (frontend.m): its _exit skips atexit, and a save can keep the game running a while after it. */
+void runtime_triggers_release(void) { if (triggerPad) { triggers_off(); usleep(50000); } }
+/* The bow thread: every 10 ms the bow's state and whether the game gets the controllers; the main queue hears of a change.
+   A line the first time the state can be read (the world is up), and every 30 s one with the draws that ended, if any;
+   TOTK_TRIGGER_LOG=1 also logs each change of the state. */
 static void *bow_watch(void *arg) {
     (void)arg;
     pthread_setname_np("bow-state");
-    BOOL drawn = NO, found = NO;
+    static const char *names[] = {"unknown", "not drawn", "drawn", "paused"};
+    BOOL found = NO, log = getenv("TOTK_TRIGGER_LOG") != NULL;
+    int last = BOW_UNKNOWN, lastInput = 1;
     unsigned draws = 0; uint64_t since = 0, longest = 0, logAt = runtime_now_ns();
     for (;;) {
-        int state = bow_state_now();
+        int state = bow_state_now(), input = runtime_gamepad_game_input();
         uint64_t t = runtime_now_ns();
         if (state != BOW_UNKNOWN && !found) { found = YES; fprintf(stderr, "[triggers] bow state found: R2 follows the bow\n"); }
-        BOOL now = state == BOW_DRAWN;
-        if (now != drawn) {
-            drawn = now;
-            if (now) since = t;
-            else { draws++; if (t - since > longest) longest = t - since; }
-            dispatch_async(dispatch_get_main_queue(), ^{ bowDrawn = now; triggers_r2(); });
+        if (state != last || input != lastInput) {
+            if ((state == BOW_DRAWN) != (last == BOW_DRAWN)) {
+                if (state == BOW_DRAWN) since = t;
+                else { draws++; if (t - since > longest) longest = t - since; }
+            }
+            if (log && state != last) fprintf(stderr, "[triggers] bow %s\n", names[state + 1]);
+            if (log && input != lastInput) fprintf(stderr, "[triggers] the game %s the controllers\n", input ? "has" : "does not have");
+            last = state; lastInput = input;
+            dispatch_async(dispatch_get_main_queue(), ^{ bowState = state; gameInput = input; triggers_r2(NO); });
         }
         if (t - logAt >= 30000000000ull) {
             if (draws) fprintf(stderr, "[triggers] last 30 s: bow drawn %u times, longest %.1f s\n", draws, longest / 1e9);
@@ -711,15 +797,14 @@ static void triggers_watch(void) {   /* main queue, every 250 ms */
 static void triggers_apply(GCController *c, const char *name) {   /* main queue */
     if (![c.extendedGamepad isKindOfClass:GCDualSenseGamepad.class] || !triggers_wanted()) return;
     if (!bow_state_supported()) { fprintf(stderr, "[triggers] %s: no bow state for this game version; triggers left alone\n", name); return; }
-    if (triggerPad && triggerPad != c.extendedGamepad) { [triggerPad.leftTrigger setModeOff]; [triggerPad.rightTrigger setModeOff]; }   /* a newer pad takes the bow; the old one goes slack */
-    triggerPad = (GCDualSenseGamepad *)c.extendedGamepad;
-    triggers_send();
-    fprintf(stderr, "[triggers] %s: R2 is a bowstring while the bow is drawn (slope 0.2 -> 0.8 over 5-95 %%), L2 slack\n", name);
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        atexit(triggers_at_exit);
-        [NSNotificationCenter.defaultCenter addObserverForName:@"NSApplicationDidBecomeActiveNotification" object:nil queue:NSOperationQueue.mainQueue
-                                                    usingBlock:^(NSNotification *n) { (void)n; triggers_send(); }];
+        atexit(runtime_triggers_release);
+        appActive = NSApp.active;   /* from here the two notifications keep it */
+        [NSNotificationCenter.defaultCenter addObserverForName:NSApplicationDidBecomeActiveNotification object:nil queue:NSOperationQueue.mainQueue
+                                                    usingBlock:^(NSNotification *n) { (void)n; appActive = YES; triggers_send(); }];
+        [NSNotificationCenter.defaultCenter addObserverForName:NSApplicationWillResignActiveNotification object:nil queue:NSOperationQueue.mainQueue
+                                                    usingBlock:^(NSNotification *n) { (void)n; appActive = NO; triggers_r2(YES); }];
         if (getenv("TOTK_TRIGGER_LOG")) {
             static dispatch_source_t watch;
             watch = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
@@ -734,6 +819,18 @@ static void triggers_apply(GCController *c, const char *name) {   /* main queue 
         if (r) fprintf(stderr, "[triggers] the bow thread could not start (%d): R2 stays slack\n", r);
         else pthread_detach(thread);
     });
+    if (triggerPad && triggerPad != c.extendedGamepad) { [triggerPad.leftTrigger setModeOff]; [triggerPad.rightTrigger setModeOff]; }   /* a newer pad takes the bow; the old one goes slack */
+    triggerPad = (GCDualSenseGamepad *)c.extendedGamepad;
+    triggers_send();
+    fprintf(stderr, "[triggers] %s: R2 is a bowstring while the bow is drawn (slope 0.2 -> 0.8 over 5-95 %%), L2 slack\n", name);
+}
+/* The DualSense to take the bow when none has it (the settings turned it on, or the one that had it went away): the pad in
+   use, else any connected one; never `gone`, which is disconnecting. */
+static void triggers_pick(GCController *gone) {   /* main queue */
+    if (triggerPad) return;
+    GCController *current = GCController.current, *pick = current != gone && [current.extendedGamepad isKindOfClass:GCDualSenseGamepad.class] ? current : nil;
+    for (GCController *c in GCController.controllers) if (!pick && c != gone && [c.extendedGamepad isKindOfClass:GCDualSenseGamepad.class]) pick = c;
+    if (pick) triggers_apply(pick, (pick.vendorName ?: @"controller").UTF8String);
 }
 
 /* The settings panel (key 1, runtime/settings_panel.h; main queue). TOTK_DUALSENSE_TRIGGERS or an agent's test session decide
@@ -756,15 +853,20 @@ void runtime_triggers_choose(int on) {
     if (!on) {   /* every DualSense's triggers go slack, also one that an earlier pad took the bow from */
         for (GCController *c in GCController.controllers)
             if ([c.extendedGamepad isKindOfClass:GCDualSenseGamepad.class]) { GCDualSenseGamepad *p = (GCDualSenseGamepad *)c.extendedGamepad; [p.leftTrigger setModeOff]; [p.rightTrigger setModeOff]; }
-        triggerPad = nil; fprintf(stderr, "[triggers] off (settings): both triggers slack\n"); return;
+        triggerPad = nil; r2Resists = NO; fprintf(stderr, "[triggers] off (settings): both triggers slack\n"); return;
     }
-    if (triggerPad) return;
-    GCController *pick = [GCController.current.extendedGamepad isKindOfClass:GCDualSenseGamepad.class] ? GCController.current : nil;   /* the pad in use */
-    for (GCController *c in GCController.controllers) if (!pick && [c.extendedGamepad isKindOfClass:GCDualSenseGamepad.class]) pick = c;
-    if (pick) triggers_apply(pick, (pick.vendorName ?: @"controller").UTF8String);
+    triggers_pick(nil);
 }
+#else
+int runtime_triggers_available(void) { return 0; }
+int runtime_triggers_locked(void) { return 1; }
+int runtime_triggers_choice(void) { return 0; }
+void runtime_triggers_choose(int on) { (void)on; }
+void runtime_triggers_release(void) {}
+#endif
 
 /* ---- motion from the input reports of a pad GameController gives none (2026-10-23): runtime/hid_imu.h ---- */
+#if TARGET_OS_OSX
 static uint64_t imuLast;   /* main run loop: the time of the last sample */
 static void hid_imu_report(void *ctx, IOReturn result, void *sender, IOHIDReportType type, uint32_t id, uint8_t *p, CFIndex len, uint64_t stamp) {   /* main run loop */
     (void)ctx; (void)sender; (void)type;
@@ -781,8 +883,8 @@ static void hid_imu_report(void *ctx, IOReturn result, void *sender, IOHIDReport
     if (!tb.denom) mach_timebase_info(&tb);
     runtime_motion_feed(acc, gyro, hid_imu_time((uint64_t)((__uint128_t)stamp * tb.numer / tb.denom), runtime_now_ns(), &imuLast));   /* the report's own receive time: see hid_imu.h */
 }
-static BOOL hid_imu_start(GCController *c) {   /* main queue: c has no GCMotion */
-    if (![c.productCategory isEqualToString:GCProductCategoryHID]) return NO;   /* not an Xbox pad that merely sits beside one of these */
+static BOOL hid_imu_start(GCController *c) {   /* main queue: c has no GCMotion, or a DualShock 4 whose GCMotion yields nothing */
+    if (![c.productCategory isEqualToString:GCProductCategoryHID] && ![c.productCategory isEqualToString:@"DualShock 4"]) return NO;   /* not an Xbox pad that merely sits beside one of these */
     NSMutableArray *matching = [NSMutableArray array];
     for (int i = 0; i < HID_IMU_PROFILES; i++)
         [matching addObject:@{@kIOHIDVendorIDKey: @(hid_imu_profiles[i].vendor), @kIOHIDProductIDKey: @(hid_imu_profiles[i].product)}];
@@ -813,17 +915,29 @@ static BOOL hid_imu_start(GCController *c) {   /* main queue: c has no GCMotion 
     fprintf(stderr, "[gyro] %s: no motion from GameController; reading the six-axis sensor from its HID reports (%04x:%04x)\n", name, vendor, product);
     return YES;
 }
+#else
+static BOOL hid_imu_start(GCController *c) {   /* the raw HID fallback is macOS only (IOKit) */
+    (void)c;
+    return NO;
+}
+#endif
 
 /* ---- controllers ---- */
 void runtime_feedback_attach(GCController *c) {   /* main queue */
     const char *name = (c.vendorName ?: @"controller").UTF8String;
     if (runtime_rumble_enabled()) {
         rumble_start();
+        BOOL tookHid = NO;
+#if TARGET_OS_OSX
         hid_rumble_stop();
         const char *viaHid = getenv("TOTK_RUMBLE_HID");
-        if ([c.productCategory isEqualToString:@"Switch Pro Controller"] && !(viaHid && !strcmp(viaHid, "0")) && hid_rumble_start(c))
+        tookHid = [c.productCategory isEqualToString:@"Switch Pro Controller"] && !(viaHid && !strcmp(viaHid, "0")) && hid_rumble_start(c);
+        if (tookHid)
             dispatch_async(rumbleQueue, ^{ for (int s = 0; s < 2; s++) { if (players[s]) [players[s] stopAtTime:CHHapticTimeImmediate error:nil]; forget_side(s); } rumblePad = nil; });
-        else if (c.haptics) {
+#endif
+        if (tookHid) {
+            /* nothing further: hid_rumble_start writes the game's rumble to the pad itself */
+        } else if (c.haptics) {
             dispatch_async(rumbleQueue, ^{ for (int s = 0; s < 2; s++) { if (players[s]) [players[s] stopAtTime:CHHapticTimeImmediate error:nil]; forget_side(s); retryAt[s] = 0; } rumblePad = c; });
             NSMutableArray *where = [NSMutableArray array]; for (NSString *l in c.haptics.supportedLocalities) [where addObject:l];
             fprintf(stderr, "[rumble] %s: haptics (%s)\n", name, [where componentsJoinedByString:@", "].UTF8String);
@@ -832,7 +946,9 @@ void runtime_feedback_attach(GCController *c) {   /* main queue */
             hid_rumble_attach(c);
         }
     }
+#if TARGET_OS_OSX
     triggers_apply(c, name);
+#endif
     if (runtime_gyro_enabled()) {
         static dispatch_once_t once;
         dispatch_once(&once, ^{
@@ -841,12 +957,27 @@ void runtime_feedback_attach(GCController *c) {   /* main queue */
             if (r > 0) fprintf(stderr, "[gyro] axes remapped by TOTK_GYRO_AXES=%s\n", axes);
         });
         GCMotion *m = c.motion;
-        if (!m || !m.hasRotationRate) {
+        if ([c.productCategory isEqualToString:@"DualShock 4"]) {   /* its GCMotion yields 0 samples: read its HID IMU instead */
+            GCController *before = motionPad;
+            if (hid_imu_start(c)) {   /* the v1 Bluetooth profile; v2 or USB has no matching profile and keeps GCMotion below */
+                if (before && before != c) {   /* one motion feed only, as below (hid_imu_start has made c the feed) */
+                    before.motion.valueChangedHandler = nil;
+                    if (before.motion.sensorsRequireManualActivation) before.motion.sensorsActive = NO;
+                }
+                return;
+            }
+        } else if (!m || !m.hasRotationRate) {
             if ([c.productCategory containsString:@"Joy-Con"]) {   /* PR #889: a paired Joy-Con's right HID sensor */
                 hid_motion_stop(); zeroSince = 0; motionSeen = hidAsked = NO;
                 motionPad = c; hid_motion_start();
             } else if (!hid_imu_start(c)) fprintf(stderr, "[gyro] %s has no gyro: no motion from it\n", name);   /* PR #309: IMU in its HID reports (8BitDo Ultimate 2) */
             return;
+        }
+        if (motionPad && motionPad != c) {   /* one motion feed only: two controllers would be mixed into one fusion */
+            motionPad.motion.valueChangedHandler = nil;
+            /* A controller that needed manual activation keeps its sensors powered until told otherwise. */
+            if (motionPad.motion.sensorsRequireManualActivation) motionPad.motion.sensorsActive = NO;
+            runtime_motion_live(0);
         }
         if (m.sensorsRequireManualActivation) m.sensorsActive = YES;
         hid_motion_stop(); zeroSince = 0; motionSeen = hidAsked = NO; runtime_motion_deadzone_default(0);
@@ -859,10 +990,19 @@ void runtime_feedback_detach(GCController *c) {   /* main queue */
     hid_rumble_detach(c);
     if (runtime_rumble_enabled() && rumbleQueue)
         dispatch_async(rumbleQueue, ^{ if (rumblePad == c) { for (int s = 0; s < 2; s++) forget_side(s); rumblePad = nil; } });
-    if (triggerPad && c.extendedGamepad == triggerPad) triggers_off();
+#if TARGET_OS_OSX
+    if (triggerPad && c.extendedGamepad == triggerPad) { triggers_off(); triggers_pick(c); }   /* e.g. USB unplugged, Bluetooth still on */
     if (hidRumblePad == c) hid_rumble_stop();
+#endif
     if (motionPad == c) {
         c.motion.valueChangedHandler = nil; hid_motion_stop(); motionPad = nil; runtime_motion_live(0);
     }
 }
-#endif
+/* iOS deactivates a manual-activation controller's sensors while the app is in the background (Settings, Control
+   Center); without this, gyro aiming stays dead until the controller reconnects. */
+void runtime_feedback_active(void) {   /* main queue */
+    if (motionPad && motionPad.motion.sensorsRequireManualActivation) {
+        motionPad.motion.sensorsActive = YES;
+        fprintf(stderr, "[gyro] motion sensors reactivated after the app returned\n");
+    }
+}

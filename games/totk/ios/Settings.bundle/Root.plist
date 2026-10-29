@@ -67,6 +67,8 @@
 			<string>PSToggleSwitchSpecifier</string>
 			<key>Key</key>
 			<string>TOTK_DOCKED</string>
+			<key>TOTKPhone</key>
+			<true/>
 			<key>Title</key>
 			<string>Full HD (docked)</string>
 			<key>DefaultValue</key>
@@ -85,6 +87,8 @@
 			<string>PSMultiValueSpecifier</string>
 			<key>Key</key>
 			<string>TOTK_PHONE_FPS</string>
+			<key>TOTKPhone</key>
+			<true/>
 			<key>Title</key>
 			<string>Frame rate</string>
 			<key>DefaultValue</key>

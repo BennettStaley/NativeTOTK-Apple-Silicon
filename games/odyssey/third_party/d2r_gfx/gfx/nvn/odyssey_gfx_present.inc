@@ -336,9 +336,18 @@ void dm_gfx_panel_text(char *out, size_t n) {
     o += (size_t)snprintf(out + o, n - o, "%s", TOTK_UI("画质（在启动前的设置窗口里改）\n", "Picture (set in the window before the game)\n"));
     for (int w = 0; w < GX_N && o < n; w++) {
         int v = gx_get(w);
-        o += (size_t)snprintf(out + o, n - o, "   %s: %s", gx_title[w], gx_label[w][v]);
-        if (w == GX_RES && v != g_gx_res_now && o < n) o += (size_t)snprintf(out + o, n - o, " at next launch (now %s)", gx_label[GX_RES][g_gx_res_now]);
-        if (w == GX_UP && v == GX_UP_METALFX && !(mfxup_enabled() && mfxup_output_enabled()) && o < n) o += (size_t)snprintf(out + o, n - o, " (off in this build: bilinear)");
+        /* The resolution is the one this launch started at; key 3 changes the picture while playing, so this line is not
+           the picture now (key 3's line above is). */
+        if (w == GX_RES && v != g_gx_res_now)
+            o += (size_t)snprintf(out + o, n - o, "   %s: %s at next launch (now %s)", gx_title[w], gx_label[w][v], gx_label[w][g_gx_res_now]);
+        else if (w == GX_RES)
+            o += (size_t)snprintf(out + o, n - o, "   %s at launch: %s (key 3 changes the picture while playing)", gx_title[w], gx_label[w][v]);
+        else
+            o += (size_t)snprintf(out + o, n - o, "   %s: %s", gx_title[w], gx_label[w][v]);
+        /* MetalFX upscales only at key 3's "MetalFX to the window" step (output_upscale); at its other steps the picture is
+           drawn bilinear, which is a choice of key 3, not something this build lacks. */
+        if (w == GX_UP && v == GX_UP_METALFX && !(mfxup_enabled() && mfxup_output_enabled()) && o < n)
+            o += (size_t)snprintf(out + o, n - o, " (runs only at key 3's \"MetalFX to the window\"; now bilinear)");
         if (o < n) o += (size_t)snprintf(out + o, n - o, "\n");
     }
     if (!live && o < n) o += (size_t)snprintf(out + o, n - o, "   (anti-aliasing, sharpen and upscaler apply while 60+60 is on)\n");

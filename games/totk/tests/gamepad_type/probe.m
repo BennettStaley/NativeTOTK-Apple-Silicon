@@ -9,9 +9,11 @@ void runtime_feedback_detach(GCController *controller) { (void)controller; }
 void runtime_feedback_quiet(void) {}
 void runtime_front_settings_toggle(void) {}
 void settings_note_controller(const char *kind) { (void)kind; }
+void runtime_input_mouse(int button, int down) { (void)button; (void)down; }   /* runtime/input.c: the keyboard and mouse layout */
 int runtime_gyro_enabled(void) { return 0; }
 void runtime_motion_mouse(int on) { (void)on; }
 void runtime_motion_feed_mouse(const double acc[3], const double gyro[3], uint64_t now) { (void)acc; (void)gyro; (void)now; }
+uint64_t runtime_keyboard_buttons(void) { return 0; }
 
 static int failures, checked;
 static void check(int ok, const char *what) { checked++; if (!ok) { failures++; fprintf(stderr, "FAIL: %s\n", what); } }

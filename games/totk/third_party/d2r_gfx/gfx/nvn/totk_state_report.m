@@ -115,7 +115,8 @@ static NSString *sysctl_string(const char *name) {
 /* The switches that change what is measured, as set for this run (environment; numbers and words only, never paths). */
 static NSString *settings_in_force(void) {
     static const char *const names[] = {"TOTK_UNCAPPED", "TOTK_UNCAPPED_HZ", "TOTK_FPS60", "TOTK_REALTIME", "TOTK_MFX",
-        "TOTK_MFX_UPSCALE", "TOTK_MFX_OUTPUT", "TOTK_TAA", "TOTK_RENDER_RES", "TOTK_OUTPUT_RES", "TOTK_FIXED_RES",
+        "TOTK_MFX_UPSCALE", "TOTK_MFX_OUTPUT", "TOTK_MFX_TEMPORAL", "TOTK_MFX_TEMPORAL_SHARPEN", "TOTK_MFX_TEMPORAL_MIPBIAS",
+        "TOTK_MFX_TEMPORAL_INPUT", "TOTK_MFX_TEMPORAL_REWARM", "TOTK_TAA", "TOTK_RENDER_RES", "TOTK_OUTPUT_RES", "TOTK_FIXED_RES",
         "TOTK_ASPECT", "TOTK_GPU_KEEPALIVE", "TOTK_WARM_BEFORE_TITLE", "TOTK_ASSUME_FOCUS", "TOTK_ASYNC_REPLAY",
         "TOTK_UNCAPPED_INTERVAL", "TOTK_WINDOW_SIZE", "TOTK_DRAWABLE_SCALE", "DM_PRESENT_LINK", "DM_PRESENT_HZ",
         "DM_PRESENT_INTERVAL", "DM_NVN_TSV", "MTL_HUD_ENABLED", "METAL_PERFORMANCE_PER_FRAME_SIGNPOSTS",
@@ -188,6 +189,7 @@ static void gfx_report(const totk_sr_gfx *s) {   // queue
     NSMutableString *l = [NSMutableString stringWithFormat:@"%dx%d", s->out_w, s->out_h];
     if (s->aspect_milli) [l appendFormat:@" | %@", aspect_name(s->aspect_milli)];
     if (s->upscale) [l appendString:s->upscale > 1 ? @" | MetalFX+output" : @" | MetalFX"];
+    if (s->temporal) [l appendString:@" | MetalFX temporal"];
     if (s->taa) [l appendString:@" | TAA"];
     if (s->fi_mode) [l appendFormat:@" | FI %@", fi_name(s->fi_mode)];
     switch (src) {
@@ -205,6 +207,7 @@ static void gfx_report(const totk_sr_gfx *s) {   // queue
     NSDictionary *st = @{@"output": [NSString stringWithFormat:@"%dx%d", s->out_w, s->out_h],
                          @"aspect": s->aspect_milli ? aspect_name(s->aspect_milli) : @"16:9",
                          @"upscaling": s->upscale > 1 ? @"metalfx+output" : s->upscale ? @"metalfx" : @"off",
+                         @"temporalUpscaling": s->temporal ? @"on" : @"off",
                          @"taa": s->taa ? @"on" : @"off", @"interpolation": fi_name(s->fi_mode),
                          @"fpsCap": @(s->cap), @"fpsCapSource": srcs[src], @"ownClock": @(s->own_clock),
                          @"pacingHz": @(paced ? s->paced_hz : 0),

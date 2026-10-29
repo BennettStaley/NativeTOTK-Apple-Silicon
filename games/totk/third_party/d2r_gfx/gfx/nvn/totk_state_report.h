@@ -12,6 +12,7 @@ typedef struct {
     int out_w, out_h;              // the game picture: the crop of the last game frame (present_encode)
     int aspect_milli;              // the aspect ratio picked, x1000 (0: the game's 16:9)
     int upscale, taa, fi_mode;     // MetalFX upscaling (0 off, 1 scene, 2 scene and window output), edge smoothing, frame interpolation (MFX_*)
+    int temporal;                  // MetalFX temporal upscaling at the game's upscale draw (TOTK_MFX_TEMPORAL)
     int cap, cap_src, own_clock;   // frame-rate cap in fps (0: none), why (SR_CAP_*), a held rate paced by the game's own clock
     int paced_hz, present_path;    // the display rate the pacing uses; 0 display link, 1 present thread, 2 present thread after a display-link stall
     int view_w, view_h;            // the window's drawable in pixels (main thread; stable metadata only, not in the label)

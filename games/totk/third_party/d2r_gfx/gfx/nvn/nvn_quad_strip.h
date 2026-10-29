@@ -1,18 +1,14 @@
-/* NVN quad strips (NVN_DRAW_PRIMITIVE_QUAD_STRIP, prim 8; upstream #1216): each successive pair of vertices completes a
-   quad (a, b, d, c). Metal has no quads, so each quad becomes two triangles. Both keep d as their last vertex, preserving
-   flat (last-vertex) inputs. Hero's Path draws its route with them. Pure C, no Metal: tests/test_quad_strip.c checks it. */
+/* NVN quad strips: each successive pair completes (a,b,d,c). Metal has no quads.
+   Both triangles keep d as their last vertex, preserving flat last-vertex inputs. */
 #ifndef NVN_QUAD_STRIP_H
 #define NVN_QUAD_STRIP_H
-#include <stddef.h>
 #include <stdint.h>
 #include <string.h>
 
 static inline uint32_t nvn_quad_strip_quads(uint32_t vertices) {
-    return vertices >= 4 ? vertices / 2 - 1 : 0;   // an odd last vertex completes nothing
+    return vertices >= 4 ? vertices / 2 - 1 : 0;
 }
 
-/* The shared index list of a non-indexed strip of `quads` quads, starting at vertex 0 (the draw's first vertex is the
-   base vertex): batches of it keep the vertex IDs of the original strip. */
 static inline void nvn_quad_strip_indices(uint32_t *indices, uint32_t quads) {
     for (uint32_t q = 0; q < quads; q++) {
         uint32_t a = q * 2;
@@ -25,10 +21,10 @@ static inline void nvn_quad_strip_indices(uint32_t *indices, uint32_t quads) {
     }
 }
 
-/* Expands host-visible 8/16/32-bit indices into triangle indices (32-bit), splitting at the type's restart index. An odd
-   tail is dropped in each strip on its own rather than joined to the next strip. Returns the indices written (at most
-   nvn_quad_strip_quads(count) * 6). */
-static inline size_t nvn_quad_strip_indexed(uint32_t *out, const void *input, uint32_t count, unsigned width) {
+/* Expand host-visible 8/16/32-bit indices, splitting at the type's restart index.
+   An odd tail is discarded independently in each strip, rather than joining it to the next strip. */
+static inline size_t nvn_quad_strip_indexed(uint32_t *out, const void *input,
+                                             uint32_t count, unsigned width) {
     const uint8_t *bytes = input;
     uint32_t pair[4], used = 0;
     size_t written = 0;
