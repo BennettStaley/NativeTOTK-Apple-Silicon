@@ -3865,6 +3865,29 @@ uint64_t mtl_rt_size_frame(void) { return atomic_load(&g_rt_size_frame); }   /* 
    the auto frame cap (hle_nvn.c) does not treat the game's frequent resolution steps as requested changes. */
 static _Atomic uint64_t g_rt_scene_frame;
 static uint64_t rt_changed_frame(void) { uint64_t a = atomic_load(&g_rt_size_frame), b = atomic_load(&g_rt_scene_frame); return a > b ? a : b; }
+/* After a change of the game's own (no requested one since), only targets of an earlier scene size go: the scene size or
+   1/2 .. 1/16 of it in both directions (half / quarter-resolution buffers), and not the current one's. The release used
+   to look only at when a target was last drawn into, so a lighting texture the game redraws now and then (shadow map,
+   probe, cube, lighting table) could go and come back empty: actors in the Depths went black in a boss fight right after
+   the first releases in a tight episode (2026-10-28). Those are square or of their own size, never the scene's shape. */
+static _Atomic uint64_t g_scene_sizes[8], g_scene_cur;   // seen scene sizes, w | h << 32 (round robin); the current one
+static _Atomic unsigned g_scene_nsizes;
+static void rt_scene_size_seen(uint32_t w, uint32_t h) {
+    uint64_t v = w | (uint64_t)h << 32; atomic_store(&g_scene_cur, v);
+    for (int i = 0; i < 8; i++) if (atomic_load(&g_scene_sizes[i]) == v) return;
+    atomic_store(&g_scene_sizes[atomic_fetch_add(&g_scene_nsizes, 1) % 8], v);
+}
+static int rt_size_of_scene(uint32_t w, uint32_t h, uint64_t scene) {
+    uint32_t sw = (uint32_t)scene, sh = (uint32_t)(scene >> 32); if (!sw || !sh) return 0;
+    for (uint32_t k = 1; k <= 16; k *= 2)
+        if ((w == sw / k || w == (sw + k - 1) / k) && (h == sh / k || h == (sh + k - 1) / k)) return 1;
+    return 0;
+}
+static int rt_of_earlier_scene(uint32_t w, uint32_t h) {
+    if (rt_size_of_scene(w, h, atomic_load(&g_scene_cur))) return 0;
+    for (int i = 0; i < 8; i++) { uint64_t v = atomic_load(&g_scene_sizes[i]); if (v && rt_size_of_scene(w, h, v)) return 1; }
+    return 0;
+}
 static int stor_rt_evict_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("TOTK_RT_EVICT"); on = !e || atoi(e); } return on; }
 /* A pass renders into mt (a base texture or a view on one): stamp its storage entry. */
 static void stor_note_attach(id<MTLTexture> mt) {
@@ -3879,7 +3902,7 @@ static void stor_sweep(uint64_t fence) {
     stor_collect_drop(^int(const stor_ent *e) { return !e->nser && fence > e->idle_fence + STOR_IDLE_SUBMITS; }, &g_stor_swept);
     if (stor_rt_evict_on()) {
         static uint64_t last_check; uint64_t frame = atomic_load_explicit(&g_cur_frame, memory_order_relaxed);
-        uint64_t changed = rt_changed_frame();
+        uint64_t changed = rt_changed_frame(); int scene_only = atomic_load(&g_rt_scene_frame) > atomic_load(&g_rt_size_frame);
         /* Each target's own idle time counts, not the time since the latest change: before (2026-10-23), every new size
            change pushed the release of all older sizes' targets out by another STOR_RT_IDLE_FRAMES, so switching render
            resolutions every few seconds kept every size's set (1.1-1.8 GB with six sizes at 2560x1440 output) until the
@@ -3887,7 +3910,7 @@ static void stor_sweep(uint64_t fence) {
         uint64_t idle = stor_rt_idle_frames(); int tight = idle < STOR_RT_IDLE_FRAMES;
         if (changed && frame > changed && frame >= last_check + (tight ? 8 : 60)) { last_check = frame;   /* about once a second, or every 8 frames when tight */
             uint64_t before = g_stor_rt_evicted; __block uint64_t bytes = 0; __block uint64_t *held = NULL; __block int nheld = 0, cheld = 0;
-            stor_collect_drop(^int(const stor_ent *e) { int go = e->rt_frames >= STOR_RT_MIN_FRAMES && e->rt_frame < changed && frame > e->rt_frame + idle;
+            stor_collect_drop(^int(const stor_ent *e) { int go = e->rt_frames >= STOR_RT_MIN_FRAMES && e->rt_frame < changed && frame > e->rt_frame + idle && (!scene_only || rt_of_earlier_scene(e->k.w, e->k.h));
                                                          if (go) { bytes += ((__bridge id<MTLTexture>)e->tex).allocatedSize;
                                                                    for (int i = 0; i < e->nser; i++) { if (nheld == cheld) { cheld = cheld ? cheld * 2 : 64; held = realloc(held, (size_t)cheld * sizeof *held); if (!held) MDIE("evicted holders"); } held[nheld++] = e->ser[i]; } }
                                                          return go; }, &g_stor_rt_evicted);
@@ -13549,7 +13572,7 @@ static void scene_size_note(__unsafe_unretained NvShader *fs) {   // the compose
     id<MTLTexture> src = (__bridge id<MTLTexture>)tex_fast(tid); if (!src) return;
     uint32_t w = (uint32_t)src.width, h = (uint32_t)src.height;
     uint32_t ow = atomic_exchange(&g_scene_w, w), oh = atomic_exchange(&g_scene_h, h);
-    if (ow != w || oh != h) { MLOG("internal resolution (the scene the compose draw samples): %ux%u", w, h); if (ow) atomic_store(&g_rt_scene_frame, atomic_load(&g_cur_frame)); }
+    if (ow != w || oh != h) { MLOG("internal resolution (the scene the compose draw samples): %ux%u", w, h); rt_scene_size_seen(w, h); if (ow) atomic_store(&g_rt_scene_frame, atomic_load(&g_cur_frame)); }
 }
 static int mfxup_draw(NvProg *pr) {
     render_note_observed(pr);
