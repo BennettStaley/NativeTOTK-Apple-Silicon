@@ -346,6 +346,24 @@ static uint64_t gpu_budget_bytes(void) {
 /* For the settings menu's memory meter: what the GPU has allocated and the budget the game stops at (0: none). */
 void mtl_gpu_memory(uint64_t *used, uint64_t *budget) { *used = g_dev ? (uint64_t)g_dev.currentAllocatedSize : 0; *budget = gpu_budget_bytes(); }
 static void defer_drain(void);
+static void stor_dump_(int force);
+/* The hard stop (2026-10-28): the budget above is where the game starts releasing what it can and reports what grows;
+   only past this one does it stop. A boss fight never seen before reached 10.1 GB on the 18 GB M3 Pro (render targets
+   swinging 1 -> 7 GB and back) and was stopped at the 9216 MB budget; upstream (1dcf40d) dropped the guard entirely,
+   but the four kernel panics happened at about 15 GB wired, so a runaway still has to end the game before that.
+   TOTK_GPU_HARD_MB overrides; default three quarters of physical memory (13824 MB on 18 GB), never below the budget. */
+static uint64_t gpu_hard_bytes(void) {
+    static uint64_t h; static int init;
+    if (!init) {
+        init = 1; const char *e = getenv("TOTK_GPU_HARD_MB");
+        if (e) h = strtoull(e, NULL, 10) << 20;
+        else { uint64_t phys = 0; size_t n = sizeof phys; if (!sysctlbyname("hw.memsize", &phys, &n, NULL, 0)) h = phys / 4 * 3; }
+        if (h < gpu_budget_bytes()) h = gpu_budget_bytes();
+        MLOG("GPU memory hard stop %llu MB (over the budget the game releases what it can and goes on; override with TOTK_GPU_HARD_MB)", (unsigned long long)(h >> 20));
+    }
+    return h;
+}
+static _Atomic uint64_t g_budget_soft_until;   // over the budget but under the hard stop: no new wait for the running work until then
 static void gpu_budget_check(const char *where) {
     uint64_t budget = gpu_budget_bytes(); if (!budget) return;
     uint64_t cur = (uint64_t)g_dev.currentAllocatedSize, now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
@@ -357,6 +375,7 @@ static void gpu_budget_check(const char *where) {
     uint64_t asked = atomic_load(&g_budget_relief);
     if (!asked) { atomic_store(&g_budget_relief, now); asked = now; MLOG("%s: GPU allocated %llu MB over the budget of %llu MB: releasing old-size render targets and cached MetalFX objects first", where, (unsigned long long)(cur >> 20), (unsigned long long)(budget >> 20)); }
     if (cur <= budget / 10 * 11 && now - asked < 3000000000ull) return;
+    if (cur <= gpu_hard_bytes() && now < atomic_load(&g_budget_soft_until)) return;   // looked at less than a second ago
     /* TOTK_MFX: optional frame interpolation / per-object motion go first (paused near the budget at each present,
        mfx_present_tick); an overrun of at most 5% while they are being released does not stop the game. */
     if (cur <= budget / 20 * 21 && mfx_budget_grace(cur, budget)) {
@@ -386,9 +405,21 @@ static void gpu_budget_check(const char *where) {
                  spikes, where, (unsigned long long)(first >> 20), (unsigned long long)(cur >> 20), waited_ms, (unsigned long long)(budget >> 20));
         return;
     }
+    if (cur <= gpu_hard_bytes()) {
+        /* Over the budget, under the hard stop: go on, looking again (with the wait above) at most once a second so
+           submissions are not held. The first time per episode the sites are reported, so what grew can be found. */
+        static uint64_t episodes, said, last_episode_asked;
+        int first = last_episode_asked != asked; last_episode_asked = asked;
+        atomic_store(&g_budget_soft_until, clock_gettime_nsec_np(CLOCK_UPTIME_RAW) + 1000000000ull);
+        if (first) { episodes++; res_site_report(8); stor_dump_(1); }
+        if (first || ++said % 30 == 0)
+            MLOG("%s: GPU allocated %llu MB over the budget of %llu MB, under the hard stop of %llu MB: going on (episode %llu)", where, (unsigned long long)(cur >> 20), (unsigned long long)(budget >> 20),
+                 (unsigned long long)(gpu_hard_bytes() >> 20), (unsigned long long)episodes);
+        return;
+    }
     res_site_report(16);
-    MDIE("%s: GPU allocated %llu MB exceeds the budget of %llu MB (%llu MB before waiting %.1f ms for the running submissions and retired objects); all four kernel panics happened at about 15 GB resident, refusing to keep submitting (adjust with TOTK_GPU_BUDGET_MB)",
-         where, (unsigned long long)(cur >> 20), (unsigned long long)(budget >> 20), (unsigned long long)(first >> 20), waited_ms);
+    MDIE("%s: GPU allocated %llu MB exceeds the hard stop of %llu MB (%llu MB before waiting %.1f ms for the running submissions and retired objects); all four kernel panics happened at about 15 GB resident, refusing to keep submitting (adjust with TOTK_GPU_HARD_MB)",
+         where, (unsigned long long)(cur >> 20), (unsigned long long)(gpu_hard_bytes() >> 20), (unsigned long long)(first >> 20), waited_ms);
 }
 // DM_RES_CHECK=1 (diagnostic): if textures / buffers the shader accesses through the argument block are not in the residency set, print the first 40 (textures are attributed to the actual allocation via parent texture / underlying buffer)
 static int g_res_check_on;
@@ -3872,8 +3903,8 @@ static void stor_sweep(uint64_t fence) {
 }
 /* TOTK_STOR_DUMP=1 (diagnostic): the storage-shared entries grouped by size, with their holders (live = the newest
    texture initialised at that memory; dead = finalised serial). */
-static void stor_dump(void) {
-    static int on = -1; if (on < 0) on = getenv("TOTK_STOR_DUMP") != NULL; if (!on) return;
+static void stor_dump_(int force) {
+    static int on = -1; if (on < 0) on = getenv("TOTK_STOR_DUMP") != NULL; if (!on && !force) return;
     extern int nvn_tex_live_at(const void *mem, tex_t *out);
     enum { G = 48 }; struct { uint32_t w, h; int n, held, live, dead, other; uint64_t bytes, idle; } g[G]; int ng = 0;
     pthread_mutex_lock(&g_smu);
@@ -4780,7 +4811,7 @@ void mtl_mem_stat(unsigned long long frame, unsigned long long rss_mb) {
     pthread_mutex_lock(&g_smu); int ndet = g_stor_ndet; pthread_mutex_unlock(&g_smu);
     MLOG("compressible textures changed owner across formats %llu times (%llu back to the original texture), %d old registrations parked (TOTK_COMPRESSED_ALIAS=1 restores cross-format sharing)", (unsigned long long)g_stor_handover, (unsigned long long)g_stor_taken_back, ndet);
     MLOG("shared-storage textures: entries %llu, shared %llu times, format views %llu, recreated %llu, idle-reclaimed %llu, freed with their memory pool %llu", (unsigned long long)g_stor_entries, (unsigned long long)g_stor_shared, (unsigned long long)g_stor_viewed, (unsigned long long)g_stor_recreated, (unsigned long long)g_stor_swept, (unsigned long long)g_stor_dropped);
-    treg_stale_report(); stor_dump();
+    treg_stale_report(); stor_dump_(0);
     MLOG("texture pool reclaimed %llu old views after re-upload", (unsigned long long)g_treg_replaced_views);
     MLOG("texture registration: %llu unchanged (skipped), %llu changed", (unsigned long long)g_treg_same, (unsigned long long)g_treg_changed);
     MLOG("re-upload textures reused %llu times (%llu kept, %d alive now; TOTK_REUP_RECYCLE=0 turns it off)", (unsigned long long)g_reup_reused, (unsigned long long)g_reup_kept, g_nreup);
