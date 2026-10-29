@@ -24,8 +24,8 @@ RENDER_SITES = {0x585e48, 0x585e50, 0x585e54, 0x585e60}
 RENDER_KICK = {0x580920}   # the per-frame update's display-state load, ORed with the data page +48 (a live pick)
 # Text padding after main's text (offsets from the stub base; the layout at the top of runtime/game_patches_v143.c):
 # frame step +0, output +16, aspect +48, cloth/hair clock +176, bounce +256, field of view +288, render veneer +384,
-# world +416, fog +512, shadow +560..+592.
-FOV_STUB, RENDER_VENEER, WORLD_STUB, STUBS_END = 288, 384, 416, 600
+# world +416, fog +512, shadow +560..+600, high-FPS fade +608..+688 (Mac only; verify_v143_timing.py checks it).
+FOV_STUB, RENDER_VENEER, WORLD_STUB, STUBS_END = 288, 384, 416, 688
 # runtime/world_patch.h: the time of day's step (s9) and the two far-plane loads, each a 32-byte stub from +416.
 WORLD_SITES = {0x68c15c: (0xbd403e69, 416, 72), 0x628c30: (0xbd413a60, 448, 76), 0xb43420: (0xbd4062c0, 480, 76)}
 
@@ -35,7 +35,7 @@ def clean_env():
     would change words the checks below count."""
     return {k: v for k, v in os.environ.items()
             if k not in ('TOTK_RENDER_RES', 'TOTK_RENDER_RESERVE', 'TOTK_EXPORT_IOS', 'TOTK_OUTPUT_RES', 'TOTK_FOG', 'TOTK_SHADOW_RES',
-                          'TOTK_TIME_SPEED', 'TOTK_RENDER_DISTANCE')}
+                          'TOTK_TIME_SPEED', 'TOTK_RENDER_DISTANCE')} | {'TOTK_PREACTOR_FADE_FIX': '0'}   # its words: verify_v143_timing.py
 
 
 def render_res_checks(out, raw, data, layout):
@@ -335,7 +335,7 @@ def main():
     # clock at +176 and the bounce veneer at +256, which this run turns off: verify_v143_timing.py checks them).
     aspect = {0x628c74, 0xb43460, 0x1ff04f4, 0x253fbb0, 0x628c3c, 0xb4342c} \
         | {p for p in changes if frame_step + 48 <= p < frame_step + 176 or frame_step + FOV_STUB <= p < frame_step + FOV_STUB + 96}
-    # Fog density and shadow resolution (aspect_patch.h): two sites, their stubs at +512..+592 (fog_shadow_checks).
+    # Fog density and shadow resolution (aspect_patch.h): two sites, their stubs at +512..+600 (fog_shadow_checks).
     aspect |= FOG_SITES | SHADOW_SITES | {p for p in changes if frame_step + FOG_STUB <= p < frame_step + SHADOW_STUB + 40}
     assert changes - aspect == want, [hex(p) for p in sorted((changes - aspect) ^ want)]
     assert not {p for p in changes if frame_step + 176 <= p < frame_step + 288}, 'cloth / bounce words changed with both turned off'

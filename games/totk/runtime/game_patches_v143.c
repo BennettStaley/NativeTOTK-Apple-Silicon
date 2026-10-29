@@ -28,9 +28,10 @@ typedef struct { uint64_t off; uint32_t original, replacement; } Patch;
      +48   aspect, 4 x 32 (aspect_patch.h)          +176  cloth/hair clock (19 words, to +252)
      +256  high-FPS trampoline bounce (20)          +288  field of view, 2 x 48 (aspect_patch.h)
      +384  render resolution + pick kick (32)       +416  world: time of day, render distance x 2 (3 x 32)
-     +512  fog (48)                                 +560  shadow resolution (40), to +600 */
+     +512  fog (48)                                 +560  shadow resolution (40), to +600
+     +608  high-FPS fade minimum step, 2 x 40 (Mac only), to +688 */
 enum { CLOTH_STUB_AT = 176, BOUNCE_STUB_AT = 256, FOV_STUB_AT = 288, RENDER_VENEER = 384, WORLD_STUBS = 416,
-       FOG_STUB_AT = 512, SHADOW_STUB_AT = 560, STUBS_END = 600 };
+       FOG_STUB_AT = 512, SHADOW_STUB_AT = 560, FADE_STUB_AT = 608, STUBS_END = 688 };
 static const Patch fps60[] = {
     {0x2db204, 0x6b08015f, 0x7100055f},
     {0x2db208, 0x1a89b10a, 0x1a9fa52a},
@@ -213,6 +214,54 @@ static void patch_slowmo_bounce(Module *m){
 #endif
     fprintf(stderr,"[totk] 1.4.3 high-FPS fix: trampoline slow-motion check uses the time scale, veneer +%#llx\n",(unsigned long long)stub);
 }
+#if !TARGET_OS_IPHONE
+/* High-FPS fades (upstream #466, fix from open PR #1134; upstream 3e9e7f6 / #1112 forces 0 -> 1 always). Static placement
+   and shared-record fades use alpha = counter / 20 and advance the counter by trunc(2.1 * 30 Hz ratio) each frame; above
+   ~63 fps that is 0, so the counter never moves and rocks, lanterns and walls stay invisible or see-through. At the four
+   conversion sites (fcvtzs w8 / w10, s0) a BL to a 40-byte veneer gives 1 where a finite positive step truncates to 0;
+   zero (paused), negative and non-finite steps keep the original conversion, and 30 / 60 fps are unchanged. Fades then
+   finish faster than at 30 Hz above ~63 fps (about 2x at 120 fps updated every frame); FrameRateMgr and game time are
+   not touched. Placement sites (0xa7ac4, 0x95dd24) produce w8, shared-record sites (0x6155e4, 0x615660) w10. Both
+   veneers use w11 / w12, which every path after the sites writes before reading, keep s0, NZCV and FPSR as the
+   original, and return through x30, which each enclosing function reloads from its frame before it returns.
+   Stubs at +608 and +648, after the shadow stub. Mac only: the iOS export (TOTK_EXPORT_IOS) leaves the four sites
+   alone. TOTK_PREACTOR_FADE_FIX=0 keeps the original conversion at all four. */
+static void patch_preactor_fade(Module *m){
+    if(getenv("TOTK_EXPORT_IOS"))return;   /* the Mac host also builds the phone's code */
+    const char *enabled=getenv("TOTK_PREACTOR_FADE_FIX");
+    if(enabled&&!strcmp(enabled,"0"))return;
+    uint64_t stub=((m->text_end+15)&~15ULL)+FADE_STUB_AT,stubs[]={stub,stub+40};
+    const Patch guards[]={   /* each site and the add that consumes its result */
+        {0xa7ac4,0x1e380008,0},{0xa7ac8,0x3942792a,0},    /* fcvtzs w8, s0 / ldrb w10, [x9, #0x9e] */
+        {0x95dd24,0x1e380008,0},{0x95dd28,0x0b080128,0},  /* fcvtzs w8, s0 / add w8, w9, w8 */
+        {0x6155e4,0x1e38000a,0},{0x6155e8,0x0b0a012b,0},  /* fcvtzs w10, s0 / add w11, w9, w10 */
+        {0x615660,0x1e38000a,0},{0x615664,0x0b0a012b,0},
+    };
+    /* fcvtzs wD, s0; cbnz wD, ret; fmov w11, s0; cbz w11, ret (+0.0); tbnz w11, #31, ret (negative);
+       ubfx w12, w11, #23, #8; add w12, w12, #1; tbnz w12, #8, ret (exponent 255: inf / NaN); mov wD, #1; ret */
+    static const uint32_t code[2][10]={
+        {0x1e380008,0x35000108,0x1e26000b,0x340000cb,0x37f800ab,0x5317796c,0x1100058c,0x3740004c,0x52800028,0xd65f03c0},
+        {0x1e38000a,0x3500010a,0x1e26000b,0x340000cb,0x37f800ab,0x5317796c,0x1100058c,0x3740004c,0x5280002a,0xd65f03c0},
+    };
+    enum { SITES=4 };
+    if(stubs[1]+sizeof code[1]>((m->text_end+15)&~15ULL)+STUBS_END||stubs[1]+sizeof code[1]>((m->text_end+0xfff)&~0xfffULL))
+        runtime_fail("1.4.3 fade veneer layout");
+    for(unsigned i=0;i<SITES*2;i++){
+        uint32_t word;
+        if(guards[i].off+4>m->text_end)runtime_fail("1.4.3 fade site outside text");
+        memcpy(&word,m->base+guards[i].off,4);
+        if(word!=guards[i].original)runtime_fail("1.4.3 fade: original instruction mismatch");
+    }
+    for(unsigned s=0;s<2;s++)for(unsigned i=0;i<sizeof code[s];i++)
+        if(m->base[stubs[s]+i])runtime_fail("1.4.3 fade veneer padding not empty");
+    uint32_t jumps[SITES];
+    for(unsigned i=0;i<SITES;i++)jumps[i]=branch(guards[i*2].off,stubs[i/2])|0x80000000u;   /* bl */
+    for(unsigned s=0;s<2;s++)memcpy(m->base+stubs[s],code[s],sizeof code[s]);
+    for(unsigned i=0;i<SITES;i++)memcpy(m->base+guards[i*2].off,jumps+i,4);
+    fprintf(stderr,"[totk] 1.4.3 high-FPS fade fix: a finite positive step counts at least 1 at four fade sites, veneers +%#llx\n",
+            (unsigned long long)stub);
+}
+#endif
 /* Benchmark camera (survey sessions only, 2026-10-20). The look-at camera update stores the frame's eye (doubles +0x60,
    floats +0x38), target (doubles +0x78, floats +0x44) and normalised up (+0x50) into the camera in x20 at
    main+0x6287b4..0x628824, then builds the view matrix from d1,d2,d0 / d3,d4,d5 / s7,s16,s17. The adrp at main+0x628828
@@ -337,6 +386,7 @@ void runtime_game_patches(Module *m) {
     patch_fixed_res(m);
     patch_slowmo_bounce(m);
 #if !TARGET_OS_IPHONE
+    patch_preactor_fade(m);
     diag_main=m;   /* frmwatch / xpoke */
 #endif
     { static const uint64_t sites[] = {0x628c74, 0xb43460, 0x1ff04f4, 0x253fbb0};   /* camera update and setup, viewport x2 */
