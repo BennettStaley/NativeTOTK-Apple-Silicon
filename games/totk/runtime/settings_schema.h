@@ -209,6 +209,8 @@ static const SettingDef SETTINGS[] = {
        in the story are greyed, with the reason, and cannot be flown to. Map pins never are. */
     {"teleport.story_lock", "Teleport", "Only places the story has opened", "Greys out the places your last save has not reached in the story, so a teleport cannot skip ahead: everything off Great Sky Island until you leave it, the Depths until you have been down, a temple until its region's quest has started. Map pins are never locked.",
      NULL, SET_BOOL, SET_LIVE, SET_MAC, 1, 1, 0, 1, 1, NULL, NULL, 0, "Teleport is on the Mac only.", NULL, 0},
+    {"teleport.direct", "Teleport", "Teleport straight there", "Puts Link at the place at once instead of flying him there with noclip. Faster, but a far place is not loaded yet: the game may treat him as fallen out of the world and put him back where he stood. Off: the flight, which loads the world on the way.",
+     NULL, SET_BOOL, SET_LIVE, SET_MAC, 0, 0, 0, 1, 1, NULL, NULL, 0, "Teleport is on the Mac only.", NULL, 0},
     {"world.time_speed", "World", "Time of day speed", "How fast the day passes: the clock, the sun and the sky (version 1.4.3). Paused stops the time of day.",
      "TOTK_TIME_SPEED", SET_CHOICE, SET_LIVE, SET_ALL, 100, 100, 0, 0, 0, NULL, SET_TIME_SPEED, SET_N(SET_TIME_SPEED), NULL, NULL, 0},
 };

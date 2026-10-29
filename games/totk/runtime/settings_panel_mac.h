@@ -645,10 +645,14 @@ static int cheat_choice_members(int leader, int *all, int *usable, int max, int 
                              @"No map pins in the last save: place a pin on the map, then save (or wait for an autosave)." color:nil control:nil] id:CHEATS_PIN_ROW - MAP_PINS_MAX];
     [self buildLandmarks:profile lock:lockOn group:0];
 }
-/* The story lock's switch (teleport.story_lock) at the top of Teleport, Towers and Shrines; YES while it is on. */
+/* The story lock's switch (teleport.story_lock) and direct or fly (teleport.direct) at the top of Teleport, Towers,
+   Shrines and Lightroots; YES while the lock is on. */
 - (BOOL)addStoryLockRow {
     int lock = settings_index("teleport.story_lock");
-    if (lock >= 0) { NSView *row = [self rowFor:&SETTINGS[lock] index:lock]; [list addArrangedSubview:row]; [rows addObject:row]; [rowSetting addObject:@(lock)]; }
+    for (int i = 0; i < 2; i++) {
+        int k = i ? settings_index("teleport.direct") : lock;
+        if (k >= 0) { NSView *row = [self rowFor:&SETTINGS[k] index:k]; [list addArrangedSubview:row]; [rows addObject:row]; [rowSetting addObject:@(k)]; }
+    }
     return lock >= 0 && settings_get("teleport.story_lock");
 }
 /* ---- the Towers, Shrines and Lightroots tabs: one category of landmarks.h each (LANDMARK_GROUPS g), the story lock above it; Shrines
@@ -812,12 +816,14 @@ static int cheat_choice_members(int leader, int *all, int *usable, int max, int 
 - (void)goToPin:(int)k {
     if (k < 0 || k >= npins) return;
     float at[3] = {pins[k].xyz[0], pins[k].xyz[1] + 2, pins[k].xyz[2]};   /* a little above the pin: it sits on the ground */
-    if (runtime_noclip_goto(at)) [self hide];
+    if ([self teleport:at]) [self hide];
 }
+/* Go: flown there with noclip, or put there at once (teleport.direct). */
+- (BOOL)teleport:(const float *)at { return settings_get("teleport.direct") ? runtime_noclip_jump(at) : runtime_noclip_goto(at); }
 - (void)pinGo:(NSButton *)b { [self goToPin:(int)b.tag]; }
 - (void)goToLandmark:(int)k {
     if (k < 0 || k >= LANDMARKS || !marks[k].placed || marks[k].lock != LANDMARK_OPEN) return;   /* locked: the story lock */
-    if (runtime_noclip_goto(marks[k].at)) [self hide];   /* at: already above the floor (landmarks_place) */
+    if ([self teleport:marks[k].at]) [self hide];   /* at: already above the floor (landmarks_place) */
 }
 - (void)landmarkGo:(NSButton *)b { [self goToLandmark:(int)b.tag]; }
 - (void)finishShrine:(int)k {   /* auto shrine for that shrine alone */

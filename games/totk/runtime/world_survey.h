@@ -26,6 +26,8 @@ void runtime_noclip_step_speed(int dir);                  /* to the next speed u
 uint64_t runtime_noclip_taken(void);
 /* Teleport: noclip on, the player held at xyz (a map pin's position) from the next frame. 0 when refused. */
 int runtime_noclip_goto(const float xyz[3]);
+/* Teleport straight there: noclip on, the player put at xyz on the next frame and held, no flight. 0 when refused. */
+int runtime_noclip_jump(const float xyz[3]);
 /* Where Link is now (the Teleport tabs list the nearest places first); 0 while there is no player (loading, title). */
 int runtime_player_pos(float xyz[3]);
 /* Set by the 1.4.3 patches in survey sessions: the benchmark camera block (world_survey.c). */

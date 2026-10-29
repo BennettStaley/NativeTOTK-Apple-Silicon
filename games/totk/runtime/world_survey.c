@@ -188,6 +188,7 @@ void runtime_noclip_set(int on) { (void)on; }
 int runtime_noclip_on(void) { return 0; }
 void runtime_noclip_set_speed(float v) { (void)v; }
 int runtime_noclip_goto(const float xyz[3]) { (void)xyz; return 0; }
+int runtime_noclip_jump(const float xyz[3]) { (void)xyz; return 0; }
 int runtime_player_pos(float xyz[3]) { (void)xyz; return 0; }
 float runtime_noclip_speed(void) { return 0; }
 const int runtime_noclip_speeds[NOCLIP_NSPEEDS] = {5, 12, 25, 50, 100};
@@ -232,8 +233,9 @@ static void (*noclip_force)(void *, const float *, uint32_t);
 static _Atomic int noclip_wanted;
 static _Atomic uint32_t noclip_speed_bits = 0x41400000;   /* 12.0f m/s */
 static struct { int holding; float xyz[3]; uint64_t at_ns; } noclip;   /* frame-end thread only */
+static _Atomic uint64_t noclip_guard_until_ns;   /* noclip_guard (1.4.3); read on the input thread too: the frame tick keeps running until then */
 static pthread_mutex_t noclip_goto_lock = PTHREAD_MUTEX_INITIALIZER;
-static struct { int pending; float xyz[3]; } noclip_goto;   /* a teleport for the next tick (runtime_noclip_goto) */
+static struct { int pending, direct; float xyz[3]; } noclip_goto;   /* a teleport for the next tick (runtime_noclip_goto) */
 static _Atomic int as_active;   /* auto shrine is running (below, before runtime_survey_tick) */
 #if defined(TOTK_GAME_V143)
 static void event_init(Module *m);   /* "ctl event" (below, by the other game-control commands) */
@@ -621,7 +623,7 @@ void runtime_survey_cancel_user(void) {
     if (!atomic_load_explicit(&runtime_survey_pending, memory_order_relaxed)) return;
     pthread_mutex_lock(&survey_lock);
     request.kind = 0; hold_left = 0; route_on = 0; cam_off(); atomic_store(&runtime_survey_pending, 0);
-    if (atomic_load(&runtime_spawn_waiting) || atomic_load(&noclip_wanted) || noclip.holding || atomic_load(&as_active)) atomic_store(&runtime_survey_pending, 1);   /* spawns, noclip (and its landing) and auto shrine (its own stop) are not cancelled here */
+    if (atomic_load(&runtime_spawn_waiting) || atomic_load(&noclip_wanted) || noclip.holding || runtime_now_ns() < atomic_load(&noclip_guard_until_ns) || atomic_load(&as_active)) atomic_store(&runtime_survey_pending, 1);   /* spawns, noclip (and its landing) and auto shrine (its own stop) are not cancelled here */
     fprintf(stderr, "[survey] cancelled: user input\n");
     pthread_mutex_unlock(&survey_lock);
 }
@@ -641,10 +643,19 @@ void runtime_noclip_set_speed(float v) {
 int runtime_noclip_goto(const float xyz[3]) {
     if (!noclip_force || !valid_xyz(xyz)) return 0;
     pthread_mutex_lock(&noclip_goto_lock);
-    memcpy(noclip_goto.xyz, xyz, sizeof noclip_goto.xyz); noclip_goto.pending = 1;
+    memcpy(noclip_goto.xyz, xyz, sizeof noclip_goto.xyz); noclip_goto.pending = 1; noclip_goto.direct = 0;
     pthread_mutex_unlock(&noclip_goto_lock);
     fprintf(stderr, "[noclip] teleport to %.1f,%.1f,%.1f\n", xyz[0], xyz[1], xyz[2]);
     runtime_noclip_set(1);   /* held there while the world streams in; switching noclip off lands */
+    return 1;
+}
+int runtime_noclip_jump(const float xyz[3]) {
+    if (!noclip_force || !valid_xyz(xyz)) return 0;
+    pthread_mutex_lock(&noclip_goto_lock);
+    memcpy(noclip_goto.xyz, xyz, sizeof noclip_goto.xyz); noclip_goto.pending = 1; noclip_goto.direct = 1;
+    pthread_mutex_unlock(&noclip_goto_lock);
+    fprintf(stderr, "[noclip] teleport straight to %.1f,%.1f,%.1f\n", xyz[0], xyz[1], xyz[2]);
+    runtime_noclip_set(1);
     return 1;
 }
 float runtime_noclip_speed(void) { uint32_t bits = atomic_load(&noclip_speed_bits); float v; memcpy(&v, &bits, 4); return v; }
@@ -729,8 +740,14 @@ static void noclip_tick(uintptr_t actor) {
     }
     pthread_mutex_lock(&noclip_goto_lock);
     if (noclip_goto.pending) {
-        memcpy(noclip_flight.to, noclip_goto.xyz, sizeof noclip_flight.to); noclip_flight.on = 1; noclip_goto.pending = 0;
-        noclip_flight.cruise = fmaxf(noclip.xyz[1], noclip_flight.to[1]) + NOCLIP_FLIGHT_CLEAR;
+        if (noclip_goto.direct) {   /* straight there: held at the place from this frame (the world streams in around him) */
+            memcpy(noclip.xyz, noclip_goto.xyz, sizeof noclip.xyz); noclip_flight.on = 0;
+            fprintf(stderr, "[noclip] put at %.1f,%.1f,%.1f\n", noclip.xyz[0], noclip.xyz[1], noclip.xyz[2]);
+        } else {
+            memcpy(noclip_flight.to, noclip_goto.xyz, sizeof noclip_flight.to); noclip_flight.on = 1;
+            noclip_flight.cruise = fmaxf(noclip.xyz[1], noclip_flight.to[1]) + NOCLIP_FLIGHT_CLEAR;
+        }
+        noclip_goto.pending = 0;
     }
     pthread_mutex_unlock(&noclip_goto_lock);
     float dt = (float)(now - noclip.at_ns) * 1e-9f;
@@ -1655,12 +1672,33 @@ static uintptr_t ctl_component(uintptr_t actor, unsigned index) {
    the heat), with no health cheat on. While noclip is on, and for NOCLIP_GUARD_S seconds after it goes off (the landing),
    Link's life is set back to his maximum whenever it drops, as the cheat list's Inf. Health does (current +0x8 = max
    +0x18 of the life object, see ctl state's hp). A single blow larger than all his hearts can still kill between two
-   frames. Writes go through mach_vm_write, so a stale pointer fails instead of faulting. */
-enum { NOCLIP_GUARD_S = 8 };
+   frames. Writes go through mach_vm_write, so a stale pointer fails instead of faulting.
+   Fall damage: a teleport's flight climbs, and touching the ground at the target counted as a fall from the top of it
+   (a 260 m "fall" killed at once, 2026-10-28; high falls kill whatever the hearts). The game keeps where the fall began
+   in the player's fall calculator: 1.4.3 0x1cd8500 (called as player component + 0x1218 from 0x301260) reads its actor at
+   +0x8 and the start height at +0x560 and stores the fall so far, start minus his height (actor +0x2b8), at +0x564.
+   While guarded the start is set to where he is and the fall to 0 every frame, as afiaka87/totk-mods self-recall does
+   for its own teleports (MIT; RecallMovement.cpp FallHeightUpdateHook, its 1.4.3 address of the same function). The
+   component is the one self-recall reaches as [actor+0x228]+0x3a8 (index 0x75); only used when its +0x8 is this actor. */
+enum { NOCLIP_GUARD_S = 8, COMPONENT_PLAYER = 0x75, PLAYER_FALL = 0x1218, FALL_ACTOR = 0x8, FALL_START = 0x560, FALL_SO_FAR = 0x564 };
+static void noclip_no_fall(uintptr_t actor) {
+    static int said;
+    uintptr_t player = ctl_component(actor, COMPONENT_PLAYER), fall = player ? player + PLAYER_FALL : 0;
+    float y; struct { float start, so_far; } reset;
+    if (!fall || read_ptr(fall + FALL_ACTOR) != actor || !read_mem(actor + ACTOR_POS + 4, &y, 4) || !isfinite(y)) {
+        if (!said) { said = 1; fprintf(stderr, "[noclip] [red] fall calculator not found (component %#llx): falls are not reset\n", (unsigned long long)player); }
+        return;
+    }
+    reset.start = y; reset.so_far = 0;
+    if (mach_vm_write(mach_task_self(), fall + FALL_START, (vm_offset_t)&reset, sizeof reset) == KERN_SUCCESS && !said) {
+        said = 1; fprintf(stderr, "[noclip] fall calculator %#llx: the fall start follows Link while guarded\n", (unsigned long long)fall);
+    }
+}
 static void noclip_guard(uintptr_t actor) {
-    static double until; static unsigned refills; double now = now_seconds();
-    if (atomic_load(&noclip_wanted)) until = now + NOCLIP_GUARD_S;
-    if (now >= until || !actor) return;
+    static unsigned refills; uint64_t now = runtime_now_ns();
+    if (atomic_load(&noclip_wanted) || noclip.holding) atomic_store(&noclip_guard_until_ns, now + NOCLIP_GUARD_S * 1000000000ull);
+    if (now >= atomic_load(&noclip_guard_until_ns) || !actor) return;
+    noclip_no_fall(actor);
     uintptr_t life_component = ctl_component(actor, COMPONENT_LIFE), life = life_component ? read_ptr(life_component + 0x1830) : 0;
     int32_t hp[2];
     if (!life || !read_mem(life + 0x8, &hp[0], 4) || !read_mem(life + 0x18, &hp[1], 4)) return;
