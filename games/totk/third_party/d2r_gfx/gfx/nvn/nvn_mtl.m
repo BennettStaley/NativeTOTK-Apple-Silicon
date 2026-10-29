@@ -7888,6 +7888,7 @@ static int prog_fit(NvProg *pr) {
     return changed;
 }
 // TOTK_PROBE_NEGATIVE for the prediction checks of probe-gfx (24-31: each breaks one rule below; the probe must fail).
+// 32 (upstream 51cd535) turns off the depth-state rule of pred_guess_wanted, for comparisons in play.
 static int pred_negative(void) { static int neg = -1; if (neg < 0) { const char *e = getenv("TOTK_PROBE_NEGATIVE"); neg = e ? atoi(e) : 0; } return neg; }
 // Prediction must not translate/compile, or mutate a program's active binding.
 // Only the exact already-resolved variant is predicted here. Unknown variants
@@ -7971,13 +7972,18 @@ static int prog_prediction_unseen(const prog_t *p, NvShader **vs, NvShader **fs)
 static const uint8_t PRED_DEPTH[4] = {1, 0, 0, 1}, PRED_STENCIL[4] = {1, 0, 1, 0};
 // A fragment function that exports depth makes ds_scan attach the pass's depth buffer, so a guess without it is never
 // used -- and pso_desc would compile that variant's library (fs_fn_without_depth) on the submit thread for nothing.
-// Negative 27 guesses it anyway.
+// Negative 27 guesses it anyway. The same holds for the draw's own depth-stencil state (S as the scan left it): a draw
+// that tests or writes depth keeps the pass's depth buffer, one that tests stencil keeps its stencil (ds_scan). Without
+// that, where the pipelines are not all resident (the iPhone's first run fills the archive and drops each one), every
+// scan compiled the depth-less guesses again, each dropped unused after two submissions (pso_pend_reclaim): upstream
+// 51cd535 measured 1,062 such keys compiled 12,417 times in 6 minutes of Breath of the Wild. Negative 32 guesses them anyway.
 static int pred_guess_wanted(int v, uint32_t dfull, uint32_t sfull, __unsafe_unretained NvShader *fs) {
     uint32_t d = PRED_DEPTH[v] ? dfull : 0, s = PRED_STENCIL[v] ? sfull : 0;
     if (v && d == dfull && s == sfull) return 0;   // same as the pass's own
     if (v == 2 && !sfull) return 0;
     if (v == 3 && (!dfull || !sfull)) return 0;
     if (dfull && !d && fs && fs->writes_depth && pred_negative() != 27) return 0;
+    if (pred_negative() != 32 && ((dfull && !d && (S.ds.dt || S.ds.dw)) || (sfull && !s && S.ds.st))) return 0;
     return 1;
 }
 // Compute thread group size lives in the control section; not located yet, so compute shaders stop with this message.
