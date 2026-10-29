@@ -27,16 +27,19 @@
 
 /* The Depths' Lightroots: CheckPoint000..147 (120 of them used, 1.4.3), each a DgnObj_WarpPoint_Zonau_A_04 with
    Dynamic.CheckPointNo; lit: ArrivalPointState.CheckPointNNN = Open. */
-enum { LANDMARK_TOWERS = 15, LANDMARK_SHRINES = 152, LANDMARK_STORY = 6, LANDMARK_LIGHTROOTS = 148, LANDMARK_FIRST_SHRINE = LANDMARK_TOWERS,
+/* The Dragon's Tears: the map's place list markers DragonTears01..12 (each at a FldObj_DragonTears_01); seen:
+   IsVisitLocation.DragonTearsNN. The game's messages have no names for them. */
+enum { LANDMARK_TOWERS = 15, LANDMARK_SHRINES = 152, LANDMARK_STORY = 6, LANDMARK_LIGHTROOTS = 148, LANDMARK_TEARS = 12, LANDMARK_FIRST_SHRINE = LANDMARK_TOWERS,
        LANDMARK_FIRST_STORY = LANDMARK_TOWERS + LANDMARK_SHRINES, LANDMARK_FIRST_LIGHTROOT = LANDMARK_FIRST_STORY + LANDMARK_STORY,
-       LANDMARKS = LANDMARK_FIRST_LIGHTROOT + LANDMARK_LIGHTROOTS };
+       LANDMARK_FIRST_TEAR = LANDMARK_FIRST_LIGHTROOT + LANDMARK_LIGHTROOTS, LANDMARKS = LANDMARK_FIRST_TEAR + LANDMARK_TEARS };
 enum { LANDMARK_UNKNOWN, LANDMARK_NOT_FOUND, LANDMARK_FOUND, LANDMARK_DONE };   /* from the save: done = activated / completed */
 /* Why the story lock (landmarks_lock) greys a place; LANDMARK_OPEN: it does not. */
 enum { LANDMARK_OPEN, LANDMARK_LOCK_ISLAND, LANDMARK_LOCK_DEPTHS, LANDMARK_LOCK_QUEST };
 static const char *const LANDMARK_LOCK_TEXT[] = {"", "Locked until the story leaves Great Sky Island", "Locked until you have been to the Depths",
                                                  "Locked until its quest gets there in the story"};
 /* Landmark k: towers first (k = Tower k+1), then shrines (k - 15 = Dungeon index), then the story's places
-   (LANDMARK_STORY_PLACES), then the Lightroots (k - LANDMARK_FIRST_LIGHTROOT = CheckPoint index). at: where a teleport lands, placed: at is known; island: on Great Sky Island, depths: in the
+   (LANDMARK_STORY_PLACES), then the Lightroots (k - LANDMARK_FIRST_LIGHTROOT = CheckPoint index), then the Dragon's Tears
+   (k - LANDMARK_FIRST_TEAR + 1 = DragonTears number). at: where a teleport lands, placed: at is known; island: on Great Sky Island, depths: in the
    Depths (from the map); state, opened (the story has sent the player there), lock: from the save. */
 typedef struct { char name[64]; float at[3]; int placed, state, island, depths, opened, lock; } Landmark;
 
@@ -61,17 +64,20 @@ static const LandmarkStoryPlace LANDMARK_STORY_PLACES[LANDMARK_STORY] = {
    caves, places) go here as ranges of their own. */
 typedef struct { const char *title; int first, count, fold; } LandmarkGroup;
 static const LandmarkGroup LANDMARK_GROUPS[] = {{"Story", LANDMARK_FIRST_STORY, LANDMARK_STORY, 0}, {"Skyview Towers", 0, LANDMARK_TOWERS, 1},
-                                                {"Shrines", LANDMARK_FIRST_SHRINE, LANDMARK_SHRINES, 1}, {"Lightroots", LANDMARK_FIRST_LIGHTROOT, LANDMARK_LIGHTROOTS, 1}};
+                                                {"Shrines", LANDMARK_FIRST_SHRINE, LANDMARK_SHRINES, 1}, {"Lightroots", LANDMARK_FIRST_LIGHTROOT, LANDMARK_LIGHTROOTS, 1},
+                                                {"Dragon's Tears", LANDMARK_FIRST_TEAR, LANDMARK_TEARS, 1}};
 enum { LANDMARK_NGROUPS = sizeof LANDMARK_GROUPS / sizeof *LANDMARK_GROUPS };
 static inline int landmark_is_story(int k) { return k >= LANDMARK_FIRST_STORY && k < LANDMARK_FIRST_LIGHTROOT; }
-static inline int landmark_is_lightroot(int k) { return k >= LANDMARK_FIRST_LIGHTROOT && k < LANDMARKS; }
+static inline int landmark_is_lightroot(int k) { return k >= LANDMARK_FIRST_LIGHTROOT && k < LANDMARK_FIRST_TEAR; }
+static inline int landmark_is_tear(int k) { return k >= LANDMARK_FIRST_TEAR && k < LANDMARKS; }
 static inline int landmark_is_shrine(int k) { return k >= LANDMARK_FIRST_SHRINE && k < LANDMARK_FIRST_STORY; }
 
 static inline void landmark_label(int k, char *out, size_t size) {
     if (k < LANDMARK_TOWERS) snprintf(out, size, "Tower%02d", k + 1);
     else if (k < LANDMARK_FIRST_STORY) snprintf(out, size, "Dungeon%03d", k - LANDMARK_FIRST_SHRINE);
     else if (k < LANDMARK_FIRST_LIGHTROOT) snprintf(out, size, "%s", LANDMARK_STORY_PLACES[k - LANDMARK_FIRST_STORY].location);
-    else snprintf(out, size, "CheckPoint%03d", k - LANDMARK_FIRST_LIGHTROOT);
+    else if (k < LANDMARK_FIRST_TEAR) snprintf(out, size, "CheckPoint%03d", k - LANDMARK_FIRST_LIGHTROOT);
+    else snprintf(out, size, "DragonTears%02d", k - LANDMARK_FIRST_TEAR + 1);
 }
 static inline uint32_t landmark_le32(const uint8_t *p) { return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24; }
 
@@ -317,6 +323,11 @@ static inline int landmarks_load(const LandmarkRomfs *r, Landmark *out) {
         if (!nm && depths && (nm = landmark_markers(depths, dn, name, mk, 16))) out[k].depths = 1;
         placed += nm && landmark_place_story(s, (const float (*)[3])mk, nm, &out[k]);
     }
+    for (int k = LANDMARK_FIRST_TEAR; k < LANDMARKS && surface; k++) {   /* a Dragon's Tear: on its marker, 1.5 m up */
+        char label[32]; landmark_label(k, label, sizeof label);
+        if (!landmark_markers(surface, sn, label, mk, 1)) continue;
+        out[k].placed = 1; out[k].at[0] = mk[0][0]; out[k].at[1] = mk[0][1] + 1.5f; out[k].at[2] = mk[0][2]; placed++;
+    }
     for (int k = 0; k < LANDMARKS && has_island; k++) out[k].island = out[k].placed && !out[k].depths && landmark_on_island(island[0], out[k].at);
     free(surface); free(depths); free(s);
     size_t n = 0, mn = 0; uint8_t *pack = mals[0] ? landmark_read(r, mals, &n) : NULL;
@@ -327,6 +338,7 @@ static inline int landmarks_load(const LandmarkRomfs *r, Landmark *out) {
         if (k < LANDMARK_TOWERS) snprintf(out[k].name, sizeof out[k].name, "Skyview Tower %d", k + 1);
         else if (k < LANDMARK_FIRST_STORY) snprintf(out[k].name, sizeof out[k].name, "Shrine %d", k - LANDMARK_FIRST_SHRINE);
         else if (landmark_is_lightroot(k)) snprintf(out[k].name, sizeof out[k].name, "Lightroot %d", k - LANDMARK_FIRST_LIGHTROOT);
+        else if (landmark_is_tear(k)) snprintf(out[k].name, sizeof out[k].name, "Dragon's Tear %d", k - LANDMARK_FIRST_TEAR + 1);
         else snprintf(out[k].name, sizeof out[k].name, "%s", label);
     }
     free(pack);
@@ -384,6 +396,10 @@ static inline int landmarks_state_parse(const uint8_t *b, size_t n, Landmark *lm
     uint32_t clear = dish_murmur3("Clear"), enter = dish_murmur3("Enter"), not_ready = dish_murmur3("NotReady"), ready = dish_murmur3("Ready");
     for (int k = 0; k < LANDMARKS; k++) {
         int has_visit = got[k], has_done = got[LANDMARKS + k]; uint32_t vv = value[k], dv = value[LANDMARKS + k];
+        if (landmark_is_tear(k)) {   /* reached (its memory seen): done */
+            if (has_visit) lm[k].state = vv == 1 ? LANDMARK_DONE : LANDMARK_NOT_FOUND;
+            continue;
+        }
         if (landmark_is_lightroot(k)) {   /* lit: done; visited (its light seen up close) without being lit: found */
             if (!has_visit && !has_done) continue;
             lm[k].state = has_done && dv == open ? LANDMARK_DONE : has_visit && vv == 1 ? LANDMARK_FOUND : LANDMARK_NOT_FOUND;

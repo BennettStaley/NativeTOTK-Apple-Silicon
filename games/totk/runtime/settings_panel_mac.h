@@ -700,7 +700,7 @@ static int cheat_choice_members(int leader, int *all, int *usable, int max, int 
             dispatch_async(dispatch_get_main_queue(), ^{
                 if (placed) memcpy(landmark_places, got, sizeof landmark_places);
                 free(got); landmarks_read = placed ? 2 : 3;
-                if (self.superview && (self.kind == MENU_TELEPORT || self.kind == MENU_TOWERS || self.kind == MENU_SHRINES || self.kind == MENU_LIGHTROOTS)) [self rebuildKeepingPlace];
+                if (self.superview && (self.kind == MENU_TELEPORT || self.kind == MENU_TOWERS || self.kind == MENU_SHRINES || self.kind == MENU_LIGHTROOTS || self.kind == MENU_TEARS)) [self rebuildKeepingPlace];
             });
         });
     }
@@ -732,11 +732,12 @@ static int cheat_choice_members(int leader, int *all, int *usable, int max, int 
             if (near) { float da = away(a.intValue), db = away(b.intValue); if (da != db) return da < db ? NSOrderedAscending : NSOrderedDescending; }
             return [@(m[a.intValue].name) localizedStandardCompare:@(m[b.intValue].name)];
         }];
-        BOOL towers = group->first == 0, story = landmark_is_story(group->first), shrines = landmark_is_shrine(group->first), roots = landmark_is_lightroot(group->first);
+        BOOL towers = group->first == 0, story = landmark_is_story(group->first), shrines = landmark_is_shrine(group->first), roots = landmark_is_lightroot(group->first), tears = landmark_is_tear(group->first);
         char autoLine[600]; BOOL running = shrines && runtime_autoshrine_status(autoLine, sizeof autoLine);
         NSString *count = !known ? (saved < 0 ? @"No save yet: shown by name." : @"The last save does not say which are done: shown by name.")
                         : [NSString stringWithFormat:story ? @"%d of %lu completed in the last save." : towers ? @"%d of %lu activated in the last save; the rest first."
-                                                     : roots ? @"%d of %lu lit in the last save; the rest first." : @"%d of %lu completed in the last save; the rest first.", done, (unsigned long)order.count];
+                                                     : roots ? @"%d of %lu lit in the last save; the rest first." : tears ? @"%d of %lu seen in the last save; the rest first."
+                                                     : @"%d of %lu completed in the last save; the rest first.", done, (unsigned long)order.count];
         if (group->fold && known) count = [count stringByAppendingString:near ? @" Nearest first." : @" By name (no player yet)."];
         if (locked) count = [count stringByAppendingFormat:@" %d locked by the story so far.", locked];
         else if (lockOn && !progress.known && story)
@@ -744,13 +745,15 @@ static int cheat_choice_members(int leader, int *all, int *usable, int max, int 
         NSString *lands = story ? @"Lands at the place's travel point; flies you there with noclip, as a map pin does."
                         : towers ? @"Lands inside the tower by its door; flies you there with noclip, as a map pin does."
                         : roots ? @"Lands on the Lightroot's travel point; flies you there with noclip, as a map pin does."
+                        : tears ? @"Lands on the tear, in its geoglyph; flies you there with noclip, as a map pin does."
                                  : @"Go lands at the shrine's travel point (noclip, as a map pin does); Finish (→ on the row) completes that shrine alone, as auto shrine does.";
         [self cheatsHeading:@(group->title) detail:[NSString stringWithFormat:@"%@ %@", count, lands] problem:nil big:YES];
         for (NSNumber *n in order) {
             int k = n.intValue; const Landmark *l = &marks[k];
             static const char *const tower_state[] = {"", "Not activated", "Found, not activated", "Activated"}, *const shrine_state[] = {"", "Not found yet", "Found, not completed", "Completed"},
-                              *const story_state[] = {"", "Not visited yet", "Visited", "Completed"}, *const root_state[] = {"", "Not found yet", "Found, not lit", "Lit"};
-            const char *state = (story ? story_state : towers ? tower_state : roots ? root_state : shrine_state)[l->state];
+                              *const story_state[] = {"", "Not visited yet", "Visited", "Completed"}, *const root_state[] = {"", "Not found yet", "Found, not lit", "Lit"},
+                              *const tear_state[] = {"", "Not seen yet", "Not seen yet", "Seen"};
+            const char *state = (story ? story_state : towers ? tower_state : roots ? root_state : tears ? tear_state : shrine_state)[l->state];
             NSButton *go = [self cheatsButton:@"Go" action:@selector(landmarkGo:)]; go.tag = k; go.enabled = l->lock == LANDMARK_OPEN;
             NSView *control = go;
             if (shrines) {
@@ -913,6 +916,7 @@ static int cheat_choice_members(int leader, int *all, int *usable, int max, int 
     else if (kind == MENU_TOWERS) [self buildPlaces:1];
     else if (kind == MENU_SHRINES) [self buildPlaces:2];
     else if (kind == MENU_LIGHTROOTS) [self buildPlaces:3];
+    else if (kind == MENU_TEARS) [self buildPlaces:4];
     else if (kind == MENU_SAVES) {
         NSView *saves = [self savesRow];
         [list addArrangedSubview:saves]; [rows addObject:saves]; [rowSetting addObject:@(SAVES_ROW)];
