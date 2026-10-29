@@ -14,6 +14,7 @@ int mfxup_output_enabled(void);
 static NSWindow *window;
 uint64_t dm_nvn_frame_count(void);   /* gfx/nvn/hle_nvn.c: game frames presented so far */
 static CAMetalLayer *metalLayer;
+static id<NSObject> appNapOff;   /* the activity that keeps macOS from napping the game (runtime_front_run) */
 static NSView *bootOverlay;
 static NSTextField *bootStage,*bootDetail;
 static NSProgressIndicator *bootProgress;
@@ -520,6 +521,12 @@ void runtime_front_run(void(*callback)(void)){
   dispatch_after(dispatch_time(DISPATCH_TIME_NOW,3*NSEC_PER_SEC),dispatch_get_main_queue(),^{note_occlusion(" 3 s after opening");});
   [TOTKCheatDb boot];   /* the community cheat list for the Cheats tab, in the background (runtime/cheat_db_fetch.h) */
   atomic_store(&focused,1);
+  /* No App Nap while the game runs (TOTK_APP_NAP=1 allows it; idle system sleep stays allowed). 2026-10-24 (fork sunsssyc
+     b265f28): with the app not focal and its window hidden, macOS napped it (RunningBoard appnap "Enable") and every thread,
+     the real-time render thread included, ran at priority 4 for 2-14 s at a time; the replay then waited seconds for the
+     encode stage, whose 2 s limit aborted the game (8 crash reports, each after a nap began). */
+  {const char *e=getenv("TOTK_APP_NAP");if(!(e&&!strcmp(e,"1")))appNapOff=[NSProcessInfo.processInfo beginActivityWithOptions:NSActivityUserInitiatedAllowingIdleSystemSleep|NSActivityLatencyCritical reason:@"game running"];
+   fprintf(stderr,"[totk] App Nap %s\n",appNapOff?"off while the game runs (TOTK_APP_NAP=1 allows it)":"allowed (TOTK_APP_NAP=1)");}
   if(CVDisplayLinkCreateWithActiveCGDisplays(&displayLink)||CVDisplayLinkSetOutputCallback(displayLink,vsync_callback,NULL)||CVDisplayLinkStart(displayLink))runtime_fail("native display link initialization");
   pthread_t guest;pthread_attr_t attr;pthread_attr_init(&attr);pthread_attr_setstacksize(&attr,8*1024*1024);int err=pthread_create(&guest,&attr,guest_main,(void *)callback);pthread_attr_destroy(&attr);if(err)runtime_fail("native game thread creation");
   [NSApp run];runtime_fail("native event loop returned unexpectedly");
