@@ -621,7 +621,7 @@ void runtime_survey_cancel_user(void) {
     if (!atomic_load_explicit(&runtime_survey_pending, memory_order_relaxed)) return;
     pthread_mutex_lock(&survey_lock);
     request.kind = 0; hold_left = 0; route_on = 0; cam_off(); atomic_store(&runtime_survey_pending, 0);
-    if (atomic_load(&runtime_spawn_waiting) || atomic_load(&noclip_wanted) || atomic_load(&as_active)) atomic_store(&runtime_survey_pending, 1);   /* spawns, noclip and auto shrine (its own stop) are not cancelled here */
+    if (atomic_load(&runtime_spawn_waiting) || atomic_load(&noclip_wanted) || noclip.holding || atomic_load(&as_active)) atomic_store(&runtime_survey_pending, 1);   /* spawns, noclip (and its landing) and auto shrine (its own stop) are not cancelled here */
     fprintf(stderr, "[survey] cancelled: user input\n");
     pthread_mutex_unlock(&survey_lock);
 }
@@ -659,10 +659,61 @@ uint64_t runtime_noclip_taken(void) { return atomic_load(&noclip_wanted) ? NOCLI
    left stick moves relative to the camera (up: away from it, right: to the screen's right; level, whatever the camera's
    pitch) and the triggers raise (ZR / RT) and lower (ZL / LT). Without a camera yet, his facing. Gravity and collisions
    act between frames and are undone by the next hold. */
+/* Soft landing (2026-10-28): switched off in the air, the player used to drop from where he was held, and a high fall
+   kills whatever his hearts. He is lowered at NOCLIP_LAND_SPEED instead and let go once he stands: the hold puts him at
+   noclip.xyz each frame and the game's physics acts in between, so in the air he reads back a little lower (gravity, a few
+   millimetres a frame) and on the ground not lower, or pushed up out of it. Let go after NOCLIP_LAND_FRAMES such frames
+   in a row (pushed up: two), or NOCLIP_LAND_S seconds at most; noclip on again ends it too. */
+enum { NOCLIP_LAND_SPEED = 12, NOCLIP_LAND_FRAMES = 6, NOCLIP_LAND_S = 60 };
+static struct { int on, still, pushed, sank; uint64_t t0; float lowest_sag, highest_sag; } noclip_land;
+static void noclip_release(const char *why) {
+    if (noclip.holding) fprintf(stderr, "[noclip] released at %.1f,%.1f,%.1f%s%s\n", noclip.xyz[0], noclip.xyz[1], noclip.xyz[2], why ? ": " : "", why ? why : "");
+    noclip.holding = 0; noclip_land.on = 0;
+}
+/* One frame of the soft landing; 0 once he is let go. */
+static int noclip_landing(uintptr_t actor, uint64_t now) {
+    float at[3];
+    if (!noclip_land.on) {
+        noclip_land.on = 1; noclip_land.still = noclip_land.pushed = noclip_land.sank = 0; noclip_land.t0 = now; noclip_land.lowest_sag = 1e9f; noclip_land.highest_sag = -1e9f;
+        fprintf(stderr, "[noclip] landing from %.1f,%.1f,%.1f\n", noclip.xyz[0], noclip.xyz[1], noclip.xyz[2]);
+    } else if (read_mem(actor + ACTOR_POS, at, sizeof at) && valid_xyz(at)) {
+        float sag = noclip.xyz[1] - at[1];   /* how far the game moved him down since the last hold */
+        if (sag < noclip_land.lowest_sag) noclip_land.lowest_sag = sag;
+        if (sag > noclip_land.highest_sag) noclip_land.highest_sag = sag;
+        if (sag > 0.0005f) { noclip_land.sank = 1; noclip_land.still = 0; noclip_land.pushed = 0; }
+        else if (sag < -0.003f) { noclip_land.pushed++; noclip_land.still++; }
+        else { noclip_land.pushed = 0; noclip_land.still++; }
+        /* still frames count only once the air has been seen to sag (else this physics does not act between holds and
+           only a push out of the ground says he stands) */
+        if (noclip_land.pushed >= 2 || (noclip_land.sank && noclip_land.still >= NOCLIP_LAND_FRAMES)) {
+            char why[120]; snprintf(why, sizeof why, "standing (%s; sag %.4f..%.4f m)", noclip_land.pushed >= 2 ? "pushed up" : "no longer sinking", noclip_land.lowest_sag, noclip_land.highest_sag);
+            noclip_release(why); return 0;
+        }
+    }
+    if (now - noclip_land.t0 > NOCLIP_LAND_S * 1000000000ull) { noclip_release("landing took too long"); return 0; }
+    return 1;
+}
 static void noclip_tick(uintptr_t actor) {
+    if (!atomic_load(&noclip_wanted) && noclip.holding && noclip_force && actor) {   /* switched off: the soft landing */
+        uint64_t now = runtime_now_ns(); float rot[9], matrix[12];
+        float dt = (float)(now - noclip.at_ns) * 1e-9f; noclip.at_ns = now;
+        if (!(dt > 0)) dt = 0;
+        if (dt > 0.1f) dt = 0.1f;
+        noclip_flight.on = 0;
+        if (!read_mem(actor + ACTOR_ROT, rot, sizeof rot)) { noclip_release("no rotation"); return; }
+        for (unsigned i = 0; i < 9; i++) if (!isfinite(rot[i]) || fabsf(rot[i]) > 2) { noclip_release("no rotation"); return; }
+        if (!noclip_landing(actor, now)) return;
+        float next[3] = {noclip.xyz[0], noclip.xyz[1] - NOCLIP_LAND_SPEED * dt, noclip.xyz[2]};
+        if (valid_xyz(next)) memcpy(noclip.xyz, next, sizeof next); else { noclip_release("the map's edge"); return; }
+        for (unsigned row = 0; row < 3; row++) {
+            for (unsigned col = 0; col < 3; col++) matrix[row * 4 + col] = rot[row * 3 + col];
+            matrix[row * 4 + 3] = noclip.xyz[row];
+        }
+        noclip_force((void *)actor, matrix, 0);
+        return;
+    }
     if (!atomic_load(&noclip_wanted) || !noclip_force || !actor) {
-        if (noclip.holding) fprintf(stderr, "[noclip] released at %.1f,%.1f,%.1f\n", noclip.xyz[0], noclip.xyz[1], noclip.xyz[2]);
-        noclip.holding = 0;
+        noclip_release(NULL);
         if (!atomic_load(&noclip_wanted)) noclip_flight.on = 0;
         return;
     }
@@ -670,6 +721,7 @@ static void noclip_tick(uintptr_t actor) {
     uint64_t now = runtime_now_ns();
     if (!read_mem(actor + ACTOR_ROT, rot, sizeof rot)) return;
     for (unsigned i = 0; i < 9; i++) if (!isfinite(rot[i]) || fabsf(rot[i]) > 2) return;
+    if (noclip_land.on) { noclip_land.on = 0; fprintf(stderr, "[noclip] landing ended: noclip on again\n"); }
     if (!noclip.holding) {
         if (!read_mem(actor + ACTOR_POS, noclip.xyz, sizeof noclip.xyz) || !valid_xyz(noclip.xyz)) return;
         noclip.holding = 1; noclip.at_ns = now;
