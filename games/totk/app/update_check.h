@@ -59,9 +59,10 @@ static inline NSDictionary *mng_public_json(NSString *suffix, double deadline) {
     return finished ? result : nil;
 }
 
+// Off by default in this fork: it compares against upstream, which a fork always differs from (MNG_CHECK_UPDATES=1 turns it on).
 static inline BOOL mng_updates_enabled(void) {
     const char *enabled = getenv("MNG_CHECK_UPDATES");
-    return !enabled || strcmp(enabled, "0");
+    return enabled && strcmp(enabled, "0");
 }
 
 static inline NSString *mng_update_state_path(NSString *folder) {
