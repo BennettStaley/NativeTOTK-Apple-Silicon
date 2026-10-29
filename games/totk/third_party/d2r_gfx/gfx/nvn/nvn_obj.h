@@ -202,6 +202,7 @@ void botw_mfx_frame_reset(void);
    takes the whole canvas as the scene and clears the UI layer (end of nvn_mtl.m). */
 void botw_mfx_no_ui_scene(void);
 #define BOTW_MFX_NO_UI_SCENE() botw_mfx_no_ui_scene();
+#define TOTK_MFX_COPY_DRAW(pr)   /* TOTK only (mfx_copy_draw); this game has its own no-UI scene copy above */
 /* Key 4 (ultrawide, game_patches_botw.c): every draw of this game into the canvas is a 6-index quad of its UI layouts
    (HUD, menus, map, the inventory's Link) except the upscale of the scene (a full-screen triangle) and the menus'
    blurred picture of it (a quad, botw_uw_scene_picture), which keep the full width. The quads drawn before the upscale are covered by it, so all of
@@ -272,6 +273,9 @@ extern _Thread_local int botw_bra_attach;   /* tex_mtl for a render target: its 
 #define UW_NOT_UI_DRAW(vs, dw, di) !uw_ui_vs(vs) || (dw ? dw->count : di ? di->count : 0) != 6
 #define BOTW_MFX_FRAME_RESET()
 #define BOTW_MFX_NO_UI_SCENE()
+/* The first draw into a presented texture names the canvas by the texture it samples and, in a frame with no UI draw
+   (cutscenes), copies the canvas as the scene (mfx_copy_draw, nvn_mtl.m). */
+#define TOTK_MFX_COPY_DRAW(pr) mfx_copy_draw(pr);
 #define MFX_CAM_SLOT 1
 #define MFX_CAM_SIZE 2368
 #define BOTW_MFXUP_MASK_BAD (S.chmask.mask & 0xf) != 0xf

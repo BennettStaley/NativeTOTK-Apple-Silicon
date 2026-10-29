@@ -4906,6 +4906,9 @@ static struct { uint32_t cfmt[8], dfmt, sfmt, samples; int hd, hs; NSUInteger tw
 #define MFX_ROLE_UI 2
 #define MFX_ROLE_UI_OPAQUE 3
 static struct { uint64_t canvas, last_c0, swap[4]; uint32_t swap_w, swap_h; int nswap, scene_done, ui_cleared, depth_done, want_cam, role; uint64_t frames;
+                /* mfx_copy_draw: the copy to the window named the canvas this / the previous frame; the size and format of
+                   the last copy source that was already the known canvas; frames whose scene it copied */
+                int copy_learned, copy_prev; uint32_t cw, ch, cfmt; uint64_t copy_scenes;
                 uint64_t gbuf_pass; int cam_tries; } g_mfx;   // gbuf_pass: g_pass.serial of the last G-buffer pass (the camera may come from a later draw of it)
 /* The UI-layer composite (totk_ui_layer.h): its textures while interpolation is off, this frame's canvas and scene copy. */
 static struct {
@@ -5640,8 +5643,10 @@ static void canvas_learn(MTL4RenderPassDescriptor *pd) {
     if (t0 && c0 && g_mfx.swap_w) {
         int to_swap = 0; for (int i = 0; i < g_mfx.nswap; i++) to_swap |= g_mfx.swap[i] == t0->serial;
         if (to_swap) {
-            /* The first size is the canvas's own; this used to print the presented texture's (3840x2160 for a 2560x1440 canvas). */
-            if (g_mfx.last_c0 && g_mfx.canvas != g_mfx.last_c0) { g_mfx.canvas = g_mfx.last_c0; MLOG("[mfx] canvas: texture %llu (%ux%u), copied to presented texture %llu (%ux%u)", (unsigned long long)g_mfx.canvas, g_canvas_w, g_canvas_h, (unsigned long long)t0->serial, g_mfx.swap_w, g_mfx.swap_h); }
+            /* The first size is the canvas's own; this used to print the presented texture's (3840x2160 for a 2560x1440 canvas).
+               Not when the copy to the window named the canvas (mfx_copy_draw), this frame or the last: in cutscenes the last
+               such target is a different texture every frame, not the canvas. */
+            if (!g_mfx.copy_learned && !g_mfx.copy_prev && g_mfx.last_c0 && g_mfx.canvas != g_mfx.last_c0) { g_mfx.canvas = g_mfx.last_c0; MLOG("[mfx] canvas: texture %llu (%ux%u), copied to presented texture %llu (%ux%u)", (unsigned long long)g_mfx.canvas, g_canvas_w, g_canvas_h, (unsigned long long)t0->serial, g_mfx.swap_w, g_mfx.swap_h); }
         } else if (c0.width >= 640 && fabs((double)c0.width * g_mfx.swap_h / ((double)c0.height * g_mfx.swap_w) - 1) < 0.01 && pd.colorAttachments[0].level == 0 &&
                    MFX_CANVAS_FMT_OK(c0.pixelFormat) && !pd.depthAttachment.texture)
             { g_mfx.last_c0 = t0->serial; g_canvas_w = (uint32_t)c0.width; g_canvas_h = (uint32_t)c0.height; }
@@ -12979,6 +12984,54 @@ static void mfx_take_camera(void) {
                                               (unsigned long long)u->addr, (unsigned long long)u->size, (unsigned long long)atomic_load(&g_cur_frame), retry ? "; the pass's next draw is tried" : "");
     }
 }
+/* TOTK_MFX: the game's copy of the canvas to the window names the canvas. canvas_learn takes the last float target of the
+   window's shape drawn before a pass into a presented texture; in rendered cutscenes and dialogue scenes that is a
+   different texture every frame (log 2026-10-28, 2560x1600 window: about 6,000 frames with a new 1280x800, 832x520 or
+   2560x1600 "canvas" each, texture 2934, the canvas of gameplay, coming back in between), so the scene copy, which waits
+   for a UI draw into last frame's canvas, never came: 14,214 of 42,900 frames not interpolated for want of colour, the
+   game held at 30 fps by the auto cap showing 30. The texture the first draw into a presented texture samples is the
+   picture the window gets; when it is a float texture of the window's shape it is the canvas, from this frame on.
+   A frame with no scene copy by then (a cutscene draws no UI; or its UI went into a texture not known as the canvas yet)
+   gets one here: the canvas, the whole picture, is copied as the scene and the UI layer cleared, so it is interpolated
+   like the others (as Breath of the Wild's botw_mfx_no_ui_scene). Only with a G-buffer this frame (pre-rendered movies
+   have none and stay as they are) and only at the size and format of the last copy source that was already the known
+   canvas (g_mfx.cw / ch / cfmt), so a texture that is the canvas for one frame only never resizes the scene and output
+   textures (MetalFX keeps the memory of every interpolator it makes). */
+static void mfx_copy_draw(__unsafe_unretained NvProg *pr) {
+    if (g_mfx.copy_learned || !g_mfx.nswap || !g_mfx.swap_w || g_defer_replaying || !mfx_enabled() || !pr || !pr->sh[1] || R.rt.n < 1 || !R.rt.color[0]) return;
+    uint64_t ser = R.rt.color[0]->serial; int to_swap = 0;
+    for (int i = 0; i < g_mfx.nswap; i++) to_swap |= g_mfx.swap[i] == ser;
+    if (!to_swap) return;
+    __unsafe_unretained NvShader *f = pr->sh[1];
+    uint64_t h = 0; for (int i = 0; i < f->rf.nb && !h; i++) if (f->rf.b[i].kind == NVN_RB_TEX && f->rf.b[i].reg < 128) h = S.tex[1][f->rf.b[i].reg];
+    int tid = (int)(h & 0xfffff);
+    const tex_t *src = tid > 0 && tid < g_ntreg && g_treg[tid].ok ? &g_treg[tid].t : NULL;
+    id<MTLTexture> c = src && src->serial ? tex_mtl(src) : nil;
+    if (!c || c.textureType != MTLTextureType2D || c.width < 640 || !MFX_CANVAS_FMT_OK(c.pixelFormat) ||
+        fabs((double)c.width * g_mfx.swap_h / ((double)c.height * g_mfx.swap_w) - 1) >= 0.01) return;   // not a copy of a canvas: the next draw into the window may be
+    g_mfx.copy_learned = 1;
+    uint32_t w = (uint32_t)c.width, hh = (uint32_t)c.height, fmt = (uint32_t)c.pixelFormat;
+    if (src->serial == g_mfx.canvas) { g_mfx.cw = w; g_mfx.ch = hh; g_mfx.cfmt = fmt; }
+    else {
+        static unsigned n; if (n++ < 20 || n % 1000 == 0)
+            MLOG("[mfx] canvas: texture %llu (%ux%u), the texture the copy to presented texture %llu samples (was %llu; %u such changes)", (unsigned long long)src->serial, w, hh,
+                 (unsigned long long)ser, (unsigned long long)g_mfx.canvas, n);
+        g_mfx.canvas = src->serial;
+    }
+    if (g_mfx.scene_done || !g_mfx.depth_done || w != g_mfx.cw || hh != g_mfx.ch || fmt != g_mfx.cfmt) return;
+    const tex_t *swap = R.rt.color[0]; R.rt.color[0] = src; mfx_snapshot_scene(); R.rt.color[0] = swap;   // ends the pass, copies the canvas
+    id<MTLTexture> ui = mfx_ui_target(g_dev, w, hh);
+    if (ui) {   // an empty pass clears the UI layer to transparent
+        MTL4RenderPassDescriptor *rp = [MTL4RenderPassDescriptor new]; rp.colorAttachments[0].texture = ui;
+        rp.colorAttachments[0].loadAction = MTLLoadActionClear; rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0); rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+        blit_close(); rs_sync(); pt_mark(g_cb, 'R', rp); id<MTL4RenderCommandEncoder> en = [g_cb renderCommandEncoderWithDescriptor:rp]; es_reset();
+        if (en) { [en barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:MTL4VisibilityOptionDevice]; m4_end(en); }
+        args_dirty_all(); g_pso_dirty = g_dss_dirty = 1;
+    }
+    if (++g_mfx.copy_scenes <= 2 || g_mfx.copy_scenes % 300 == 0)
+        MLOG("[mfx] %llu frames without a scene copy at the first UI draw so far (game frame %llu): the canvas copied to the window is the scene, the UI layer is empty",
+             (unsigned long long)g_mfx.copy_scenes, (unsigned long long)atomic_load(&g_cur_frame));
+}
 static void draw_inner(const p_draw *dw, const p_draw_idx *di);
 /* Diagnostic DM_NVN_NANDRAW=<first>-<last frame> (log DM_NVN_NANDRAW_LOG, default analysis/nandraw.tsv): after every
    draw into a full-size RG11B10F or R32F colour attachment (the HDR target, the linear depth), end the pass and count
@@ -13912,6 +13965,7 @@ frz_plain:;
         (uil_on() ? uw_ui_vs(pr->sh[0]->key) : MFX_UI_DRAW(pr) && mfx_enabled()))
         mfx_snapshot_scene();   // TOTK_MFX / the UI-layer composite: first UI draw into the canvas: copy the finished scene first
     if (!g_uw_ui && uw_on_canvas() && pr && pr->sh[0] && UW_UI_BEGINS(pr)) g_uw_ui = 1; BOTW_MFX_NO_UI_SCENE()   // key 4: the UI begins | BOTW key 2 (every draw, not part of the if): a frame without UI takes the canvas as its scene
+    TOTK_MFX_COPY_DRAW(pr)   // TOTK key 2: the copy to the window names the canvas; a frame without a scene copy takes the canvas as its scene
     /* TOTK: unretained: g_enc holds the encoder (the encode-stage sentinel when streamed) until rp_end, and every path below
        that ends the pass returns without touching en again; as a strong local it was a retain + release on every draw.
        defer_replay draws whole replayed draws, which may end the pass: en_keep holds the encoder over it as before. */
@@ -16844,6 +16898,7 @@ uint64_t mtl_present(const tex_t *t, double period, const int crop[4]) {
     pp_latch();   // picture settings for the next frame (totk_post.h)
     mtl_wb_eager();
     g_uw_ui = 0;
+    g_mfx.copy_prev = g_mfx.copy_learned; g_mfx.copy_learned = 0;   // mfx_copy_draw: the next frame's copy names its canvas again
     if (atomic_load(&g_uw_log) > 0) atomic_fetch_sub(&g_uw_log, 1);
     if (atomic_load(&g_draw_log) > 0) atomic_fetch_sub(&g_draw_log, 1);
     if (discard) return 0;   // Ticket number 0 = no pending present; the swapchain texture acquire does not wait
