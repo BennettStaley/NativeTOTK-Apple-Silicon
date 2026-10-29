@@ -303,7 +303,8 @@ static void res_site_report(int top) {
     }
     pthread_mutex_unlock(&g_res_mu);
 }
-/* GPU memory budget: TOTK_GPU_BUDGET_MB, default 40% of physical memory on the Mac (0 disables). Checked before every
+/* GPU memory budget: TOTK_GPU_BUDGET_MB, default half of physical memory on the Mac (0 disables; 40% until 2026-10-28, when it stopped an 18 GB M3 Pro at
+   8.1 GB, far from the ~15 GB of the kernel panics). Checked before every
    submission and residency commit, in the no-submit mode too, so the growth is reported with its sites instead of
    exhausting wired memory. Off by default on iOS: there the system's per-app limit bounds GPU memory and ends only the app,
    and 40% of an iPhone 14 (2284 MB) stopped the game in the world while it used 3.6 of its 4 GB (2026-10-19). */
@@ -313,7 +314,7 @@ static uint64_t gpu_budget_bytes(void) {
         init = 1; const char *e = getenv("TOTK_GPU_BUDGET_MB");
         if (e) b = strtoull(e, NULL, 10) << 20;
         else if (TARGET_OS_IPHONE) b = 0;
-        else { uint64_t phys = 0; size_t n = sizeof phys; if (sysctlbyname("hw.memsize", &phys, &n, NULL, 0) || !phys) MDIE("hw.memsize unavailable for the GPU memory budget"); b = phys / 5 * 2; }
+        else { uint64_t phys = 0; size_t n = sizeof phys; if (sysctlbyname("hw.memsize", &phys, &n, NULL, 0) || !phys) MDIE("hw.memsize unavailable for the GPU memory budget"); b = phys / 2; }
         MLOG("GPU memory budget %llu MB (override with TOTK_GPU_BUDGET_MB, 0 disables)", (unsigned long long)(b >> 20));
     }
     return b;
@@ -3790,6 +3791,14 @@ static _Atomic uint64_t g_rt_size_frame;   /* frame of the latest output / scene
 /* +120: a size is applied up to 0.4 s after the request (output_latch); targets still drawn afterwards stay newer than the change */
 void mtl_rt_size_changed(void) { atomic_store(&g_rt_size_frame, atomic_load(&g_cur_frame) + 120); }
 uint64_t mtl_rt_size_frame(void) { return atomic_load(&g_rt_size_frame); }   /* hle_nvn.c: the auto frame cap leaves the change out */
+/* The game's own scene size changes (dynamic resolution, scene_size_note) count as size changes too (2026-10-28): without
+   them a session that never touched the settings never released a target, and one drop to 2048x1280 and back added a
+   second set of targets (2.3 -> 5.1 GB at nvn_mtl.m's texture creation) until the budget guard stopped the game twice.
+   Stamped at the frame the new size was seen, not +120 like a requested change: it is already in effect, so every target
+   drawn since (the pause menu's frozen scene among them) is newer than it and kept. Kept apart from g_rt_size_frame so
+   the auto frame cap (hle_nvn.c) does not treat the game's frequent resolution steps as requested changes. */
+static _Atomic uint64_t g_rt_scene_frame;
+static uint64_t rt_changed_frame(void) { uint64_t a = atomic_load(&g_rt_size_frame), b = atomic_load(&g_rt_scene_frame); return a > b ? a : b; }
 static int stor_rt_evict_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("TOTK_RT_EVICT"); on = !e || atoi(e); } return on; }
 /* A pass renders into mt (a base texture or a view on one): stamp its storage entry. */
 static void stor_note_attach(id<MTLTexture> mt) {
@@ -3804,7 +3813,7 @@ static void stor_sweep(uint64_t fence) {
     stor_collect_drop(^int(const stor_ent *e) { return !e->nser && fence > e->idle_fence + STOR_IDLE_SUBMITS; }, &g_stor_swept);
     if (stor_rt_evict_on()) {
         static uint64_t last_check; uint64_t frame = atomic_load_explicit(&g_cur_frame, memory_order_relaxed);
-        uint64_t changed = atomic_load(&g_rt_size_frame);
+        uint64_t changed = rt_changed_frame();
         /* Each target's own idle time counts, not the time since the latest change: before (2026-10-23), every new size
            change pushed the release of all older sizes' targets out by another STOR_RT_IDLE_FRAMES, so switching render
            resolutions every few seconds kept every size's set (1.1-1.8 GB with six sizes at 2560x1440 output) until the
@@ -13407,7 +13416,7 @@ static void scene_size_note(__unsafe_unretained NvShader *fs) {   // the compose
     id<MTLTexture> src = (__bridge id<MTLTexture>)tex_fast(tid); if (!src) return;
     uint32_t w = (uint32_t)src.width, h = (uint32_t)src.height;
     uint32_t ow = atomic_exchange(&g_scene_w, w), oh = atomic_exchange(&g_scene_h, h);
-    if (ow != w || oh != h) MLOG("internal resolution (the scene the compose draw samples): %ux%u", w, h);
+    if (ow != w || oh != h) { MLOG("internal resolution (the scene the compose draw samples): %ux%u", w, h); if (ow) atomic_store(&g_rt_scene_frame, atomic_load(&g_cur_frame)); }
 }
 static int mfxup_draw(NvProg *pr) {
     render_note_observed(pr);
@@ -19134,7 +19143,7 @@ int botw_wb_newer(const void *mem, uint64_t gen) {
    change, targets last drawn before it (old size, waiting for stor_sweep), and the rest; interpolation's own textures,
    cached and retired interpolators; the per-object motion arenas; the residency set and the deferred-release queue. */
 void mtl_mem_report(const char *tag) {
-    uint64_t frame = atomic_load(&g_cur_frame), changed = atomic_load(&g_rt_size_frame);
+    uint64_t frame = atomic_load(&g_cur_frame), changed = rt_changed_frame();
     uint64_t cur_b = 0, old_b = 0, other_b = 0; int cur_n = 0, old_n = 0, other_n = 0;
     enum { G = 12 }; struct { uint32_t w, h; uint64_t b; int n; } big[G]; int ng = 0;
     pthread_mutex_lock(&g_smu);

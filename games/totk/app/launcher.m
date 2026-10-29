@@ -406,17 +406,19 @@ int main(int argc, char **argv) {
         setenv("TOTK_GPU_MIDCLEAR", "1", 1);
         /* 5000 MB, more with the 4K maximum output (settings: display.headroom 4K, or Auto on 16 GB): a 4K canvas alone runs
            at 4.5-4.9 GB and a size switch holds old and new targets for a moment (stopped at 5023 MB, 2026-10-20). Never
-           above the runtime's own default, 40% of the memory. */
+           above the runtime's own default, half of the memory (40% until 2026-10-28). */
         { uint64_t mem = 0; size_t len = sizeof mem; sysctlbyname("hw.memsize", &mem, &len, NULL, 0);
           const char *out = getenv("TOTK_OUTPUT_RES");
           int big = out ? !strncmp(out, "3840", 4) : mem >= (16ULL << 30);
-          unsigned budget = big ? 6500 : 5000, cap = (unsigned)((mem / 5 * 2) >> 20);
+          unsigned budget = big ? 6500 : 5000, cap = (unsigned)((mem / 2) >> 20);
           /* A 3D world above 1440p (settings: Maximum render resolution): its texture heap passes the 1 GiB a memory pool's
-             GPU buffer may otherwise take, and its targets need more room: the 40% cap itself, at most 8000 MB. */
+             GPU buffer may otherwise take, and its targets need more room: the cap itself, at most 12000 MB (40% and 8000 MB
+             until 2026-10-28: 7372 MB stopped a 2560x1600 world on the 18 GB M3 Pro twice, at 8.1 GB, after the game's
+             own resolution change; the kernel panics happened at about 15 GB). */
           const char *world = getenv("TOTK_RENDER_RESERVE"); unsigned ww = 0, wh = 0;
           if (world && sscanf(world, "%ux%u", &ww, &wh) == 2 && (uint64_t)ww * wh > 2560u * 1440u) {
               setenv("TOTK_POOL_BUFFER_MAX_MB", "2048", 0);
-              budget = cap && cap < 8000 ? cap : 8000;
+              budget = cap && cap < 12000 ? cap : 12000;
           }
           if (cap && budget > cap) budget = cap;
           setenv("TOTK_GPU_BUDGET_MB", [NSString stringWithFormat:@"%u", budget].UTF8String, 1); }
