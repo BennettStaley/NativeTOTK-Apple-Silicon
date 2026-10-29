@@ -41,7 +41,7 @@ enum { SETTINGS_NPAGES = sizeof SETTINGS_PAGES / sizeof *SETTINGS_PAGES };
 /* Places (2026-10-28): the teleport sections had their own tab once Tools held nine and the bar cut their names. */
 static const char *const SETTINGS_TABS[] = {"Game", "Graphics", "Content", "Tools", "Places"};
 enum { SETTINGS_NTABS = sizeof SETTINGS_TABS / sizeof *SETTINGS_TABS };
-enum { MENU_SETTINGS, MENU_MODS, MENU_SAVES, MENU_CHEATS, MENU_SPAWN, MENU_TELEPORT, MENU_TOWERS, MENU_SHRINES, MENU_LIGHTROOTS, MENU_TEARS };
+enum { MENU_SETTINGS, MENU_MODS, MENU_SAVES, MENU_CHEATS, MENU_SPAWN, MENU_TELEPORT, MENU_TOWERS, MENU_SHRINES, MENU_LIGHTROOTS, MENU_TEARS, MENU_KOROKS };
 typedef struct { int tab; const char *name; int kind; } SettingsSection;
 static const SettingsSection SETTINGS_SECTIONS[] = {
     {0, "Display", MENU_SETTINGS}, {0, "Frame rate", MENU_SETTINGS}, {0, "Controls", MENU_SETTINGS}, {0, "Audio", MENU_SETTINGS},
@@ -50,7 +50,7 @@ static const SettingsSection SETTINGS_SECTIONS[] = {
     {2, "Mods", MENU_MODS}, {2, "Saves", MENU_SAVES}, {2, "Downloads", MENU_SETTINGS},
     {3, "Cheats", MENU_CHEATS}, {3, "Spawn", MENU_SPAWN}, {3, "World", MENU_SETTINGS}, {3, "Camera", MENU_SETTINGS},
     {4, "Teleport", MENU_TELEPORT}, {4, "Towers", MENU_TOWERS}, {4, "Shrines", MENU_SHRINES}, {4, "Lightroots", MENU_LIGHTROOTS},
-    {4, "Dragon's Tears", MENU_TEARS},
+    {4, "Dragon's Tears", MENU_TEARS}, {4, "Koroks", MENU_KOROKS},
 };
 enum { SETTINGS_NSECTIONS = sizeof SETTINGS_SECTIONS / sizeof *SETTINGS_SECTIONS };
 /* The first section of a tab and how many it has. */

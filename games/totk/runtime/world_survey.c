@@ -7,6 +7,7 @@
 #include "actor_spawn.h"
 #include "game_version.h"
 #include "shrine_auto.h"
+#include "korok_auto.h"
 #include <ctype.h>
 #include <limits.h>
 #include <mach/mach.h>
@@ -206,6 +207,14 @@ int runtime_autoshrine_command(const char *line) {   /* "ctl state | peek | ..."
     fprintf(stderr, "[ctl] rejected: game state and movement commands are TOTK only: %s", line); return 1;
 }
 void runtime_autoshrine_romfs(const char *path) { (void)path; }
+int runtime_autokorok_available(void) { return 0; }   /* auto korok: the TOTK koroks only */
+int runtime_autokorok_start(int one) { (void)one; return 0; }
+int runtime_autokorok_only(uint64_t hash) { (void)hash; return 0; }
+void runtime_autokorok_stop(void) { }
+void runtime_autokorok_set_type(int type, int on) { (void)type; (void)on; }
+int runtime_autokorok_type_on(int type) { (void)type; return 0; }
+int runtime_autokorok_status(char *text, size_t size) { if (size) snprintf(text, size, "Not available in this game"); return 0; }
+int runtime_autokorok_counts(int *found, int *total, int types) { for (int t = 0; t < types; t++) found[t] = total[t] = 0; return -1; }
 #else
 enum { SCENE_SLOT = GAME_ADDR(0x4663f08), FORCE_MATRIX = GAME_ADDR(0x69a18c), ACTOR_POS = GAME_ACTOR_POS, ACTOR_ROT = GAME_ACTOR_ROT };
 static uintptr_t survey_main;
@@ -237,6 +246,7 @@ static _Atomic uint64_t noclip_guard_until_ns;   /* noclip_guard (1.4.3); read o
 static pthread_mutex_t noclip_goto_lock = PTHREAD_MUTEX_INITIALIZER;
 static struct { int pending, direct; float xyz[3]; } noclip_goto;   /* a teleport for the next tick (runtime_noclip_goto) */
 static _Atomic int as_active;   /* auto shrine is running (below, before runtime_survey_tick) */
+static _Atomic int ak_active, ak_no_fall;   /* auto korok is running; ak_no_fall: noclip_guard leaves the falls alone (a korok's dive) */
 #if defined(TOTK_GAME_V143)
 static void event_init(Module *m);   /* "ctl event" (below, by the other game-control commands) */
 #endif
@@ -618,12 +628,14 @@ int runtime_survey_command(const char *line) {
     return 1;
 }
 void runtime_autoshrine_cancel_user(void);
+void runtime_autokorok_cancel_user(void);
 void runtime_survey_cancel_user(void) {
     runtime_autoshrine_cancel_user();   /* a run of auto shrine stops too (world_survey.c, below) */
+    runtime_autokorok_cancel_user();    /* and of auto korok */
     if (!atomic_load_explicit(&runtime_survey_pending, memory_order_relaxed)) return;
     pthread_mutex_lock(&survey_lock);
     request.kind = 0; hold_left = 0; route_on = 0; cam_off(); atomic_store(&runtime_survey_pending, 0);
-    if (atomic_load(&runtime_spawn_waiting) || atomic_load(&noclip_wanted) || noclip.holding || runtime_now_ns() < atomic_load(&noclip_guard_until_ns) || atomic_load(&as_active)) atomic_store(&runtime_survey_pending, 1);   /* spawns, noclip (and its landing) and auto shrine (its own stop) are not cancelled here */
+    if (atomic_load(&runtime_spawn_waiting) || atomic_load(&noclip_wanted) || noclip.holding || runtime_now_ns() < atomic_load(&noclip_guard_until_ns) || atomic_load(&as_active) || atomic_load(&ak_active)) atomic_store(&runtime_survey_pending, 1);   /* spawns, noclip (and its landing), auto shrine and auto korok (their own stops) are not cancelled here */
     fprintf(stderr, "[survey] cancelled: user input\n");
     pthread_mutex_unlock(&survey_lock);
 }
@@ -1595,6 +1607,7 @@ int runtime_autoshrine_finish(int shrine) {
 int runtime_autoshrine_start(int one) {
     if (!noclip_force) { fprintf(stderr, "[autoshrine] not started: needs noclip (1.0.0 or 1.4.3)\n"); return 0; }
     int idle = 0;
+    if (atomic_load(&ak_active)) { fprintf(stderr, "[autoshrine] not started: auto korok is running\n"); return 0; }
     if (!atomic_compare_exchange_strong(&as_active, &idle, 1)) { fprintf(stderr, "[autoshrine] already running\n"); return 0; }
     pthread_mutex_lock(&as_status_lock); snprintf(as_status, sizeof as_status, "Starting: reading the shrines…"); pthread_mutex_unlock(&as_status_lock);
     pthread_t t;
@@ -1696,9 +1709,10 @@ static void noclip_no_fall(uintptr_t actor) {
 }
 static void noclip_guard(uintptr_t actor) {
     static unsigned refills; uint64_t now = runtime_now_ns();
-    if (atomic_load(&noclip_wanted) || noclip.holding) atomic_store(&noclip_guard_until_ns, now + NOCLIP_GUARD_S * 1000000000ull);
+    /* auto korok keeps Link guarded through each korok's steps (walking, a lift, the discovery event), not only in noclip */
+    if (atomic_load(&noclip_wanted) || noclip.holding || atomic_load(&ak_active)) atomic_store(&noclip_guard_until_ns, now + NOCLIP_GUARD_S * 1000000000ull);
     if (now >= atomic_load(&noclip_guard_until_ns) || !actor) return;
-    noclip_no_fall(actor);
+    if (!atomic_load(&ak_no_fall)) noclip_no_fall(actor);
     uintptr_t life_component = ctl_component(actor, COMPONENT_LIFE), life = life_component ? read_ptr(life_component + 0x1830) : 0;
     int32_t hp[2];
     if (!life || !read_mem(life + 0x8, &hp[0], 4) || !read_mem(life + 0x18, &hp[1], 4)) return;
@@ -1906,7 +1920,10 @@ static void ctl_event(const char *args) {
     fprintf(stderr, "[ctl-done] event %s refused: not available in " TOTK_GAME_VERSION " (1.4.3 only)\n", name);
 #endif
 }
+static int autokorok_command(const char *args);   /* "autokorok ..." (auto korok, below) */
 int runtime_autoshrine_command(const char *line) {
+    if (!strncmp(line, "autokorok", 9) && (!line[9] || isspace((unsigned char)line[9]))) return autokorok_command(line + 9);
+    if (!strncmp(line, "ctl autokorok", 13) && (!line[13] || isspace((unsigned char)line[13]))) return autokorok_command(line + 13);
     int ctl = !strncmp(line, "ctl ", 4);
     if (!ctl && strncmp(line, "autoshrine ", 11)) return 0;
     const char *tag = ctl ? "ctl" : "as", *rest = line + (ctl ? 4 : 11);
@@ -1966,6 +1983,498 @@ int runtime_autoshrine_command(const char *line) {
     else fprintf(stderr, "[autoshrine] rejected: expected state, peek, face, walk, info, watch, start, one, finish N, stop, status, chests on|off or skip x|b|none\n");
     return 1;
 }
+/* ---- Auto korok (Places › Koroks; korok_auto.h has what the game's files say): one korok after another, the nearest
+   first, each by its kind's steps (korok_plan): noclip flies Link there and holds him in the puzzle's Areas, sets him
+   down on blocks and stumps, lets him fall for a dive; a rock is walked up to and lifted with A, as a player does. The
+   game finds the korok itself: a korok is found when its discovery event (DmF_SY_HideCharaDiscovery, read from the
+   game's EventMgr as "ctl state" does; 1.4.3) plays; its messages are advanced with B (A would talk to the korok again
+   once it is over), and a rock still held after it is put down with B. Every step is one way of solving the puzzle, and
+   the log names the step the event came in ("[autokorok] discovery event in step N, OP: <method>"), which says what the
+   game counts: a body held there by noclip, landed there, or walked in. No event after the last step: the korok failed
+   (logged, left for this run), Link set down, the next one. Link is guarded the whole run (noclip_guard: life refilled,
+   falls reset; not during a dive's fall). Any key, button or stick of the player's stops it, as auto shrine. 1.4.3 only
+   (the event's name). Frame-end thread, except the loading and the commands. ---- */
+static KorokInfo ak_korok[KOROKS];
+static int ak_count;
+static _Atomic int ak_loaded;            /* 0 not read, 1 reading, 2 read, 3 none in this game */
+static _Atomic int ak_request;           /* 1 run, 2 one korok, 3 stop: for the frame-end thread */
+static _Atomic int ak_want = -1;         /* with 2: that korok (index), -1 the nearest */
+static _Atomic uint64_t ak_want_hash;    /* runtime_autokorok_only: the korok's hash, found once the koroks are read */
+static _Atomic unsigned ak_types_on = (1u << KOROK_NTYPES) - 1;   /* KOROK_TYPES bits: every kind on at every start */
+static _Atomic int ak_cancel;
+static _Atomic uint32_t ak_seq_found;    /* DmF_SY_HideCharaDiscovery's flow opened (the first discovery of a session) */
+static pthread_mutex_t ak_status_lock = PTHREAD_MUTEX_INITIALIZER;
+static char ak_status[600] = "Not started";
+enum { AK_OFF, AK_PICK, AK_STEP, AK_EVENT, AK_AFTER, AK_STOPPING };
+enum { AK_FAILS_IN_A_ROW = 5 };
+static struct {
+    int state, one, target, k, step, phase, done, failed, failed_row, flight, flown, presses, quiet, unnamed;
+    double started, t0, step_t, phase_t, last_tick, korok_t0, korok_limit, quiet_t, stall_t, run_save;
+    float stall_pos[3], probe[3];
+    uint32_t seq_found;
+    KorokPlan plan;
+    uint8_t run[KOROKS], skip[KOROKS], found[KOROKS];
+    int done_k[256], ndone;   /* found in this run, for the save's confirmation */
+    char why[300], failed_list[700], other_event[132];
+} ak;
+static const char *ak_type_name(int k) { return k >= 0 && ak_korok[k].type >= 0 ? KOROK_TYPES[ak_korok[k].type].name : "?"; }
+static void ak_say(void) {
+    char line[600];
+    if (ak.state != AK_OFF && ak.k >= 0) {
+        const KorokStep *s = ak.state == AK_STEP && ak.step < ak.plan.n ? &ak.plan.s[ak.step] : NULL;
+        snprintf(line, sizeof line, "Running: %s korok, %s · %d found, %d failed this run", ak_type_name(ak.k),
+                 s ? s->method : ak.state == AK_EVENT ? "its discovery (advancing the messages)" : ak.state == AK_AFTER ? "putting the rock down" : "on to the next", ak.done, ak.failed);
+    } else if (ak.state != AK_OFF) snprintf(line, sizeof line, "Running: choosing the next korok · %d found, %d failed this run", ak.done, ak.failed);
+    else snprintf(line, sizeof line, "%s · %d found, %d failed%s%s", ak.why[0] ? ak.why : "Stopped", ak.done, ak.failed, ak.failed ? ": " : "", ak.failed_list);
+    pthread_mutex_lock(&ak_status_lock); snprintf(ak_status, sizeof ak_status, "%s", line); pthread_mutex_unlock(&ak_status_lock);
+}
+/* The game's current event, as "ctl state" reads it: 1 one plays (its name into name, "-" when it cannot be read), 0 none,
+   -1 not known (not 1.4.3, or the EventMgr is not up). */
+static int ak_event(char *name, size_t size) {
+    snprintf(name, size, "-");
+#if defined(TOTK_GAME_V143)
+    uintptr_t mgr = survey_main ? read_ptr(survey_main + STATE_EVENT_MGR) : 0, current = 0;
+    if (!mgr || !read_mem(mgr + 0x58, &current, sizeof current)) return -1;
+    if (current && read_ptr(mgr + 0xb0) == mgr + 0xbc && !ctl_text(mgr + 0xbc, name, size)) snprintf(name, size, "-");
+    return current != 0;
+#else
+    return -1;
+#endif
+}
+/* The map the game has loaded ("MainField", "MinusField", "SmallDungeon/Dungeon009"), as "ctl state" reads it; "" unknown. */
+static void ak_map(char *map, size_t size) {
+    map[0] = 0;
+#if defined(TOTK_GAME_V143)
+    uintptr_t banc = survey_main ? read_ptr(survey_main + STATE_BANC) : 0, holder = banc ? read_ptr(banc + 0x28) : 0, info = holder ? read_ptr(holder + 0x150) : 0;
+    uint8_t ready = 0;
+    if (info && read_mem(info + 0x224, &ready, 1) && (ready & 1)) ctl_text(read_ptr(info + 0x158), map, size);
+#else
+    (void)size;
+#endif
+}
+/* Whether the map around Link has streamed in (QueryBancLoadMgrIsStable, as "ctl state" reads it): 1, 0, or -1 not known. */
+static int ak_stable(void) {
+#if defined(TOTK_GAME_V143)
+    uintptr_t module = survey_main ? read_ptr(survey_main + SCENE_SLOT) : 0, scene = module ? read_ptr(module + 0x1e8) : 0, components = 0, loader = 0;
+    int count = 0; uint32_t flags = 0;
+    if (scene && read_mem(scene + 0x50, &count, 4) && count > SCENE_BANC_LOAD && count <= 256) components = read_ptr(scene + 0x58);
+    if (components) loader = read_ptr(components + SCENE_BANC_LOAD * 8u);
+    if (loader && read_mem(loader + 0xed30, &flags, 4)) return flags >> 2 & 1;
+#endif
+    return -1;
+}
+static int ak_flying(void) {
+    pthread_mutex_lock(&noclip_goto_lock); int pending = noclip_goto.pending; pthread_mutex_unlock(&noclip_goto_lock);
+    return pending || noclip_flight.on;
+}
+/* Held by noclip at to: noclip on (holding him from where he is), a flight when it is more than 40 m (up, across, down:
+   the world loads on the way), else a straight line at 30 m/s. 1 once he is held there. */
+static int ak_hold_at(const float to[3], double dt) {
+    if (!atomic_load(&noclip_wanted)) { runtime_noclip_set(1); dm_gfx_camera_want(1); ak.flight = 0; return 0; }
+    if (!noclip.holding) return 0;
+    if (ak.flight) { if (ak_flying()) return 0; ak.flight = 0; }
+    float d = landmark_distance(noclip.xyz, to), step = 30 * (float)dt;
+    if (d > 40 && !ak.flown) { runtime_noclip_goto(to); ak.flight = ak.flown = 1; return 0; }
+    if (d > step) { for (int c = 0; c < 3; c++) noclip.xyz[c] += (to[c] - noclip.xyz[c]) * step / d; return 0; }
+    memcpy(noclip.xyz, to, 12);
+    return 1;
+}
+/* Let go in the air without the soft landing (a dive, or the discovery event, which opens the paraglider itself). */
+static void ak_let_go(const char *why) {
+    if (!atomic_load(&noclip_wanted) && !noclip.holding) return;
+    if (atomic_load(&noclip_wanted)) runtime_noclip_set(0);
+    dm_gfx_camera_want(1);
+    pthread_mutex_lock(&noclip_goto_lock); noclip_goto.pending = 0; pthread_mutex_unlock(&noclip_goto_lock);
+    fprintf(stderr, "[autokorok] let go at %.1f,%.1f,%.1f without the soft landing: %s\n", noclip.xyz[0], noclip.xyz[1], noclip.xyz[2], why);
+    noclip.holding = 0; noclip_land.on = 0; noclip_flight.on = 0;
+}
+static void ak_go(int state, double now) {
+    as_walk(0, NULL); runtime_input_lease_release_all();
+    ak.state = state; ak.t0 = now; ak.phase = 0; ak.phase_t = now;
+    ak_say();
+}
+/* The run ends: every key let go; noclip off (a flight first ends on the ground; the soft landing sets him down from
+   wherever he is held); a summary and a sound. */
+static void ak_end(int ok, const char *why, double now) {
+    as_walk(0, NULL); runtime_input_lease_release_all(); atomic_store(&ak_no_fall, 0);
+    snprintf(ak.why, sizeof ak.why, "%s%s", ok ? "Finished: " : "", why);
+    fprintf(stderr, "[autokorok] %s\n", ak.why);
+    fprintf(stderr, "[autokorok] summary: %d found, %d failed%s%s%s, %.0f s\n", ak.done, ak.failed, ak.failed ? " (" : "", ak.failed_list, ak.failed ? ")" : "", now - ak.started);
+    runtime_front_run_sound(ok);
+    if (atomic_load(&noclip_wanted) && ak_flying()) { ak_go(AK_STOPPING, now); return; }
+    if (atomic_load(&noclip_wanted)) runtime_noclip_set(0);   /* the soft landing */
+    else dm_gfx_camera_want(0);
+    ak_go(AK_OFF, now); atomic_store(&ak_active, 0); ak_say();
+}
+static void ak_step_begin(double now) {
+    as_walk(0, NULL); runtime_input_lease_release_all();
+    ak.step_t = now; ak.phase = 0; ak.phase_t = now; ak.flight = ak.flown = 0;
+    const KorokStep *s = &ak.plan.s[ak.step];
+    if (s->op == KS_WAIT || s->op == KS_DROP) fprintf(stderr, "[autokorok] step %d of %d, %s: %s (%.1f s)\n", ak.step + 1, ak.plan.n, KOROK_STEP_TEXT[s->op], s->method, s->secs);
+    else fprintf(stderr, "[autokorok] step %d of %d, %s: %s, at %.1f,%.1f,%.1f (%.1f s)\n", ak.step + 1, ak.plan.n, KOROK_STEP_TEXT[s->op], s->method, s->at[0], s->at[1], s->at[2], s->secs);
+    char shot[40]; snprintf(shot, sizeof shot, "korok-%d-%s", ak.step + 1, KOROK_STEP_TEXT[s->op]); as_shot(shot);
+    ak_say();
+}
+/* A korok given up: logged with the step and the reason, kept out for the rest of the run; Link set down; the next one.
+   AK_FAILS_IN_A_ROW in a row end the run (something is wrong in general, not with one korok). */
+static void ak_fail(const char *what, double now) {
+    const KorokInfo *k = &ak_korok[ak.k]; const KorokStep *s = ak.step < ak.plan.n ? &ak.plan.s[ak.step] : NULL;
+    fprintf(stderr, "[autokorok] failed: %s korok %llu at %.1f,%.1f,%.1f, step %d of %d%s%s: %s\n", ak_type_name(ak.k), (unsigned long long)k->hash,
+            k->pos[0], k->pos[1], k->pos[2], ak.step + 1, ak.plan.n, s ? ", " : "", s ? s->method : "", what);
+    as_walk(0, NULL); runtime_input_lease_release_all(); atomic_store(&ak_no_fall, 0);
+    ak.run[ak.k] = KOROK_SKIP_FAILED; ak.failed++; ak.failed_row++;
+    size_t o = strlen(ak.failed_list);
+    if (o + 80 < sizeof ak.failed_list) snprintf(ak.failed_list + o, sizeof ak.failed_list - o, "%s%s %llu", o ? ", " : "", ak_type_name(ak.k), (unsigned long long)k->hash);
+    if (atomic_load(&noclip_wanted) && !ak_flying()) runtime_noclip_set(0);   /* set down (the soft landing) before the next */
+    if (ak.one || ak.target >= 0) { char why[300]; snprintf(why, sizeof why, "Stopped: the korok failed: %s", what); ak_end(0, why, now); return; }
+    if (ak.failed_row >= AK_FAILS_IN_A_ROW) { ak_end(0, "Stopped: five koroks failed in a row", now); return; }
+    ak_go(AK_PICK, now);
+}
+static void ak_step_next(double now) {
+    if (++ak.step >= ak.plan.n) { ak_fail("no discovery event after its last step", now); return; }
+    ak_step_begin(now);
+}
+static void ak_pick(uintptr_t actor, double now) {
+    float at[3]; char map[160];
+    if (!as_pos(actor, at) || (fabsf(at[0]) < 1 && fabsf(at[2]) < 1)) { if (now - ak.t0 > 60) ak_end(0, "Stopped: no player to start from (60 s)", now); return; }
+    ak_map(map, sizeof map);
+    if (!strncmp(map, "MinusField", 10) || strstr(map, "Dungeon")) {   /* the Depths, a shrine, a temple: the koroks are on the surface and in the sky */
+        char why[260]; snprintf(why, sizeof why, "Stopped: Link is in %s; the koroks are on the surface and in the sky (go there first)", map); ak_end(0, why, now); return;
+    }
+    const char *profile = getenv("TOTK_PROFILE_DIR");
+    int flags = korok_found_read(profile, ak_korok, ak_count, ak.found), found = 0;
+    for (int i = 0; i < ak_count; i++) found += ak.found[i];
+    if (ak.ndone) {   /* the koroks found in this run: what the newest save says of them (the game saves them at its next autosave) */
+        int confirmed = 0; for (int i = 0; i < ak.ndone; i++) confirmed += ak.found[ak.done_k[i]];
+        double saved = as_save_time();
+        if (saved > ak.run_save) fprintf(stderr, "[autokorok] the newest save confirms %d of the %d koroks found in this run (IsAppearKorok)\n", confirmed, ak.ndone);
+    }
+    static Landmark lm[LANDMARKS]; LandmarkProgress progress = {0, 0, 0};
+    int lock = settings_get("teleport.story_lock") != 0 && profile && landmarks_state_read(profile, lm, &progress) >= 0 && progress.known && !progress.island_done;
+    unsigned types = ak.target >= 0 ? (1u << KOROK_NTYPES) - 1 : atomic_load(&ak_types_on);   /* a korok chosen by hash: whatever its kind's switch */
+    int count[KOROK_SKIPS] = {0};
+    for (int i = 0; i < ak_count; i++) count[ak.skip[i] = (uint8_t)korok_skip(&ak_korok[i], ak.found[i], types, lock && !ak_korok[i].island, ak.run[i])]++;
+    char left[400] = ""; size_t o = 0;
+    for (int r = 1; r < KOROK_SKIPS && o < sizeof left - 1; r++) if (count[r]) o += (size_t)snprintf(left + o, sizeof left - o, "%s%d %s", o ? ", " : "", count[r], KOROK_SKIP_TEXT[r]);
+    fprintf(stderr, "[autokorok] %d koroks to do; %d IsAppearKorok flags in the save, %d found; map %s; left out: %s\n", count[KOROK_GO], flags, found, map[0] ? map : "?", left[0] ? left : "none");
+    if (ak.target >= 0 && ak.target < ak_count && ak.skip[ak.target] != KOROK_GO) {
+        char why[300]; snprintf(why, sizeof why, "Refused: that korok (%llu) is left out: %s", (unsigned long long)ak_korok[ak.target].hash, KOROK_SKIP_TEXT[ak.skip[ak.target]]);
+        if (ak.run[ak.target] == KOROK_SKIP_DONE) ak_end(1, "the korok is found", now); else ak_end(0, why, now);
+        return;
+    }
+    if ((ak.one || ak.target >= 0) && ak.done) { ak_end(1, "the korok is found", now); return; }
+    int k = ak.target >= 0 && ak.target < ak_count ? ak.target : korok_next(ak_korok, ak_count, ak.skip, at);
+    if (k < 0) { ak.k = -1; ak_end(1, "no korok left to do", now); return; }
+    const KorokInfo *ko = &ak_korok[k];
+    ak.k = k; ak.step = 0; korok_plan(ko, at, &ak.plan);
+    if (!ak.plan.n) { ak.run[k] = KOROK_SKIP_FAILED; fprintf(stderr, "[autokorok] korok %llu has no steps; left out\n", (unsigned long long)ko->hash); ak_go(AK_PICK, now); return; }
+    float d = landmark_distance(ko->pos, at);
+    ak.korok_t0 = now; ak.korok_limit = 150 + d / 60; ak.seq_found = atomic_load(&ak_seq_found); ak.other_event[0] = 0; ak.unnamed = 0;
+    fprintf(stderr, "[autokorok] next: %s korok %llu (HideType %d, %s%s%s) at %.1f,%.1f,%.1f, %.0f m away, %d steps\n", ak_type_name(k), (unsigned long long)ko->hash, ko->hide,
+            ko->fly ? "Npc_HiddenKorokFly" : "Npc_HiddenKorokGround", ko->sky ? ", a sky island" : "", ko->island ? ", Great Sky Island" : "", ko->pos[0], ko->pos[1], ko->pos[2], d, ak.plan.n);
+    if (ko->time_limit > 0) fprintf(stderr, "[autokorok] the race's time limit: %.0f s\n", ko->time_limit);
+    ak_go(AK_STEP, now); ak_step_begin(now);
+}
+/* The discovery event (or its flow opening) since the korok was chosen; another event is logged once. */
+static int ak_discovery(double now) {
+    char name[132]; int e = ak_event(name, sizeof name);
+    if (atomic_load(&ak_seq_found) != ak.seq_found) { fprintf(stderr, "[autokorok] DmF_SY_HideCharaDiscovery's flow opened\n"); return 1; }
+    if (e != 1) return 0;
+    if (!strcmp(name, "DmF_SY_HideCharaDiscovery")) return 1;
+    if (!strcmp(name, "-")) {   /* the name did not read: two seconds of an event no step starts is taken as the discovery */
+        if (!ak.unnamed) { ak.unnamed = 1; ak.quiet_t = now; fprintf(stderr, "[autokorok] an event plays and its name does not read\n"); }
+        return now - ak.quiet_t >= 2;
+    }
+    if (strcmp(name, ak.other_event)) { snprintf(ak.other_event, sizeof ak.other_event, "%s", name); fprintf(stderr, "[autokorok] another event plays: %s (not the discovery; the steps go on)\n", name); }
+    return 0;
+}
+static void ak_tick_step(uintptr_t actor, double now, double dt) {
+    const KorokStep *s = &ak.plan.s[ak.step]; float at[3]; int have = as_pos(actor, at);
+    double t = now - ak.step_t, c = now - ak.phase_t;
+    if (ak_discovery(now)) {
+        fprintf(stderr, "[autokorok] discovery event in step %d of %d, %s: %s (%.1f s into it)%s%.1f,%.1f,%.1f\n", ak.step + 1, ak.plan.n, KOROK_STEP_TEXT[s->op], s->method, t,
+                have ? "; Link at " : "", have ? at[0] : 0, have ? at[1] : 0, have ? at[2] : 0);
+        atomic_store(&ak_no_fall, 0); ak.quiet = 0; ak.presses = 0;
+        if (atomic_load(&noclip_wanted) || noclip.holding) ak_let_go("the discovery event takes over");
+        ak_go(AK_EVENT, now); return;
+    }
+    if (now - ak.korok_t0 > ak.korok_limit) { char why[120]; snprintf(why, sizeof why, "took longer than %.0f s", ak.korok_limit); ak_fail(why, now); return; }
+    switch (s->op) {
+    case KS_FLY: case KS_HOLD: case KS_SNAP:
+        if (ak.phase == 0) {
+            if (s->op == KS_SNAP) {   /* from wherever he is (standing, too): noclip on, then there in one frame */
+                if (!atomic_load(&noclip_wanted)) { runtime_noclip_set(1); dm_gfx_camera_want(1); return; }
+                if (!noclip.holding) return;
+                fprintf(stderr, "[autokorok] put at %.1f,%.1f,%.1f at once, from %.1f,%.1f,%.1f\n", s->at[0], s->at[1], s->at[2], noclip.xyz[0], noclip.xyz[1], noclip.xyz[2]);
+                memcpy(noclip.xyz, s->at, 12);
+            } else if (!ak_hold_at(s->at, dt)) { if (t > 30 + landmark_distance(noclip.xyz, s->at) / 60) ak_fail("the flight did not arrive", now); return; }
+            ak.phase = 1; ak.phase_t = now; return;
+        }
+        memcpy(noclip.xyz, s->at, 12);
+        if (c < s->secs) return;
+        if (s->op == KS_FLY && s->secs >= 1.5f) {   /* a far place: also until the map around him has streamed in (8 s more at most) */
+            int stable = ak_stable();
+            if (stable == 0 && c < s->secs + 8) return;
+            if (stable == 0) fprintf(stderr, "[autokorok] the map still streams in after %.1f s; going on\n", c);
+        }
+        ak_step_next(now); return;
+    case KS_SWEEP:
+        if (ak.phase == 0) { if (!ak_hold_at(s->at, dt)) return; ak.phase = 1; return; }
+        { float d = landmark_distance(noclip.xyz, s->to), step = 3 * (float)dt;
+          if (d > step) { for (int i = 0; i < 3; i++) noclip.xyz[i] += (s->to[i] - noclip.xyz[i]) * step / d; return; }
+          memcpy(noclip.xyz, s->to, 12); }
+        ak_step_next(now); return;
+    case KS_LAND:
+        if (ak.phase == 0) { if (!ak_hold_at(s->at, dt)) return; runtime_noclip_set(0); dm_gfx_camera_want(1); ak.phase = 1; ak.phase_t = now; return; }
+        if (ak.phase == 1) {   /* the soft landing lets go once he stands (world_survey.c noclip_landing) */
+            if (noclip.holding && c < 30) return;
+            fprintf(stderr, "[autokorok] %s at %.1f,%.1f,%.1f after %.1f s (%.1f m from the step's place)\n", noclip.holding ? "still not standing" : "standing", at[0], at[1], at[2], c,
+                    have ? landmark_distance(at, s->at) : -1.0f);
+            ak.phase = 2; ak.phase_t = now; return;
+        }
+        if (c >= s->secs) ak_step_next(now);
+        return;
+    case KS_WALK: {   /* the left stick toward the point, from the camera's view (as_walk), until within to[0] m, stopped or the time is up */
+        if (atomic_load(&noclip_wanted) || noclip.holding) { if (atomic_load(&noclip_wanted)) { runtime_noclip_set(0); dm_gfx_camera_want(1); } ak.step_t = now; return; }
+        float d = have ? as_xz(at, s->at) : 99; int stalled = 0;
+        if (have && (now - ak.stall_t >= 0.5 || t < 0.05)) { stalled = t > 1 && landmark_distance(at, ak.stall_pos) < 0.1f; memcpy(ak.stall_pos, at, 12); ak.stall_t = now; }
+        if (d < s->to[0] || stalled || t > s->secs) {
+            fprintf(stderr, "[autokorok] walked %.1f s, now %.1f m from the point%s\n", t, d, d < s->to[0] ? "" : stalled ? " (stopped by something)" : " (time up)");
+            as_walk(0, NULL); ak_step_next(now); return;
+        }
+        as_walk(actor, s->at); return;
+    }
+    case KS_LIFT:   /* the camera behind him (ZL), a short push toward the rock (he turns to it), nothing held, then A held */
+        if (atomic_load(&noclip_wanted) || noclip.holding) { if (atomic_load(&noclip_wanted)) { runtime_noclip_set(0); dm_gfx_camera_want(1); } ak.step_t = ak.phase_t = now; return; }
+        if (ak.phase == 0) { as_key(AS_KEY_ZL, 0.15); ak.phase = 1; }
+        else if (ak.phase == 1 && c >= 0.5) { as_face(actor, s->at); ak.phase = 2; }
+        else if (ak.phase == 2 && c >= 0.9) { runtime_input_lease_release_all(); ak.phase = 3; }
+        else if (ak.phase == 3 && c >= 1.1) {
+            float rot[9] = {0}, dir[2] = {0, 0}, off = -1;
+            if (have && read_mem(actor + ACTOR_ROT, rot, sizeof rot)) {
+                shrine_unit_xz(at, s->at, dir); float fl = sqrtf(rot[2] * rot[2] + rot[8] * rot[8]);
+                if (fl > 1e-3f) off = acosf(fmaxf(-1, fminf(1, (rot[2] * dir[0] + rot[8] * dir[1]) / fl))) * 57.2958f;
+            }
+            as_key(AS_KEY_A, s->secs);
+            fprintf(stderr, "[autokorok] A for %.1f s at the rock, %.2f m away, facing %.0f degrees off it\n", s->secs, have ? as_xz(at, s->at) : -1.0f, off);
+            ak.phase = 4; ak.phase_t = now;
+        } else if (ak.phase == 4 && c >= s->secs + 0.2) ak_step_next(now);
+        return;
+    case KS_DROP:   /* let go without the soft landing, the falls not reset (a dive is a long fall into water); until he stops falling */
+        if (ak.phase == 0) { atomic_store(&ak_no_fall, 1); ak_let_go("a dive"); ak.phase = 1; ak.phase_t = now; if (have) memcpy(ak.probe, at, 12); return; }
+        if (c >= 0.5 && have) {
+            float fell = ak.probe[1] - at[1]; memcpy(ak.probe, at, 12); ak.phase_t = now;
+            if ((t > 1.5 && fabsf(fell) < 0.05f) || t > s->secs) {
+                atomic_store(&ak_no_fall, 0);
+                fprintf(stderr, "[autokorok] the fall ended at %.1f,%.1f,%.1f after %.1f s\n", at[0], at[1], at[2], t);
+                ak_step_next(now);
+            }
+        } else if (t > s->secs) { atomic_store(&ak_no_fall, 0); ak_step_next(now); }
+        return;
+    case KS_WAIT: default:
+        if (t >= s->secs) ak_step_next(now);
+        return;
+    }
+}
+static void autokorok_tick(uintptr_t actor, double now) {
+    int req = atomic_exchange(&ak_request, 0);
+    if (req == 3 && ak.state != AK_OFF && ak.state != AK_STOPPING) { ak_end(0, "Stopped: from the menu or the input file", now); return; }
+    if ((req == 1 || req == 2) && ak.state == AK_OFF) {
+        memset(&ak, 0, sizeof ak); ak.k = -1;
+        ak.one = req == 2; ak.target = atomic_exchange(&ak_want, -1); ak.started = now; ak.last_tick = now; ak.run_save = as_save_time();
+        atomic_store(&ak_cancel, 0); atomic_store(&ak_no_fall, 0); dm_gfx_camera_want(1); runtime_input_lease_release_all();
+        unsigned types = atomic_load(&ak_types_on); char on[200] = ""; size_t o = 0;
+        for (int t = 0; t < KOROK_NTYPES; t++) if (types >> t & 1) o += (size_t)snprintf(on + o, sizeof on - o, "%s%s", o ? ", " : "", KOROK_TYPES[t].word);
+        fprintf(stderr, "[autokorok] start: %s; kinds on: %s\n", ak.target >= 0 ? "one chosen korok" : ak.one ? "the nearest korok" : "every korok it can do, nearest first", on[0] ? on : "none");
+        ak_go(AK_PICK, now);
+    }
+    if (ak.state == AK_OFF) return;
+    double dt = now - ak.last_tick; ak.last_tick = now;
+    if (dt > 0.1) dt = 0.1;
+    if (atomic_exchange(&ak_cancel, 0) && now - ak.started > 2 && ak.state != AK_STOPPING) { ak_end(0, "Stopped: your own input (a key, a button or the stick)", now); return; }
+    double t = now - ak.t0;
+    switch (ak.state) {
+    case AK_PICK: ak_pick(actor, now); return;
+    case AK_STEP: ak_tick_step(actor, now, dt); return;
+    case AK_EVENT: {   /* the korok appears and talks: B every 0.8 s after the first 2.5 s; over after 1.5 s without an event */
+        char name[132]; int e = ak_event(name, sizeof name);
+        if (e == 1) ak.quiet = 0;
+        else if (!ak.quiet) { ak.quiet = 1; ak.quiet_t = now; }
+        if ((ak.quiet && now - ak.quiet_t >= 1.5 && t > 3) || (e < 0 && t > 20) || t > 90) {
+            fprintf(stderr, "[autokorok] the discovery is over after %.1f s (%d B presses)%s\n", t, ak.presses, t > 90 ? ": still playing after 90 s, going on" : "");
+            ak_go(AK_AFTER, now); return;
+        }
+        if (e == 1 && t > 2.5 && now - ak.phase_t >= 0.8) { as_key(AS_KEY_B, 0.1); ak.presses++; ak.phase_t = now; }
+        return;
+    }
+    case AK_AFTER: {   /* a rock is still lifted after the event: put down with B (then once more in case the first one came early) */
+        const KorokInfo *k = &ak_korok[ak.k]; int rock = k->hide == KOROK_HIDE_ROCK;
+        if (rock && ak.phase == 0 && t >= 0.6) { as_key(AS_KEY_B, 0.1); fprintf(stderr, "[autokorok] B to put the rock down\n"); ak.phase = 1; }
+        else if (rock && ak.phase == 1 && t >= 1.6) { as_key(AS_KEY_B, 0.1); ak.phase = 2; }
+        else if ((!rock && t >= 1) || (rock && ak.phase == 2 && t >= 2.6)) {
+            ak.run[ak.k] = KOROK_SKIP_DONE; ak.done++; ak.failed_row = 0;
+            if (ak.ndone < (int)(sizeof ak.done_k / sizeof *ak.done_k)) ak.done_k[ak.ndone++] = ak.k;
+            fprintf(stderr, "[autokorok] found: %s korok %llu in %.0f s (%d found in this run)\n", ak_type_name(ak.k), (unsigned long long)k->hash, now - ak.korok_t0, ak.done);
+            if (ak.one || ak.target >= 0) { ak_end(1, "the korok is found", now); return; }
+            ak_go(AK_PICK, now);
+        }
+        return;
+    }
+    case AK_STOPPING:   /* a flight first lands where it was going, then noclip off (the soft landing) */
+        if (t < 60 && ak_flying()) return;
+        if (atomic_load(&noclip_wanted)) runtime_noclip_set(0);
+        fprintf(stderr, "[autokorok] set down\n");
+        ak_go(AK_OFF, now); atomic_store(&ak_active, 0); ak_say();
+        return;
+    }
+}
+/* The koroks from the RomFS, once (a few hundred map files, about a second); 1 when there are some. */
+static int ak_load_sync(void) {
+    int expected = 0;
+    if (atomic_compare_exchange_strong(&ak_loaded, &expected, 1)) {
+        LandmarkRomfs rom = {runtime_romfs_file_count, runtime_romfs_file_name, runtime_romfs_host_read, runtime_romfs_zs_decompress};
+        double t0 = now_seconds();
+        ak_count = koroks_load(&rom, ak_korok, KOROKS);
+        int go[KOROK_NTYPES] = {0};
+        for (int i = 0; i < ak_count; i++) if (ak_korok[i].type >= 0 && korok_skip(&ak_korok[i], 0, ~0u, 0, 0) == KOROK_GO) go[ak_korok[i].type]++;
+        char line[300]; size_t o = 0;
+        for (int t = 0; t < KOROK_NTYPES; t++) o += (size_t)snprintf(line + o, sizeof line - o, "%s%d %s", t ? ", " : "", go[t], KOROK_TYPES[t].word);
+        fprintf(stderr, "[autokorok] read %d koroks from the game's files (%.2f s); the run can do %s\n", ak_count, now_seconds() - t0, line);
+        atomic_store(&ak_loaded, ak_count ? 2 : 3);
+    }
+    while (atomic_load(&ak_loaded) == 1) usleep(50000);
+    return atomic_load(&ak_loaded) == 2;
+}
+static int ak_index(uint64_t hash) { for (int i = 0; i < ak_count; i++) if (ak_korok[i].hash == hash) return i; return -1; }
+static void *ak_start_thread(void *arg) {
+    int one = (int)(intptr_t)arg;
+    if (!ak_load_sync()) {
+        fprintf(stderr, "[autokorok] not started: the koroks are not in this game's files\n");
+        pthread_mutex_lock(&ak_status_lock); snprintf(ak_status, sizeof ak_status, "Not available: the koroks are not in this game's files"); pthread_mutex_unlock(&ak_status_lock);
+        atomic_store(&ak_active, 0); return NULL;
+    }
+    uint64_t hash = atomic_exchange(&ak_want_hash, 0);
+    if (hash) {
+        int k = ak_index(hash);
+        if (k < 0) {
+            fprintf(stderr, "[autokorok] not started: no korok %llu in the game's files\n", (unsigned long long)hash);
+            pthread_mutex_lock(&ak_status_lock); snprintf(ak_status, sizeof ak_status, "Not started: no korok %llu", (unsigned long long)hash); pthread_mutex_unlock(&ak_status_lock);
+            atomic_store(&ak_active, 0); return NULL;
+        }
+        atomic_store(&ak_want, k);
+    }
+    atomic_store(&ak_request, one ? 2 : 1);
+    atomic_store_explicit(&runtime_survey_pending, 1, memory_order_release);
+    return NULL;
+}
+int runtime_autokorok_available(void) {
+#if defined(TOTK_GAME_V143)
+    return noclip_force != NULL && survey_main;
+#else
+    return 0;
+#endif
+}
+int runtime_autokorok_start(int one) {
+    if (!runtime_autokorok_available()) { fprintf(stderr, "[autokorok] not started: needs noclip and the game's event state (1.4.3)\n"); return 0; }
+    if (atomic_load(&as_active)) { fprintf(stderr, "[autokorok] not started: auto shrine is running\n"); return 0; }
+    int idle = 0;
+    if (!atomic_compare_exchange_strong(&ak_active, &idle, 1)) { fprintf(stderr, "[autokorok] already running\n"); return 0; }
+    pthread_mutex_lock(&ak_status_lock); snprintf(ak_status, sizeof ak_status, "Starting: reading the koroks…"); pthread_mutex_unlock(&ak_status_lock);
+    pthread_t t;
+    if (pthread_create(&t, NULL, ak_start_thread, (void *)(intptr_t)one)) { atomic_store(&ak_active, 0); return 0; }
+    pthread_detach(t);
+    return 1;
+}
+int runtime_autokorok_only(uint64_t hash) {
+    if (!hash || atomic_load(&ak_active)) return 0;
+    atomic_store(&ak_want_hash, hash);
+    if (runtime_autokorok_start(1)) return 1;
+    atomic_store(&ak_want_hash, 0); return 0;
+}
+void runtime_autokorok_stop(void) {
+    if (!atomic_load(&ak_active)) return;
+    atomic_store(&ak_request, 3); atomic_store_explicit(&runtime_survey_pending, 1, memory_order_release);
+}
+void runtime_autokorok_set_type(int type, int on) {
+    if (type < 0 || type >= KOROK_NTYPES) return;
+    if (on) atomic_fetch_or(&ak_types_on, 1u << type); else atomic_fetch_and(&ak_types_on, ~(1u << type));
+    fprintf(stderr, "[autokorok] %s koroks %s\n", KOROK_TYPES[type].word, on ? "on" : "off");
+}
+int runtime_autokorok_type_on(int type) { return type >= 0 && type < KOROK_NTYPES && (atomic_load(&ak_types_on) >> type & 1); }
+int runtime_autokorok_status(char *text, size_t size) {
+    pthread_mutex_lock(&ak_status_lock); snprintf(text, size, "%s", ak_status); pthread_mutex_unlock(&ak_status_lock);
+    return atomic_load(&ak_active);
+}
+static void *ak_load_thread(void *arg) { (void)arg; ak_load_sync(); return NULL; }
+/* Per kind (KOROK_TYPES, then one more for every other kind): found in the newest save and how many there are. 1 when the
+   koroks are read, 0 while they are being read (the first call starts that), -1 when this game has none. */
+int runtime_autokorok_counts(int *found, int *total, int types) {
+    for (int t = 0; t < types; t++) found[t] = total[t] = 0;
+    int state = atomic_load(&ak_loaded);
+    if (!state) { pthread_t t; if (!pthread_create(&t, NULL, ak_load_thread, NULL)) pthread_detach(t); return 0; }
+    if (state == 1) return 0;
+    if (state == 3) return -1;
+    static uint8_t got[KOROKS]; static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_lock(&lock);
+    korok_found_read(getenv("TOTK_PROFILE_DIR"), ak_korok, ak_count, got);
+    for (int i = 0; i < ak_count; i++) {
+        int t = ak_korok[i].type >= 0 ? ak_korok[i].type : KOROK_NTYPES;
+        if (t < types) { total[t]++; found[t] += got[i]; }
+    }
+    pthread_mutex_unlock(&lock);
+    return 1;
+}
+void runtime_autokorok_cancel_user(void) { if (atomic_load(&ak_active)) atomic_store(&ak_cancel, 1); }
+/* romfs.c's file opens: the discovery's flow (the first korok of a session; the game keeps it after), and every event
+   flow while a run is on, for the log. */
+static void autokorok_romfs(const char *path) {
+    if (!atomic_load_explicit(&ak_active, memory_order_relaxed) || strncmp(path, "Event/EventFlow/", 16)) return;
+    if (!strncmp(path + 16, "DmF_SY_HideCharaDiscovery", 25)) atomic_fetch_add(&ak_seq_found, 1);
+    fprintf(stderr, "[autokorok] the game opens %s\n", path);
+}
+/* The input file's "autokorok ..." (also "ctl autokorok ..."):
+     start | one [<hash>] | stop | status      a run; one: the nearest korok, or that one (its kind's switch aside)
+     type <word> on|off | types                the kinds (rock leaf dive flowers ring jump stickwall ceiling)
+     list [<word>] [<n>]                       the n nearest koroks (of a kind) not found yet, with their hashes
+     info <hash>                               a korok's parts and steps from where Link is */
+static int autokorok_command(const char *args) {
+    char word[16] = "", a1[32] = "", a2[16] = ""; sscanf(args, "%15s %31s %15s", word, a1, a2);
+    if (!strcmp(word, "start")) runtime_autokorok_start(0);
+    else if (!strcmp(word, "one")) { if (a1[0]) runtime_autokorok_only(strtoull(a1, NULL, 10)); else runtime_autokorok_start(1); }
+    else if (!strcmp(word, "stop")) runtime_autokorok_stop();
+    else if (!strcmp(word, "status")) { char s[600]; runtime_autokorok_status(s, sizeof s); fprintf(stderr, "[autokorok] status: %s\n", s); }
+    else if (!strcmp(word, "type") && korok_type_word(a1) >= 0 && (!strcmp(a2, "on") || !strcmp(a2, "off"))) runtime_autokorok_set_type(korok_type_word(a1), a2[1] == 'n');
+    else if (!strcmp(word, "types")) for (int t = 0; t < KOROK_NTYPES; t++) fprintf(stderr, "[autokorok] %s (%s): %s\n", KOROK_TYPES[t].word, KOROK_TYPES[t].name, runtime_autokorok_type_on(t) ? "on" : "off");
+    else if (!strcmp(word, "list") || !strcmp(word, "info")) {
+        if (!ak_load_sync()) { fprintf(stderr, "[autokorok] no koroks in this game's files\n"); return 1; }
+        float at[3] = {0, 0, 0}; int have = runtime_player_pos(at);
+        static uint8_t got[KOROKS]; korok_found_read(getenv("TOTK_PROFILE_DIR"), ak_korok, ak_count, got);
+        if (!strcmp(word, "info")) {
+            int k = ak_index(strtoull(a1, NULL, 10));
+            if (k < 0) { fprintf(stderr, "[autokorok] info: no korok %s\n", a1); return 1; }
+            const KorokInfo *ko = &ak_korok[k]; KorokPlan plan; korok_plan(ko, at, &plan);
+            fprintf(stderr, "[autokorok] info %llu: %s (HideType %d) at %.1f,%.1f,%.1f%s%s%s, %s; skip: %s\n", (unsigned long long)ko->hash, ak_type_name(k), ko->hide, ko->pos[0], ko->pos[1], ko->pos[2],
+                    ko->sky ? ", a sky island" : "", ko->island ? ", Great Sky Island" : "", ko->blocked ? ", blocked" : "", got[k] ? "found" : "not found",
+                    KOROK_SKIP_TEXT[korok_skip(ko, got[k], ~0u, 0, 0)][0] ? KOROK_SKIP_TEXT[korok_skip(ko, got[k], ~0u, 0, 0)] : "none");
+            for (int i = 0; i < ko->nparts; i++) fprintf(stderr, "[autokorok]   part %s%s%s at %.1f,%.1f,%.1f scale %.2f,%.2f,%.2f shape %d\n", ko->part[i].kind == KOROK_PART_ROCK ? "rock" : "Area",
+                    ko->part[i].role ? " " : "", KOROK_ROLE_TEXT[ko->part[i].role], ko->part[i].pos[0], ko->part[i].pos[1], ko->part[i].pos[2], ko->part[i].scale[0], ko->part[i].scale[1], ko->part[i].scale[2], ko->part[i].shape);
+            for (int i = 0; i < plan.n; i++) fprintf(stderr, "[autokorok]   step %d %s: %s at %.1f,%.1f,%.1f (%.1f s)\n", i + 1, KOROK_STEP_TEXT[plan.s[i].op], plan.s[i].method, plan.s[i].at[0], plan.s[i].at[1], plan.s[i].at[2], plan.s[i].secs);
+            return 1;
+        }
+        int type = korok_type_word(a1), n = atoi(type >= 0 ? a2 : a1); if (n <= 0) n = 5; if (n > 50) n = 50;
+        static uint8_t skip[KOROKS];
+        for (int i = 0; i < ak_count; i++) skip[i] = (uint8_t)korok_skip(&ak_korok[i], got[i], type >= 0 ? 1u << type : (1u << KOROK_NTYPES) - 1, 0, 0);
+        fprintf(stderr, "[autokorok] list: the %d nearest %s%skoroks not found yet%s\n", n, type >= 0 ? KOROK_TYPES[type].word : "", type >= 0 ? " " : "", have ? "" : " (no player: from the origin)");
+        for (int j = 0; j < n; j++) {
+            int k = korok_next(ak_korok, ak_count, skip, at);
+            if (k < 0) break;
+            skip[k] = KOROK_SKIP_DONE;
+            fprintf(stderr, "[autokorok]   %llu %s at %.1f,%.1f,%.1f, %.0f m away\n", (unsigned long long)ak_korok[k].hash, ak_type_name(k), ak_korok[k].pos[0], ak_korok[k].pos[1], ak_korok[k].pos[2], landmark_distance(ak_korok[k].pos, at));
+        }
+    }
+    else fprintf(stderr, "[autokorok] rejected: expected start, one [hash], stop, status, type <kind> on|off, types, list [kind] [n] or info <hash>\n");
+    return 1;
+}
 /* romfs.c, every file the game opens (path relative to the RomFS): which map is loading, and the goal's event. */
 void runtime_autoshrine_romfs(const char *path) {
     if (!path) return;
@@ -1976,6 +2485,7 @@ void runtime_autoshrine_romfs(const char *path) {
         else if (!strncmp(path, "Banc/MainField/", 15) && !field_logged) { field_logged = 1; fprintf(stderr, "[as-file] %s\n", path); }
         else if (!strncmp(path, "Event/EventFlow/", 16)) fprintf(stderr, "[as-file] %s\n", path);
     }
+    autokorok_romfs(path);
     if (!atomic_load_explicit(&as_active, memory_order_relaxed)) return;
     if (!strncmp(path, "Banc/", 5)) atomic_store(&as_map_ns, runtime_now_ns());   /* any map file: a load is going on */
     if (!strncmp(path, "Banc/SmallDungeon/Dungeon", 25) && landmark_ends(path, "_Static.bcett.byml.zs")) {
@@ -2069,7 +2579,7 @@ void runtime_survey_tick(uint64_t frame) {
     }
     int survey_left = request.kind || hold_left || route_on;
     pthread_mutex_unlock(&survey_lock);
-    if (!survey_left) { noclip_tick(actor); autoshrine_tick(actor, now_seconds()); }   /* a scripted move wins */
+    if (!survey_left) { noclip_tick(actor); autoshrine_tick(actor, now_seconds()); autokorok_tick(actor, now_seconds()); }   /* a scripted move wins */
 #if defined(TOTK_GAME_V143)
     event_tick();   /* "ctl event": outside the survey lock, it calls into the game */
     noclip_guard(actor);
@@ -2078,7 +2588,7 @@ void runtime_survey_tick(uint64_t frame) {
     /* cleared before the spawn queue is looked at again, so a spawn queued meanwhile (it sets waiting, then pending) is
        never lost */
     atomic_store(&runtime_survey_pending, survey_left);
-    if (atomic_load(&runtime_spawn_waiting) || atomic_load(&noclip_wanted) || atomic_load(&as_active)) atomic_store(&runtime_survey_pending, 1);
+    if (atomic_load(&runtime_spawn_waiting) || atomic_load(&noclip_wanted) || atomic_load(&as_active) || atomic_load(&ak_active)) atomic_store(&runtime_survey_pending, 1);
 #if defined(TOTK_GAME_V143)
     if (atomic_load(&event_waiting)) atomic_store(&runtime_survey_pending, 1);   /* queued while this tick ran */
 #endif

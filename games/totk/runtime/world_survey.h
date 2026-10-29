@@ -43,3 +43,16 @@ int runtime_autoshrine_chests(void);
 int runtime_autoshrine_status(char *text, size_t size);   /* the status line; 1 while a run is on */
 int runtime_autoshrine_command(const char *line);   /* the input file's "autoshrine start | one | finish N | stop | status | chests on|off | skip x|b|none" */
 void runtime_autoshrine_romfs(const char *path);    /* romfs.c: each file the game opens, relative to the RomFS */
+/* Auto korok (Places › Koroks, TOTK 1.4.3; world_survey.c, korok_auto.h): finds koroks one after another, the nearest
+   first, by the steps of each kind of puzzle (KOROK_TYPES); the game gives each seed. The input file's "autokorok ..."
+   lines go through runtime_autoshrine_command. */
+int runtime_autokorok_available(void);
+int runtime_autokorok_start(int one);               /* one: only the nearest korok; 0 when refused (no noclip, a run on) */
+int runtime_autokorok_only(uint64_t hash);          /* only that korok (its placement Hash), from wherever Link is */
+void runtime_autokorok_stop(void);
+void runtime_autokorok_set_type(int type, int on);  /* KOROK_TYPES index; every kind on at every start of the game */
+int runtime_autokorok_type_on(int type);
+int runtime_autokorok_status(char *text, size_t size);   /* the status line; 1 while a run is on */
+/* Per kind (KOROK_TYPES, then one more for the other kinds): found in the newest save and how many there are; 1 when the
+   koroks are read, 0 while they are being read (the first call starts it), -1 when the game has none. */
+int runtime_autokorok_counts(int *found, int *total, int types);

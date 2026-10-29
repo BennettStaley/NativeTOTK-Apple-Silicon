@@ -33,6 +33,7 @@
 #include "world_survey.h"
 #include "map_pins.h"
 #include "landmarks.h"
+#include "korok_auto.h"
 /* runtime/romfs.c: the game's files, read on the side (as the shader list does) */
 size_t runtime_romfs_file_count(void);
 const char *runtime_romfs_file_name(size_t i);
@@ -70,6 +71,7 @@ static NSWindow *settings_window(void);   /* frontend.m: the game window */
     Landmark marks[LANDMARKS];   /* the places with the last save's state and the story lock (landmarks.h), when the tab is built */
     MapPin pins[MAP_PINS_MAX]; int npins;   /* the Teleport tab's map pin rows (map_pins.h), read when the tab is built */
     NSString *autoShrineShown;   /* the auto shrine status the Teleport tab shows (rebuilt when it changes) */
+    NSString *autoKorokShown;    /* the Koroks tab's status line and counts as built (rebuilt when they change) */
 }
 static TOTKSettingsPanel *settingsPanel;
 /* The towers', shrines' and story places' names and places (landmarks.h), read from the RomFS once a run, off the main thread. */
@@ -77,7 +79,8 @@ static Landmark landmark_places[LANDMARKS];
 static int landmarks_read;   /* 0 not yet, 1 reading, 2 read, 3 none in this game; main thread */
 enum { PANEL_WIDTH = 480, PANEL_MARGIN = 16, PAGE_STEP = 8 /* rows per LT / RT on a pane without row frames */,
        SAVES_ROW = -1, CHEATS_FOLDER_ROW = -2, CHEATS_OFF_ROW = -3, CHEATS_RESTART_ROW = -4, CHEATS_DB_ROW = -5, CHEATS_UNAVAILABLE_ROW = -6,
-       CHEATS_NOCLIP_ROW = -7, CHEATS_NOCLIP_SPEED_ROW = -8, CHEATS_AUTOSHRINE_ROW = -9, CHEATS_AUTOSHRINE_CHESTS_ROW = -10, CHEATS_GROUP_ROW = -20 /* the places while the game's map is read */,
+       CHEATS_NOCLIP_ROW = -7, CHEATS_NOCLIP_SPEED_ROW = -8, CHEATS_AUTOSHRINE_ROW = -9, CHEATS_AUTOSHRINE_CHESTS_ROW = -10, CHEATS_AUTOKOROK_ROW = -11, CHEATS_GROUP_ROW = -20 /* the places while the game's map is read */,
+       CHEATS_KOROK_TYPE_ROW = -40 /* - t: KOROK_TYPES t's switch */,
        CHEATS_PIN_ROW = -100 /* - k: map pin k */, CHEATS_LANDMARK_ROW = -200 /* - k: place k (landmarks.h) */,
        CHEAT_ROW = -1000 /* - k: cheat k, or the choice whose first variant is k */ };
 static NSString *const BAR_HINT = @"←→ sections   ↓ open   Q E tabs   R reset tab   ⇧R reset all   Esc close\n"
@@ -687,6 +690,48 @@ static int cheat_choice_members(int leader, int *all, int *usable, int max, int 
     if (runtime_autoshrine_start(0)) [self hide];
 }
 - (void)autoShrineChestsSwitched:(NSSwitch *)s { runtime_autoshrine_set_chests(s.state == NSControlStateValueOn); [self.window makeFirstResponder:self]; }
+/* ---- Places › Koroks: auto korok (world_survey.c, korok_auto.h): Start / Stop with the run's status, then a switch per
+   kind of puzzle it does, each with how many of that kind the newest save has found; no list of the 800 ---- */
+- (NSString *)autoKorokState:(int *)found total:(int *)total loaded:(int *)loaded {
+    char line[600]; runtime_autokorok_status(line, sizeof line);
+    *loaded = runtime_autokorok_counts(found, total, KOROK_NTYPES + 1);
+    NSMutableString *sig = [NSMutableString stringWithFormat:@"%s|%d", line, *loaded];
+    for (int t = 0; t <= KOROK_NTYPES; t++) [sig appendFormat:@"|%d", found[t]];
+    return sig;
+}
+- (void)buildKoroks {
+    if (!runtime_autokorok_available()) {
+        [self addCheatsRow:[self cheatsRow:@"Koroks" detail:@"Not available in this game version: auto korok flies Link with noclip and reads the game's event state, which needs the 1.4.3 build." color:nil control:nil] id:CHEATS_UNAVAILABLE_ROW];
+        return;
+    }
+    [self addStoryLockRow];
+    int found[KOROK_NTYPES + 1], total[KOROK_NTYPES + 1], loaded;
+    autoKorokShown = [self autoKorokState:found total:total loaded:&loaded];
+    char line[600]; int running = runtime_autokorok_status(line, sizeof line);
+    [self cheatsHeading:@"Auto korok" detail:@"Finds koroks one after another, nearest first: the game itself gives each Korok Seed." problem:nil big:YES];
+    NSButton *go = [self cheatsButton:running ? @"Stop" : @"Start" action:@selector(autoKorokStartStop)];
+    if (running) go.bezelColor = NSColor.systemOrangeColor;
+    [self addCheatsRow:[self cheatsRow:@"Find koroks automatically"
+                                 about:@"Flies Link with noclip to the nearest korok the last save has not found, of the kinds switched on below, and solves its puzzle as a player would: lifts the rock (A), touches the sparkle, follows the flowers, stands on the stump and reaches the ring, lands on the blocks, ascends through the ceiling, dives into the water. The korok appears and gives its seed; the messages are skipped with B. Link does not lose hearts while it runs. With the story lock on, only Great Sky Island's koroks until the story leaves it. Any key, button or stick of yours stops it. Save first."
+                                detail:@(line) color:running ? NSColor.systemGreenColor : nil control:go] id:CHEATS_AUTOKOROK_ROW];
+    int all = 0, allFound = 0; for (int t = 0; t <= KOROK_NTYPES; t++) { all += total[t]; allFound += found[t]; }
+    NSString *count = loaded < 0 ? @"No koroks in this game's files." : !loaded ? @"Reading the game's map…"
+                    : [NSString stringWithFormat:@"%d of %d found in the last save; %d of them are kinds the run does not do yet.", allFound, all, total[KOROK_NTYPES]];
+    [self cheatsHeading:@"Kinds" detail:count problem:nil big:YES];
+    for (int t = 0; t < KOROK_NTYPES; t++) {
+        NSSwitch *on = [NSSwitch new]; on.state = runtime_autokorok_type_on(t) ? NSControlStateValueOn : NSControlStateValueOff;
+        on.tag = t; on.target = self; on.action = @selector(autoKorokTypeSwitched:); on.refusesFirstResponder = YES;
+        NSString *detail = loaded > 0 ? [NSString stringWithFormat:@"%s · %d of %d found", KOROK_TYPES[t].what, found[t], total[t]] : @(KOROK_TYPES[t].what);
+        [self addCheatsRow:[self cheatsRow:@(KOROK_TYPES[t].name) detail:detail color:loaded > 0 && total[t] && found[t] == total[t] ? NSColor.systemGreenColor : nil control:on]
+                        id:CHEATS_KOROK_TYPE_ROW - t];
+    }
+}
+- (void)autoKorokStartStop {
+    char line[600];
+    if (runtime_autokorok_status(line, sizeof line)) { runtime_autokorok_stop(); [self rebuildKeepingPlace]; return; }
+    if (runtime_autokorok_start(0)) [self hide];
+}
+- (void)autoKorokTypeSwitched:(NSSwitch *)s { runtime_autokorok_set_type((int)s.tag, s.state == NSControlStateValueOn); [self.window makeFirstResponder:self]; }
 /* Category only's rows: the story's places as they are; the towers, shrines and Lightroots what the newest save has not done
    yet first, then the done ones, each part nearest Link first (by name while there is no player). Locked places (the story lock) stay listed, greyed with the reason and no Go. A shrine also has Finish (auto shrine
    for that shrine alone; → on the row). */
@@ -917,6 +962,7 @@ static int cheat_choice_members(int leader, int *all, int *usable, int max, int 
     else if (kind == MENU_SHRINES) [self buildPlaces:2];
     else if (kind == MENU_LIGHTROOTS) [self buildPlaces:3];
     else if (kind == MENU_TEARS) [self buildPlaces:4];
+    else if (kind == MENU_KOROKS) [self buildKoroks];
     else if (kind == MENU_SAVES) {
         NSView *saves = [self savesRow];
         [list addArrangedSubview:saves]; [rows addObject:saves]; [rowSetting addObject:@(SAVES_ROW)];
@@ -982,6 +1028,10 @@ static NSPopUpButton *settings_find_popup(NSView *v) {
     if (self.kind == MENU_SHRINES && autoShrineShown) {   /* the auto shrine status line follows the run */
         char line[600]; runtime_autoshrine_status(line, sizeof line);
         if (![autoShrineShown isEqualToString:@(line)]) [self rebuildKeepingPlace];
+    }
+    if (self.kind == MENU_KOROKS && autoKorokShown) {   /* the run's status and the counts (once the map is read) follow it */
+        int found[KOROK_NTYPES + 1], total[KOROK_NTYPES + 1], loaded;
+        if (![autoKorokShown isEqualToString:[self autoKorokState:found total:total loaded:&loaded]]) [self rebuildKeepingPlace];
     }
 }   /* the memory meter, once a second while the menu shows */
 
@@ -1073,6 +1123,10 @@ static NSTextField *settings_help_label(NSView *v) {   /* a setting row's help t
     if (i == CHEATS_NOCLIP_SPEED_ROW) { if (dir) [self stepNoclipSpeed:dir]; return; }
     if (i == CHEATS_AUTOSHRINE_ROW) { if (!dir) [self autoShrineStartStop]; return; }
     if (i == CHEATS_AUTOSHRINE_CHESTS_ROW) { runtime_autoshrine_set_chests(dir ? dir > 0 : !runtime_autoshrine_chests()); [self rebuildKeepingPlace]; return; }
+    if (i == CHEATS_AUTOKOROK_ROW) { if (!dir) [self autoKorokStartStop]; return; }
+    if (i <= CHEATS_KOROK_TYPE_ROW && i > CHEATS_KOROK_TYPE_ROW - KOROK_NTYPES) {
+        int t = CHEATS_KOROK_TYPE_ROW - i; runtime_autokorok_set_type(t, dir ? dir > 0 : !runtime_autokorok_type_on(t)); [self rebuildKeepingPlace]; return;
+    }
     if (i <= CHEATS_PIN_ROW && i > CHEATS_PIN_ROW - MAP_PINS_MAX - 1) { if (!dir) [self goToPin:CHEATS_PIN_ROW - i]; return; }
     if (i <= CHEATS_LANDMARK_ROW && i > CHEATS_LANDMARK_ROW - LANDMARKS) {   /* A: Go; → on a shrine: Finish */
         if (!dir) [self goToLandmark:CHEATS_LANDMARK_ROW - i]; else if (dir > 0) [self finishShrine:CHEATS_LANDMARK_ROW - i];

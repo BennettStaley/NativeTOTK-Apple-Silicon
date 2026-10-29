@@ -3,12 +3,14 @@
    @effect lines (a menu that cannot give dishes leaves them out). Also map_pins.h and landmarks.h (towers, shrines and
    the story's places: a small map file, place list, message file and save made here; the story flags and the lock), and
    shrine_auto.h (a shrine's outside and inside map files, its kind, the save's DungeonState, which shrines a run does and
-   in which order, where Link stands and walks). Prints one JSON line; exit 1 on failure. */
+   in which order, where Link stands and walks), and korok_auto.h (koroks' puzzles from a map file's AiGroups, the save's
+   IsAppearKorok flags, which koroks a run does and in which order, each kind's steps). Prints one JSON line; exit 1 on failure. */
 #include "dish_give.h"
 #include "spawn_list.h"
 #include "map_pins.h"
 #include "landmarks.h"
 #include "shrine_auto.h"
+#include "korok_auto.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -16,7 +18,7 @@ static int failures, checks;
 #define CHECK(cond, ...) do { checks++; if (!(cond)) { failures++; fprintf(stderr, "FAIL: " __VA_ARGS__); fputc('\n', stderr); } } while (0)
 
 /* A little-endian BYML / MSBT / SARC made here, as the game's files are laid out. */
-static uint8_t buf[0x2000]; static size_t at;
+static uint8_t buf[0x4000]; static size_t at;
 static uint32_t put(const void *p, size_t n) { uint32_t o = (uint32_t)at; memcpy(buf + at, p, n); at += n; return o; }
 static uint32_t put32(uint32_t v) { return put(&v, 4); }
 static void align(size_t a) { while (at % a) buf[at++] = 0; }
@@ -67,6 +69,75 @@ static size_t shrine_map(const TestActor *a, int n) {
     uint32_t list = byml_array(n, types, actor);
     const uint32_t rk[] = {K_ACTORS}, rv[] = {list}; const uint8_t rt[] = {0xC0};
     uint32_t root = byml_dict(1, rk, rt, rv);
+    memcpy(buf + 4, &kt, 4); memcpy(buf + 8, &st, 4); memcpy(buf + 12, &root, 4);
+    return at;
+}
+
+/* A map file of koroks' puzzles for korok_auto.h: Actors (a Hash, a Gyaml, a Translate, a Scale and one Dynamic entry
+   when given) and AiGroups (a Logic, References to actors by Hash or sub-groups "<dir>/AiGroup" with their own Logic). */
+enum { KK_ACTORS, KK_GROUPS, KK_HASH, KK_GYAML, KK_TRANSLATE, KK_SCALE, KK_DYNAMIC, KK_HIDE, KK_SHAPE, KK_TIME, KK_LOGIC, KK_REFS, KK_ID, KK_PATH, KK_REF, NKK };
+static const char *const korok_keys[NKK] = {"Actors", "AiGroups", "Hash", "Gyaml", "Translate", "Scale", "Dynamic", "HideType", "RigidBodyShapeType",
+                                            "TimeLimit", "Logic", "References", "Id", "Path", "Reference"};
+enum { KT_GROUND, KT_FLY, KT_ROCK, KT_AREA, KT_GOALOBJ, KT_ICE, KT_AIGROUP, KT_PART, KT_L_ROCK, KT_L_BASE, KT_L_RING, KT_L_GOAL, KT_L_START, KT_L_ICE,
+       KT_L_CEIL, KT_L_LOWER, KT_L_UPPER, KT_L_OTHER, KT_P_ROCK, KT_P_KOROK_A, KT_P_BASE_A, KT_P_KOROK_B, KT_P_BASE_B, KT_P_GOALOBJ, KT_P_GOAL, KT_P_GOALGROUP,
+       KT_P_START, KT_P_STARTGROUP, KT_P_ICEROCK, KT_P_KOROK_C, KT_P_ICE, KT_P_ICEGROUP, KT_P_LOWER, KT_P_LOWERGROUP, KT_P_KOROK_D, KT_P_UPPER, KT_P_UPPERGROUP, KT_P_OTHER, NKT };
+static const char *const korok_strs[NKT] = {"Npc_HiddenKorokGround", "Npc_HiddenKorokFly", "Obj_LiftRockWhite_Korok_A_01", "Area", "FldObj_KorokGoal_A_01", "IceWall",
+    "AiGroup", "Part", "Logic/Module/HiddenKorok_LiftUpRock/HiddenKorok_LiftUpRock_2a3e.logic.module.ain", "Logic/Module/HiddenKorok_Base/HiddenKorok_Base_1e88.logic.module.ain",
+    "Logic/Module/HiddenKorok_TimeLimitRing/HiddenKorok_TimeLimitRing_3cf9.logic.module.ain", "Logic/Module/HiddenKorok_TimeLimitRingGoal/HiddenKorok_TimeLimitRingGoal_f0f9.logic.module.ain",
+    "Logic/Module/HiddenKorok_TimeLimitRingStart/HiddenKorok_TimeLimitRingStart_c312.logic.module.ain", "Logic/Module/HiddenKorok_LiftUpRockInIce/HiddenKorok_LiftUpRockInIce_21bf.logic.module.ain",
+    "Logic/Module/HiddenKorok_CeilingClipper/HiddenKorok_CeilingClipper_795d.logic.module.ain", "Logic/Module/HiddenKorok_CeilingClipper_Lower/HiddenKorok_CeilingClipper_Lower_dd75.logic.module.ain",
+    "Logic/Module/HiddenKorok_CeilingClipper_Upper_Ground/HiddenKorok_CeilingClipper_Upper_Ground_afbb.logic.module.ain", "Logic/Module/Other/Other_0000.logic.module.ain",
+    "Obj_LiftRockWhite_A_01_e058", "_c838/Npc_HiddenKorokGround_5be7", "_c838/AiGroup", "_0d76/_c28f/Npc_HiddenKorokGround_5be7", "_0d76/_c28f/AiGroup",
+    "_0d76/FldObj_KorokGoal_A_01_2bb6", "_0d76/Area_315c", "_0d76/AiGroup", "_3faa/Area_c710", "_3faa/AiGroup", "_7aab/Obj_LiftRockWhite_A_01_e058",
+    "_7aab/_f8dd/Npc_HiddenKorokGround_5be7", "IceWall_e4c9", "_7aab/AiGroup", "_39e5/_076e/Area_5d81", "_39e5/_076e/AiGroup", "_39e5/_00bd/_22d0/Npc_HiddenKorokGround_5be7",
+    "_5342/_70a3/Area_ff32", "_5342/AiGroup", "Area_0000"};
+static uint32_t put64(uint64_t v) { align(8); return put(&v, 8); }
+typedef struct { uint64_t hash; int gyaml; float pos[3], scale[3]; int dkey; uint8_t dtype; uint32_t dval; } KorokTestActor;
+typedef struct { int id, path; uint64_t ref; int logic; } KorokTestRef;   /* ref 0: a sub-group with logic */
+static size_t korok_test_map(void) {
+    static const KorokTestActor a[] = {
+        {1001, KT_GROUND, {10, 100, 10}, {0}, -1, 0, 0}, {2001, KT_ROCK, {10, 100.1f, 10}, {0}, -1, 0, 0},
+        {1002, KT_FLY, {50, 100, 50}, {0}, KK_HIDE, 0xD1, 4}, {2002, KT_AREA, {52, 100, 50}, {1.7f, 1.7f, 1.7f}, KK_SHAPE, 0xD1, 0},
+        {2003, KT_GOALOBJ, {52, 99.8f, 50}, {0}, KK_TIME, 0xD2, 0x42f00000 /* 120.0f */}, {2004, KT_AREA, {80, 110, 50}, {0.7f, 0.7f, 0.7f}, KK_SHAPE, 0xD1, 3},
+        {1003, KT_GROUND, {200, 100, 200}, {0}, -1, 0, 0}, {2005, KT_ROCK, {200, 100.1f, 200}, {0}, -1, 0, 0}, {2006, KT_ICE, {200, 100, 200}, {0}, -1, 0, 0},
+        {1004, KT_FLY, {300, 150, 300}, {0}, KK_HIDE, 0xD1, 23}, {2007, KT_AREA, {300, 124, 300}, {0.9f, 15, 0.9f}, KK_SHAPE, 0xD1, 3},
+        {2008, KT_AREA, {300, 157, 300}, {0}, -1, 0, 0}, {2009, KT_AREA, {0, 0, 0}, {0}, -1, 0, 0}};
+    static const KorokTestRef g0[] = {{KT_PART, KT_P_ROCK, 2001, 0}, {KT_PART, KT_P_KOROK_A, 1001, 0}, {KT_AIGROUP, KT_P_BASE_A, 0, KT_L_BASE}},
+        g1[] = {{KT_PART, KT_P_KOROK_B, 1002, 0}, {KT_AIGROUP, KT_P_BASE_B, 0, KT_L_BASE}, {KT_PART, KT_P_GOALOBJ, 2003, 0}, {KT_PART, KT_P_GOAL, 2002, 0},
+                {KT_AIGROUP, KT_P_GOALGROUP, 0, KT_L_GOAL}, {KT_PART, KT_P_START, 2004, 0}, {KT_AIGROUP, KT_P_STARTGROUP, 0, KT_L_START}},
+        g2[] = {{KT_PART, KT_P_ICEROCK, 2005, 0}, {KT_PART, KT_P_KOROK_C, 1003, 0}, {KT_PART, KT_P_ICE, 2006, 0}, {KT_AIGROUP, KT_P_ICEGROUP, 0, KT_L_ROCK}},
+        g3[] = {{KT_PART, KT_P_LOWER, 2007, 0}, {KT_AIGROUP, KT_P_LOWERGROUP, 0, KT_L_LOWER}, {KT_PART, KT_P_KOROK_D, 1004, 0}, {KT_PART, KT_P_UPPER, 2008, 0},
+                {KT_AIGROUP, KT_P_UPPERGROUP, 0, KT_L_UPPER}},
+        g4[] = {{KT_PART, KT_P_OTHER, 2009, 0}};
+    static const struct { int logic, n; const KorokTestRef *r; } g[] = {{KT_L_ROCK, 3, g0}, {KT_L_RING, 7, g1}, {KT_L_ICE, 4, g2}, {KT_L_CEIL, 5, g3}, {KT_L_OTHER, 1, g4}};
+    enum { NA = sizeof a / sizeof *a, NG = sizeof g / sizeof *g };
+    at = 16; memset(buf, 0, sizeof buf); memcpy(buf, "YB\x07\0", 4);
+    uint32_t kt = byml_table(korok_keys, NKK), st = byml_table(korok_strs, NKT), actor[NA], group[NG];
+    for (int i = 0; i < NA; i++) {
+        uint32_t k[5], v[5]; uint8_t t[5]; int m = 0;
+        k[m] = KK_HASH; t[m] = 0xD5; v[m++] = put64(a[i].hash);
+        k[m] = KK_GYAML; t[m] = 0xA0; v[m++] = (uint32_t)a[i].gyaml;
+        k[m] = KK_TRANSLATE; t[m] = 0xC0; v[m++] = vec3(a[i].pos);
+        if (a[i].scale[0]) { k[m] = KK_SCALE; t[m] = 0xC0; v[m++] = vec3(a[i].scale); }
+        if (a[i].dkey >= 0) { uint32_t dk = (uint32_t)a[i].dkey; k[m] = KK_DYNAMIC; t[m] = 0xC1; v[m++] = byml_dict(1, &dk, &a[i].dtype, &a[i].dval); }
+        actor[i] = byml_dict(m, k, t, v);
+    }
+    for (int i = 0; i < NG; i++) {
+        uint32_t ref[8];
+        for (int r = 0; r < g[i].n; r++) {
+            const KorokTestRef *x = &g[i].r[r];
+            uint32_t k[3] = {KK_ID, KK_PATH, x->ref ? KK_REF : KK_LOGIC}, v[3] = {(uint32_t)x->id, (uint32_t)x->path, x->ref ? put64(x->ref) : (uint32_t)x->logic};
+            uint8_t t[3] = {0xA0, 0xA0, x->ref ? 0xD5 : 0xA0};
+            ref[r] = byml_dict(3, k, t, v);
+        }
+        uint8_t types[8]; memset(types, 0xC1, sizeof types);
+        uint32_t list = byml_array(g[i].n, types, ref), k[2] = {KK_LOGIC, KK_REFS}, v[2] = {(uint32_t)g[i].logic, list}; uint8_t t[2] = {0xA0, 0xC0};
+        group[i] = byml_dict(2, k, t, v);
+    }
+    uint8_t types[16]; memset(types, 0xC1, sizeof types);
+    uint32_t actors = byml_array(NA, types, actor), groups = byml_array(NG, types, group);
+    const uint32_t rk[] = {KK_ACTORS, KK_GROUPS}, rv[] = {actors, groups}; const uint8_t rt[] = {0xC0, 0xC0};
+    uint32_t root = byml_dict(2, rk, rt, rv);
     memcpy(buf + 4, &kt, 4); memcpy(buf + 8, &st, 4); memcpy(buf + 12, &root, 4);
     return at;
 }
@@ -373,6 +444,65 @@ int main(void) {
     memcpy(save4 + ds, &end, 4);
     CHECK(shrine_states_parse(save4, sizeof save4, state) == 4 && state[0] == SHRINE_STATE_CLEAR && state[7] == SHRINE_STATE_HIDDEN && state[60] == SHRINE_STATE_APPEAR
           && state[151] == SHRINE_STATE_ENTER && state[1] == SHRINE_STATE_UNKNOWN, "DungeonState from the save");
+
+    /* korok_auto.h: a map file with four koroks' puzzles (AiGroups) and a group without a korok: a plain rock, a race
+       (its goal and start Areas in sub-groups, the goal's TimeLimit), a rock in ice, and a ceiling whose Upper Area takes
+       its role from the sub-group one folder up */
+    static KorokInfo kor[8]; int nk = 0;
+    size_t kn = korok_test_map();
+    CHECK(korok_scan_file(buf, kn, 1, kor, &nk, 8) == 4 && nk == 4, "four koroks in the map file, got %d", nk);
+    const KorokInfo *rock = &kor[0], *race = &kor[1], *iced = &kor[2], *ceil = &kor[3];
+    CHECK(rock->hash == 1001 && rock->hide == KOROK_HIDE_ROCK && rock->type == 0 && !rock->fly && rock->sky && rock->nparts == 1
+          && rock->part[0].kind == KOROK_PART_ROCK && korok_complete(rock), "a plain rock korok (no HideType: 0)");
+    CHECK(race->hash == 1002 && race->hide == KOROK_HIDE_RING && race->fly && race->time_limit == 120 && korok_complete(race), "a race: Npc_HiddenKorokFly, its TimeLimit");
+    const KorokPart *goal = korok_part(race, KOROK_PART_AREA, KOROK_ROLE_GOAL), *start = korok_part(race, KOROK_PART_AREA, KOROK_ROLE_START);
+    CHECK(goal && start && goal->pos[0] == 52 && fabsf(goal->scale[0] - 1.7f) < 1e-5f && start->pos[0] == 80 && start->shape == 3, "its goal and start Areas by their sub-groups");
+    CHECK(iced->blocked && korok_skip(iced, 0, ~0u, 0, 0) == KOROK_SKIP_BLOCKED, "a rock in ice: left out");
+    CHECK(korok_part(ceil, KOROK_PART_AREA, KOROK_ROLE_LOWER) && korok_part(ceil, KOROK_PART_AREA, KOROK_ROLE_UPPER) && korok_complete(ceil),
+          "the ceiling's Lower Area by its own folder, the Upper one by the folder above");
+    CHECK(korok_scan_file(buf, 8, 0, kor, &nk, 8) == -1, "not a map file");
+    /* which koroks a run does */
+    CHECK(korok_skip(rock, 0, ~0u, 0, 0) == KOROK_GO, "a plain rock: done");
+    CHECK(korok_skip(rock, 1, ~0u, 0, 0) == KOROK_SKIP_FOUND, "found in the save");
+    CHECK(korok_skip(rock, 0, ~1u, 0, 0) == KOROK_SKIP_OFF, "its kind switched off");
+    CHECK(korok_skip(rock, 0, ~0u, 1, 0) == KOROK_SKIP_LOCKED, "the story lock");
+    CHECK(korok_skip(rock, 0, ~0u, 0, KOROK_SKIP_FAILED) == KOROK_SKIP_FAILED, "failed in this run");
+    KorokInfo other = *rock; other.hide = 5; other.type = korok_type_of(5);
+    CHECK(other.type < 0 && korok_skip(&other, 0, ~0u, 0, 0) == KOROK_SKIP_KIND, "a kind the run does not do");
+    KorokInfo offset = *rock; offset.part[0].pos[0] += 2;
+    CHECK(korok_skip(&offset, 0, ~0u, 0, 0) == KOROK_SKIP_NO_DATA, "a rock 2 m off its korok is not its korok's rock");
+    uint8_t kskip[4] = {KOROK_GO, KOROK_GO, KOROK_SKIP_BLOCKED, KOROK_GO}; float kfrom[3] = {49, 100, 49};
+    CHECK(korok_next(kor, 4, kskip, kfrom) == 1, "nearest first");
+    kskip[1] = KOROK_SKIP_DONE; CHECK(korok_next(kor, 4, kskip, kfrom) == 0, "then the next nearest");
+    /* the save's IsAppearKorok.<hash> (the real flag's hash: MacSpazzy and MrCheeze's table, 43a84d09) */
+    CHECK(korok_flag_hash(10044045926791206854ull) == 0x43a84d09u, "IsAppearKorok.10044045926791206854 hashes to 43a84d09");
+    static uint8_t save5[0x200], kfound[4]; memcpy(save5, w, 4); size_t ks = 0x28;
+    const struct { uint64_t hash; uint32_t v; } kflags[] = {{1001, 1}, {1002, 0}, {1003, 0}};
+    for (size_t i = 0; i < 3; i++, ks += 8) { uint32_t h = korok_flag_hash(kflags[i].hash); memcpy(save5 + ks, &h, 4); memcpy(save5 + ks + 4, &kflags[i].v, 4); }
+    memcpy(save5 + ks, &end, 4);
+    CHECK(korok_found_parse(save5, sizeof save5, kor, 4, kfound) == 3 && kfound[0] == 1 && !kfound[1] && !kfound[2] && !kfound[3], "found from the save");
+    /* the steps */
+    KorokPlan plan; float kfrom2[3] = {10, 100, 20};
+    korok_plan(rock, kfrom2, &plan);
+    CHECK(plan.n == 12 && plan.s[0].op == KS_FLY && fabsf(plan.s[0].at[2] - (rock->part[0].pos[2] + 1.6f)) < 1e-4f && fabsf(plan.s[0].at[1] - (rock->part[0].pos[1] + 2.5f)) < 1e-4f
+          && plan.s[1].op == KS_LAND && plan.s[2].op == KS_WALK && plan.s[2].to[0] == 1.1f && plan.s[3].op == KS_LIFT && plan.s[3].secs == 1.5f
+          && plan.s[7].op == KS_FLY && fabsf(plan.s[7].at[2] - (rock->part[0].pos[2] - 1.6f)) < 1e-4f, "a rock: beside it on Link's side, walk, A held; then the other side");
+    korok_plan(race, kfrom2, &plan);
+    CHECK(plan.n == 9 && plan.s[1].op == KS_HOLD && plan.s[1].at[0] == 80 && plan.s[2].op == KS_FLY && plan.s[2].at[0] == 52 && plan.s[5].op == KS_LAND && plan.s[7].op == KS_HOLD,
+          "a race: held on the stump, to the ring; then stood on the stump, to the ring");
+    korok_plan(ceil, kfrom2, &plan);
+    CHECK(plan.s[1].op == KS_HOLD && plan.s[2].op == KS_SNAP && plan.s[2].at[1] > plan.s[1].at[1] && plan.s[6].op == KS_LAND, "a ceiling: Lower, at once Upper; then stood and landed");
+    KorokInfo fl = {0}; fl.hide = KOROK_HIDE_FLOWERS; fl.type = korok_type_of(fl.hide);
+    const struct { float x; int role; } flw[] = {{0, KOROK_ROLE_FIRST}, {30, KOROK_ROLE_WAY}, {10, KOROK_ROLE_WAY}, {40, KOROK_ROLE_LAST}, {20, KOROK_ROLE_WAY}};
+    for (int i = 0; i < 5; i++) { KorokPart *pt = &fl.part[fl.nparts++]; pt->kind = KOROK_PART_AREA; pt->role = (uint8_t)flw[i].role; pt->pos[0] = flw[i].x; }
+    korok_plan(&fl, kfrom2, &plan);
+    CHECK(korok_complete(&fl) && plan.s[1].at[0] == 0 && plan.s[2].at[0] == 10 && plan.s[3].at[0] == 20 && plan.s[4].at[0] == 30 && plan.s[5].at[0] == 40
+          && fabsf(plan.s[1].at[1] - 0.8f) < 1e-5f && plan.s[6].op == KS_LAND && plan.s[7].at[0] == 0, "flowers: the first, the nearest one left each time, the last; twice");
+    KorokInfo leaf = {0}; leaf.hide = KOROK_HIDE_LEAF; leaf.type = korok_type_of(leaf.hide); leaf.pos[1] = 20; leaf.nparts = 1;
+    leaf.part[0].kind = KOROK_PART_AREA; leaf.part[0].pos[0] = 10; leaf.part[0].pos[1] = 20; leaf.part[0].scale[0] = 5;
+    korok_plan(&leaf, kfrom2, &plan);
+    CHECK(plan.s[2].op == KS_HOLD && fabsf(plan.s[2].at[0] - 8) < 1e-4f && fabsf(plan.s[2].at[1] - 19.1f) < 1e-4f && plan.s[3].op == KS_SWEEP,
+          "a sparkle beside its Area: held 0.4 of the Area's size in from its centre");
 
     printf("{\"status\":\"%s\",\"probe\":\"probe-dish\",\"checked\":%d,\"failures\":%d}\n", failures ? "fail" : "pass", checks, failures);
     return failures != 0;
