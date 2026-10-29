@@ -16,6 +16,7 @@
 #include <fcntl.h>
 #include "nvn_mtl.h"
 #include "nvn_obj.h"
+#include "nvn_impl.h"   // NVN_BLOCKING: release the guest core only while a write-back waits (upstream #1141)
 #include "../tex/nvn_fmt_mtl.h"
 #include "../tex/nvn_deswizzle.h"
 #include "../tex/nvn_deswizzle_gpu.h"
@@ -3380,7 +3381,15 @@ static void wb_write_list(wb_ent **list, int nl, int force) {
         calls = total_ns = max_ns = 0; since = t1;
     }
 }
-static void wb_write_list_(wb_ent **list, int nl, int force) {
+/* The waits before a write-back: translation drained, then the GPU work the renderings came from. Cache maintenance
+   (mtl_pool_invalidate) reaches them without an NVN_BLOCKING entry point, and keeping the guest's virtual core while
+   sleeping here kept the game's other workers off it (upstream #1141, issue #552: samples in pthread_cond_wait under
+   wb_write_list with little GPU work). No renderer lock is held across the handoff (the callers drop g_smu first); the
+   core is taken back on return, before freshness is checked or pages are protected for the CPU copy. Not extended over
+   the per-level read-back that follows: by then pages can be marked busy, and a worker faulting on them must not stop
+   this thread from taking its core back. Nested guards and host threads (the submit thread) are no-ops. */
+static void wb_wait_gpu(wb_ent **list, int nl) {
+    NVN_BLOCKING();
     { extern void nvn_x_drain(void) __attribute__((weak)); if (nvn_x_drain) nvn_x_drain(); }   // translation thread: nothing queued overtakes this read-back (as for ReadTexels)
 #ifdef GAME_BOTW
     WB_WAIT_GPU(list, nl)
@@ -3393,6 +3402,9 @@ static void wb_write_list_(wb_ent **list, int nl, int force) {
     if (!wb_fence_on()) mtl_finish_gpu();
     else { if (need) mtl_wait(need, UINT64_MAX); up_pending_wait(1000); }
 #endif
+}
+static void wb_write_list_(wb_ent **list, int nl, int force) {
+    wb_wait_gpu(list, nl);
     /* Freshness is decided for every entry before anything is written back (a write-back marks its pages written), and
        of several renderings of the same memory (texture objects over it) only the newest is written back. */
     int fresh[512];
