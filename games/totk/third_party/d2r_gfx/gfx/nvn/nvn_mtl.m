@@ -16,6 +16,7 @@
 #include <fcntl.h>
 #include "nvn_mtl.h"
 #include "nvn_obj.h"
+#include "nvn_quad_strip.h"   // Hero's Path quad strips (upstream #1216)
 #include "nvn_impl.h"   // NVN_BLOCKING: release the guest core only while a write-back waits (upstream #1141)
 #include "../tex/nvn_fmt_mtl.h"
 #include "../tex/nvn_deswizzle.h"
@@ -10644,6 +10645,7 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
     return 1;
 }
 static id<MTLBuffer> g_quad_ib; static uint64_t g_quad_gpu;
+static id<MTLBuffer> g_quad_strip_ib;   // non-indexed quad strips: QUAD_STRIP_BATCH quads of shared indices (nvn_quad_strip_indices)
 static id<MTL4RenderCommandEncoder> rp_begin(void);
 // ---------- Pass lookahead: does this pass use depth / stencil ----------
 // When opening a pass, scan forward from the op after the current draw, simulating the changes of depth-stencil state, up to where this pass must end (target reset, copy, compute dispatch -
@@ -10803,7 +10805,7 @@ static int lay_scan(const uint8_t *start, const p_set_rt *rt, int first, int nla
 // The draw can run in a layered pass: triangles, and a vertex function that can write the layer.
 static int lay_draw_ok(NvProg *pr, const p_draw *dw, const p_draw_idx *di) {
     int prim = dw ? dw->prim : di ? di->prim : -1;
-    return (prim == 4 || prim == 5 || prim == 7) && pr && vs_layerable(pr->sh[0]);
+    return (prim == 4 || prim == 5 || prim == 7 || prim == 8) && pr && vs_layerable(pr->sh[0]);   // 8: quad strips are drawn as triangles too
 }
 // rp_begin_ex: the number of layers of a layered pass starting at *first, or 0 for a plain pass. Only for a pass opened by a
 // replayed draw or colour clear (g_exec_cur), with no pending clear (a Clear load action would clear every layer of the range).
@@ -14046,7 +14048,7 @@ frz_plain:;
     MTLPrimitiveType mp;
     switch (prim) {
         case 0: mp = MTLPrimitiveTypePoint; break; case 1: mp = MTLPrimitiveTypeLine; break; case 3: mp = MTLPrimitiveTypeLineStrip; break;
-        case 4: case 7: mp = MTLPrimitiveTypeTriangle; break; case 5: mp = MTLPrimitiveTypeTriangleStrip; break;
+        case 4: case 7: case 8: mp = MTLPrimitiveTypeTriangle; break; case 5: mp = MTLPrimitiveTypeTriangleStrip; break;
         default: RED_ONCE(19, "Primitive type %d not implemented", prim); g_draw_skip[11]++; return;
     }
     if (g_vis_counting && perdraw_vis_on() && g_enc_has_vis && g_vis && g_vis_n < VIS_SLOTS - 256) {
@@ -14125,7 +14127,27 @@ frz_plain:;
     bar_draw(en, pr);
     if (!att_n) for (int i = 0; i < g_nsd; i++) if (g_sd[i].wrote) g_sd_plain |= 1u << i;   // att_unstored_read: draws of a sampling run do not count
     // A draw with 0 primitives (the game does send count=0) draws no pixels, so skip encoding; Metal requires the count to be non-zero, otherwise the validation layer aborts on the spot (measured on the camp / wilderness / combat pages)
-    if (dw && prim == 7) {   // Quads: shared indices 0,1,2,0,2,3
+    if (dw && prim == NVN_DRAW_PRIMITIVE_QUAD_STRIP) {
+        /* TOTK (upstream #1216): Hero's Path draws its route as quad strips, which Metal does not have (they were skipped as
+           an unimplemented primitive). Pair boundaries and winding survive the conversion (nvn_quad_strip.h); an incomplete
+           last pair draws nothing. Long strips are drawn in batches over one shared index buffer, the batch's first vertex
+           as the base vertex, so vertex IDs stay those of the original strip. */
+        enum { QUAD_STRIP_BATCH = 65536 };
+        uint32_t quads = dw->count > 0 ? nvn_quad_strip_quads((uint32_t)dw->count) : 0;
+        if (quads && !g_quad_strip_ib) {
+            g_quad_strip_ib = [g_dev newBufferWithLength:(NSUInteger)QUAD_STRIP_BATCH * 6 * sizeof(uint32_t) options:MTLResourceStorageModeShared];
+            if (!g_quad_strip_ib) MDIE("quad strip index buffer allocation failed");
+            nvn_quad_strip_indices(g_quad_strip_ib.contents, QUAD_STRIP_BATCH);
+            res_add(g_quad_strip_ib);   // Metal 4: resident only through the residency set, like g_quad_ib
+        }
+        for (uint32_t at = 0; at < quads;) {
+            uint32_t n = quads - at; if (n > QUAD_STRIP_BATCH) n = QUAD_STRIP_BATCH;
+            enc_r_draw_indexed(en, mp, (NSUInteger)n * 6, MTLIndexTypeUInt32, g_quad_strip_ib.gpuAddress, g_quad_strip_ib.length,
+                               dw->instances > 1 ? dw->instances : 1, (NSInteger)dw->first + (NSInteger)at * 2, dw->base_instance);
+            at += n;
+        }
+        static int once; if (quads && !once++) MLOG("NVN quad strip: %d vertices drawn as %u quads", dw->count, quads);
+    } else if (dw && prim == 7) {   // Quads: shared indices 0,1,2,0,2,3
         if (!g_quad_ib) {
             uint32_t n = 65536; uint32_t *ix = malloc(n * 6 * 4);
             for (uint32_t q = 0; q < n; q++) { uint32_t b = q * 4; uint32_t v[6] = {b, b + 1, b + 2, b, b + 2, b + 3}; memcpy(ix + q * 6, v, 24); }
@@ -14137,6 +14159,26 @@ frz_plain:;
         else if (dw->count && dw->instances >= 0) enc_r_draw(en, mp, dw->first, dw->count);
     } else {
         if (prim == 7) { RED_ONCE(20, "Indexed quads not implemented"); return; }
+        if (prim == NVN_DRAW_PRIMITIVE_QUAD_STRIP) {   // TOTK (upstream #1216): indexed quad strips, converted on the CPU into this submission's arena
+            if (di->count < 4) return;
+            if (di->itype < 0 || di->itype > 2) MDIE("quad strip index type %d", di->itype);
+            unsigned width = 1u << di->itype;
+            uint64_t bytes = (uint64_t)di->count * width;
+            /* Never read stale CPU data for an index buffer written earlier on the GPU timeline. */
+            if (pend_hits(di->ibuf, bytes)) { RED_ONCE(19, "indexed quad strip whose indices pending GPU work writes: not drawn (needs a GPU conversion)"); g_draw_skip[11]++; return; }
+            void *src; uint64_t so;
+            if (!mtl_addr(di->ibuf, bytes, &src, &so)) { RED_ONCE(22, "Quad strip index buffer is not in a memory pool"); return; }
+            const uint8_t *indices = [(__bridge id<MTLBuffer>)src contents];
+            if (!indices) MDIE("quad strip index buffer is not host visible");
+            use_rec("buf", di->ibuf, bytes, 0, NULL);
+            id<MTLBuffer> conv;
+            size_t length = (size_t)nvn_quad_strip_quads((uint32_t)di->count) * 6 * sizeof(uint32_t);
+            size_t coff = arena_alloc(length, &conv);
+            size_t count = nvn_quad_strip_indexed((uint32_t *)((uint8_t *)conv.contents + coff), indices + so, (uint32_t)di->count, width);
+            if (count) enc_r_draw_indexed(en, mp, count, MTLIndexTypeUInt32, conv.gpuAddress + coff, length, di->instances ? di->instances : 1, di->base_vertex, di->base_instance);
+            static int once; if (count && !once++) MLOG("NVN indexed quad strip: %d %u-bit indices drawn as %zu triangles", di->count, width * 8, count / 3);
+            return;
+        }
         void *mb; uint64_t mo;
         uint64_t gpu;
         if (!mtl_gpu_addr(di->ibuf, 1, &mb, &mo, &gpu)) { RED_ONCE(22, "Index buffer is not in a memory pool"); return; }
