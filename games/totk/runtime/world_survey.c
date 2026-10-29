@@ -243,6 +243,8 @@ static _Atomic int noclip_wanted;
 static _Atomic uint32_t noclip_speed_bits = 0x41400000;   /* 12.0f m/s */
 static struct { int holding; float xyz[3]; uint64_t at_ns; } noclip;   /* frame-end thread only */
 static _Atomic uint64_t noclip_guard_until_ns;   /* noclip_guard (1.4.3); read on the input thread too: the frame tick keeps running until then */
+/* After noclip: Link falls free and stays guarded until he has stopped (noclip_guard). on: not stopped yet. */
+static struct { _Atomic int on; int still; float y; uint64_t t0; } noclip_settle;
 static pthread_mutex_t noclip_goto_lock = PTHREAD_MUTEX_INITIALIZER;
 static struct { int pending, direct; float xyz[3]; } noclip_goto;   /* a teleport for the next tick (runtime_noclip_goto) */
 static _Atomic int as_active;   /* auto shrine is running (below, before runtime_survey_tick) */
@@ -682,61 +684,17 @@ uint64_t runtime_noclip_taken(void) { return atomic_load(&noclip_wanted) ? NOCLI
    left stick moves relative to the camera (up: away from it, right: to the screen's right; level, whatever the camera's
    pitch) and the triggers raise (ZR / RT) and lower (ZL / LT). Without a camera yet, his facing. Gravity and collisions
    act between frames and are undone by the next hold. */
-/* Soft landing (2026-10-28): switched off in the air, the player used to drop from where he was held, and a high fall
-   kills whatever his hearts. He is lowered at NOCLIP_LAND_SPEED instead and let go once he stands: the hold puts him at
-   noclip.xyz each frame and the game's physics acts in between, so in the air he reads back a little lower (gravity, a few
-   millimetres a frame) and on the ground not lower, or pushed up out of it. Let go after NOCLIP_LAND_FRAMES such frames
-   in a row (pushed up: two), or NOCLIP_LAND_S seconds at most; noclip on again ends it too. */
-enum { NOCLIP_LAND_SPEED = 12, NOCLIP_LAND_FRAMES = 6, NOCLIP_LAND_S = 60 };
-static struct { int on, still, pushed, sank; uint64_t t0; float lowest_sag, highest_sag; } noclip_land;
+/* No soft landing (2026-10-28): lowering him while held never saw him stand (the hold leaves physics nothing to act on)
+   and pushed him into the ground three times. Switched off, he is let go where he is and falls as the game has him fall;
+   noclip_guard keeps him alive and resets the fall until he has stopped. noclip_land stays for auto korok's resets. */
+static struct { int on; } noclip_land;
 static void noclip_release(const char *why) {
     if (noclip.holding) fprintf(stderr, "[noclip] released at %.1f,%.1f,%.1f%s%s\n", noclip.xyz[0], noclip.xyz[1], noclip.xyz[2], why ? ": " : "", why ? why : "");
     noclip.holding = 0; noclip_land.on = 0;
 }
-/* One frame of the soft landing; 0 once he is let go. */
-static int noclip_landing(uintptr_t actor, uint64_t now) {
-    float at[3];
-    if (!noclip_land.on) {
-        noclip_land.on = 1; noclip_land.still = noclip_land.pushed = noclip_land.sank = 0; noclip_land.t0 = now; noclip_land.lowest_sag = 1e9f; noclip_land.highest_sag = -1e9f;
-        fprintf(stderr, "[noclip] landing from %.1f,%.1f,%.1f\n", noclip.xyz[0], noclip.xyz[1], noclip.xyz[2]);
-    } else if (read_mem(actor + ACTOR_POS, at, sizeof at) && valid_xyz(at)) {
-        float sag = noclip.xyz[1] - at[1];   /* how far the game moved him down since the last hold */
-        if (sag < noclip_land.lowest_sag) noclip_land.lowest_sag = sag;
-        if (sag > noclip_land.highest_sag) noclip_land.highest_sag = sag;
-        if (sag > 0.0005f) { noclip_land.sank = 1; noclip_land.still = 0; noclip_land.pushed = 0; }
-        else if (sag < -0.003f) { noclip_land.pushed++; noclip_land.still++; }
-        else { noclip_land.pushed = 0; noclip_land.still++; }
-        /* still frames count only once the air has been seen to sag (else this physics does not act between holds and
-           only a push out of the ground says he stands) */
-        if (noclip_land.pushed >= 2 || (noclip_land.sank && noclip_land.still >= NOCLIP_LAND_FRAMES)) {
-            char why[120]; snprintf(why, sizeof why, "standing (%s; sag %.4f..%.4f m)", noclip_land.pushed >= 2 ? "pushed up" : "no longer sinking", noclip_land.lowest_sag, noclip_land.highest_sag);
-            noclip_release(why); return 0;
-        }
-    }
-    if (now - noclip_land.t0 > NOCLIP_LAND_S * 1000000000ull) { noclip_release("landing took too long"); return 0; }
-    return 1;
-}
 static void noclip_tick(uintptr_t actor) {
-    if (!atomic_load(&noclip_wanted) && noclip.holding && noclip_force && actor) {   /* switched off: the soft landing */
-        uint64_t now = runtime_now_ns(); float rot[9], matrix[12];
-        float dt = (float)(now - noclip.at_ns) * 1e-9f; noclip.at_ns = now;
-        if (!(dt > 0)) dt = 0;
-        if (dt > 0.1f) dt = 0.1f;
-        noclip_flight.on = 0;
-        if (!read_mem(actor + ACTOR_ROT, rot, sizeof rot)) { noclip_release("no rotation"); return; }
-        for (unsigned i = 0; i < 9; i++) if (!isfinite(rot[i]) || fabsf(rot[i]) > 2) { noclip_release("no rotation"); return; }
-        if (!noclip_landing(actor, now)) return;
-        float next[3] = {noclip.xyz[0], noclip.xyz[1] - NOCLIP_LAND_SPEED * dt, noclip.xyz[2]};
-        if (valid_xyz(next)) memcpy(noclip.xyz, next, sizeof next); else { noclip_release("the map's edge"); return; }
-        for (unsigned row = 0; row < 3; row++) {
-            for (unsigned col = 0; col < 3; col++) matrix[row * 4 + col] = rot[row * 3 + col];
-            matrix[row * 4 + 3] = noclip.xyz[row];
-        }
-        noclip_force((void *)actor, matrix, 0);
-        return;
-    }
     if (!atomic_load(&noclip_wanted) || !noclip_force || !actor) {
-        noclip_release(NULL);
+        noclip_release(atomic_load(&noclip_wanted) ? NULL : "falls free, guarded until he stops");
         if (!atomic_load(&noclip_wanted)) noclip_flight.on = 0;
         return;
     }
@@ -744,7 +702,6 @@ static void noclip_tick(uintptr_t actor) {
     uint64_t now = runtime_now_ns();
     if (!read_mem(actor + ACTOR_ROT, rot, sizeof rot)) return;
     for (unsigned i = 0; i < 9; i++) if (!isfinite(rot[i]) || fabsf(rot[i]) > 2) return;
-    if (noclip_land.on) { noclip_land.on = 0; fprintf(stderr, "[noclip] landing ended: noclip on again\n"); }
     if (!noclip.holding) {
         if (!read_mem(actor + ACTOR_POS, noclip.xyz, sizeof noclip.xyz) || !valid_xyz(noclip.xyz)) return;
         noclip.holding = 1; noclip.at_ns = now;
@@ -1692,25 +1649,59 @@ static uintptr_t ctl_component(uintptr_t actor, unsigned index) {
    +0x8 and the start height at +0x560 and stores the fall so far, start minus his height (actor +0x2b8), at +0x564.
    While guarded the start is set to where he is and the fall to 0 every frame, as afiaka87/totk-mods self-recall does
    for its own teleports (MIT; RecallMovement.cpp FallHeightUpdateHook, its 1.4.3 address of the same function). The
-   component is the one self-recall reaches as [actor+0x228]+0x3a8 (index 0x75); only used when its +0x8 is this actor. */
-enum { NOCLIP_GUARD_S = 8, COMPONENT_PLAYER = 0x75, PLAYER_FALL = 0x1218, FALL_ACTOR = 0x8, FALL_START = 0x560, FALL_SO_FAR = 0x564 };
+   component holding it: self-recall's [actor+0x228]+0x3a8 (index 0x75) was not it in 1.4.3 ("not found", 2026-10-28),
+   so the player's components are searched for the one whose +0x1218 calculator names this actor at +0x8 (the game's own
+   code reads his height and components through it), and that index is kept.
+   Until he stops (2026-10-28, user: "until link actually lands"; killed three times switching noclip off just above the
+   ground): the guard lasts from noclip on until NOCLIP_STILL_FRAMES frames in a row without his height changing by
+   NOCLIP_STILL_M (stood, or holding on), then NOCLIP_GUARD_S seconds more; no fixed time, NOCLIP_SETTLE_S at most. */
+enum { NOCLIP_GUARD_S = 2, NOCLIP_STILL_FRAMES = 20, NOCLIP_SETTLE_S = 120, PLAYER_FALL = 0x1218, FALL_ACTOR = 0x8, FALL_START = 0x560, FALL_SO_FAR = 0x564,
+       PLAYER_COMPONENTS_SEARCHED = 0x200 };
+#define NOCLIP_STILL_M 0.01f
+static uintptr_t noclip_fall_calculator(uintptr_t actor) {
+    static int index = -1, said; static unsigned looks;
+    if (index >= 0) {
+        uintptr_t c = ctl_component(actor, (unsigned)index);
+        if (c && read_ptr(c + PLAYER_FALL + FALL_ACTOR) == actor) return c + PLAYER_FALL;
+        index = -1;
+    }
+    if (looks++ % 30) return 0;   /* a search about twice a second until found */
+    for (unsigned i = 0; i < PLAYER_COMPONENTS_SEARCHED; i++) {
+        uintptr_t c = ctl_component(actor, i); float start;
+        if (!c || read_ptr(c + PLAYER_FALL + FALL_ACTOR) != actor || !read_mem(c + PLAYER_FALL + FALL_START, &start, 4) || !isfinite(start)) continue;
+        index = (int)i;
+        fprintf(stderr, "[noclip] fall calculator: component %#x + %#x (%#llx), fall start %.1f\n", i, PLAYER_FALL, (unsigned long long)(c + PLAYER_FALL), start);
+        return c + PLAYER_FALL;
+    }
+    if (!said) { said = 1; fprintf(stderr, "[noclip] [red] fall calculator not found in the player's first %d components: falls are not reset\n", PLAYER_COMPONENTS_SEARCHED); }
+    return 0;
+}
 static void noclip_no_fall(uintptr_t actor) {
-    static int said;
-    uintptr_t player = ctl_component(actor, COMPONENT_PLAYER), fall = player ? player + PLAYER_FALL : 0;
+    uintptr_t fall = noclip_fall_calculator(actor);
     float y; struct { float start, so_far; } reset;
-    if (!fall || read_ptr(fall + FALL_ACTOR) != actor || !read_mem(actor + ACTOR_POS + 4, &y, 4) || !isfinite(y)) {
-        if (!said) { said = 1; fprintf(stderr, "[noclip] [red] fall calculator not found (component %#llx): falls are not reset\n", (unsigned long long)player); }
-        return;
-    }
+    if (!fall || !read_mem(actor + ACTOR_POS + 4, &y, 4) || !isfinite(y)) return;
     reset.start = y; reset.so_far = 0;
-    if (mach_vm_write(mach_task_self(), fall + FALL_START, (vm_offset_t)&reset, sizeof reset) == KERN_SUCCESS && !said) {
-        said = 1; fprintf(stderr, "[noclip] fall calculator %#llx: the fall start follows Link while guarded\n", (unsigned long long)fall);
-    }
+    mach_vm_write(mach_task_self(), fall + FALL_START, (vm_offset_t)&reset, sizeof reset);
 }
 static void noclip_guard(uintptr_t actor) {
     static unsigned refills; uint64_t now = runtime_now_ns();
     /* auto korok keeps Link guarded through each korok's steps (walking, a lift, the discovery event), not only in noclip */
-    if (atomic_load(&noclip_wanted) || noclip.holding || atomic_load(&ak_active)) atomic_store(&noclip_guard_until_ns, now + NOCLIP_GUARD_S * 1000000000ull);
+    int flying = atomic_load(&noclip_wanted) || noclip.holding;
+    if (flying) { atomic_store(&noclip_settle.on, 1); noclip_settle.still = 0; noclip_settle.y = NAN; noclip_settle.t0 = now; }
+    else if (atomic_load(&noclip_settle.on) && actor) {   /* let go: guarded until his height stays put */
+        float y;
+        if (read_mem(actor + ACTOR_POS + 4, &y, 4) && isfinite(y)) {
+            noclip_settle.still = isfinite(noclip_settle.y) && fabsf(y - noclip_settle.y) < NOCLIP_STILL_M ? noclip_settle.still + 1 : 0;
+            noclip_settle.y = y;
+        }
+        int timeout = now - noclip_settle.t0 > NOCLIP_SETTLE_S * 1000000000ull;
+        if (noclip_settle.still >= NOCLIP_STILL_FRAMES || timeout) {
+            atomic_store(&noclip_settle.on, 0);
+            fprintf(stderr, "[noclip] %s at height %.1f, %.1f s after noclip: guarded %d s more\n", timeout ? "still moving" : "Link stopped", noclip_settle.y,
+                    (double)(now - noclip_settle.t0) * 1e-9, NOCLIP_GUARD_S);
+        }
+    }
+    if (flying || atomic_load(&noclip_settle.on) || atomic_load(&ak_active)) atomic_store(&noclip_guard_until_ns, now + NOCLIP_GUARD_S * 1000000000ull);
     if (now >= atomic_load(&noclip_guard_until_ns) || !actor) return;
     if (!atomic_load(&ak_no_fall)) noclip_no_fall(actor);
     uintptr_t life_component = ctl_component(actor, COMPONENT_LIFE), life = life_component ? read_ptr(life_component + 0x1830) : 0;
@@ -2079,13 +2070,13 @@ static int ak_hold_at(const float to[3], double dt) {
     memcpy(noclip.xyz, to, 12);
     return 1;
 }
-/* Let go in the air without the soft landing (a dive, or the discovery event, which opens the paraglider itself). */
+/* Let go in the air (a dive, or the discovery event, which opens the paraglider itself). */
 static void ak_let_go(const char *why) {
     if (!atomic_load(&noclip_wanted) && !noclip.holding) return;
     if (atomic_load(&noclip_wanted)) runtime_noclip_set(0);
     dm_gfx_camera_want(1);
     pthread_mutex_lock(&noclip_goto_lock); noclip_goto.pending = 0; pthread_mutex_unlock(&noclip_goto_lock);
-    fprintf(stderr, "[autokorok] let go at %.1f,%.1f,%.1f without the soft landing: %s\n", noclip.xyz[0], noclip.xyz[1], noclip.xyz[2], why);
+    fprintf(stderr, "[autokorok] let go at %.1f,%.1f,%.1f in the air: %s\n", noclip.xyz[0], noclip.xyz[1], noclip.xyz[2], why);
     noclip.holding = 0; noclip_land.on = 0; noclip_flight.on = 0;
 }
 static void ak_go(int state, double now) {
@@ -2093,8 +2084,8 @@ static void ak_go(int state, double now) {
     ak.state = state; ak.t0 = now; ak.phase = 0; ak.phase_t = now;
     ak_say();
 }
-/* The run ends: every key let go; noclip off (a flight first ends on the ground; the soft landing sets him down from
-   wherever he is held); a summary and a sound. */
+/* The run ends: every key let go; noclip off (a flight first ends on the ground; from wherever he is held he falls,
+   guarded until he stops); a summary and a sound. */
 static void ak_end(int ok, const char *why, double now) {
     as_walk(0, NULL); runtime_input_lease_release_all(); atomic_store(&ak_no_fall, 0);
     snprintf(ak.why, sizeof ak.why, "%s%s", ok ? "Finished: " : "", why);
@@ -2102,7 +2093,7 @@ static void ak_end(int ok, const char *why, double now) {
     fprintf(stderr, "[autokorok] summary: %d found, %d failed%s%s%s, %.0f s\n", ak.done, ak.failed, ak.failed ? " (" : "", ak.failed_list, ak.failed ? ")" : "", now - ak.started);
     runtime_front_run_sound(ok);
     if (atomic_load(&noclip_wanted) && ak_flying()) { ak_go(AK_STOPPING, now); return; }
-    if (atomic_load(&noclip_wanted)) runtime_noclip_set(0);   /* the soft landing */
+    if (atomic_load(&noclip_wanted)) runtime_noclip_set(0);   /* he falls, guarded until he stops (noclip_guard) */
     else dm_gfx_camera_want(0);
     ak_go(AK_OFF, now); atomic_store(&ak_active, 0); ak_say();
 }
@@ -2125,7 +2116,7 @@ static void ak_fail(const char *what, double now) {
     ak.run[ak.k] = KOROK_SKIP_FAILED; ak.failed++; ak.failed_row++;
     size_t o = strlen(ak.failed_list);
     if (o + 80 < sizeof ak.failed_list) snprintf(ak.failed_list + o, sizeof ak.failed_list - o, "%s%s %llu", o ? ", " : "", ak_type_name(ak.k), (unsigned long long)k->hash);
-    if (atomic_load(&noclip_wanted) && !ak_flying()) runtime_noclip_set(0);   /* set down (the soft landing) before the next */
+    if (atomic_load(&noclip_wanted) && !ak_flying()) runtime_noclip_set(0);   /* set down (a guarded fall) before the next */
     if (ak.one || ak.target >= 0) { char why[300]; snprintf(why, sizeof why, "Stopped: the korok failed: %s", what); ak_end(0, why, now); return; }
     if (ak.failed_row >= AK_FAILS_IN_A_ROW) { ak_end(0, "Stopped: five koroks failed in a row", now); return; }
     ak_go(AK_PICK, now);
@@ -2226,9 +2217,10 @@ static void ak_tick_step(uintptr_t actor, double now, double dt) {
         ak_step_next(now); return;
     case KS_LAND:
         if (ak.phase == 0) { if (!ak_hold_at(s->at, dt)) return; runtime_noclip_set(0); dm_gfx_camera_want(1); ak.phase = 1; ak.phase_t = now; return; }
-        if (ak.phase == 1) {   /* the soft landing lets go once he stands (world_survey.c noclip_landing) */
-            if (noclip.holding && c < 30) return;
-            fprintf(stderr, "[autokorok] %s at %.1f,%.1f,%.1f after %.1f s (%.1f m from the step's place)\n", noclip.holding ? "still not standing" : "standing", at[0], at[1], at[2], c,
+        if (ak.phase == 1) {   /* noclip off: he falls, guarded, until his height stops changing (noclip_guard) */
+            int down = !noclip.holding && !atomic_load(&noclip_settle.on);   /* noclip_guard: his height has stopped changing */
+            if (!down && c < 30) return;
+            fprintf(stderr, "[autokorok] %s at %.1f,%.1f,%.1f after %.1f s (%.1f m from the step's place)\n", down ? "standing" : "still not standing", at[0], at[1], at[2], c,
                     have ? landmark_distance(at, s->at) : -1.0f);
             ak.phase = 2; ak.phase_t = now; return;
         }
@@ -2260,7 +2252,7 @@ static void ak_tick_step(uintptr_t actor, double now, double dt) {
             ak.phase = 4; ak.phase_t = now;
         } else if (ak.phase == 4 && c >= s->secs + 0.2) ak_step_next(now);
         return;
-    case KS_DROP:   /* let go without the soft landing, the falls not reset (a dive is a long fall into water); until he stops falling */
+    case KS_DROP:   /* let go in the air, the falls not reset (a dive is a long fall into water); until he stops falling */
         if (ak.phase == 0) { atomic_store(&ak_no_fall, 1); ak_let_go("a dive"); ak.phase = 1; ak.phase_t = now; if (have) memcpy(ak.probe, at, 12); return; }
         if (c >= 0.5 && have) {
             float fell = ak.probe[1] - at[1]; memcpy(ak.probe, at, 12); ak.phase_t = now;
@@ -2320,7 +2312,7 @@ static void autokorok_tick(uintptr_t actor, double now) {
         }
         return;
     }
-    case AK_STOPPING:   /* a flight first lands where it was going, then noclip off (the soft landing) */
+    case AK_STOPPING:   /* a flight first lands where it was going, then noclip off (a guarded fall) */
         if (t < 60 && ak_flying()) return;
         if (atomic_load(&noclip_wanted)) runtime_noclip_set(0);
         fprintf(stderr, "[autokorok] set down\n");
