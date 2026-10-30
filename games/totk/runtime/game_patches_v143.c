@@ -29,9 +29,10 @@ typedef struct { uint64_t off; uint32_t original, replacement; } Patch;
      +256  high-FPS trampoline bounce (20)          +288  field of view, 2 x 48 (aspect_patch.h)
      +384  render resolution + pick kick (32)       +416  world: time of day, render distance x 2 (3 x 32)
      +512  fog (48)                                 +560  shadow resolution (40), to +600
-     +608  high-FPS fade minimum step, 2 x 40 (Mac only), to +688 */
+     +608  high-FPS fade minimum step, 2 x 40 (Mac only), to +688
+     +688  noclip god mode, registerDamage (80, Mac only), to +768 */
 enum { CLOTH_STUB_AT = 176, BOUNCE_STUB_AT = 256, FOV_STUB_AT = 288, RENDER_VENEER = 384, WORLD_STUBS = 416,
-       FOG_STUB_AT = 512, SHADOW_STUB_AT = 560, FADE_STUB_AT = 608, STUBS_END = 688 };
+       FOG_STUB_AT = 512, SHADOW_STUB_AT = 560, FADE_STUB_AT = 608, STUBS_END = 768 };
 static const Patch fps60[] = {
     {0x2db204, 0x6b08015f, 0x7100055f},
     {0x2db208, 0x1a89b10a, 0x1a9fa52a},
@@ -262,6 +263,69 @@ static void patch_preactor_fade(Module *m){
             (unsigned long long)stub);
 }
 #endif
+/* Noclip god mode (2026-10-30): no damage at all to Link while noclip's guard is on (world_survey.c noclip_guard: noclip on,
+   and after it until he has stopped). Switching noclip off at 2103 m killed him on landing with the fall calculator reset
+   and his life refilled every frame: a blow larger than all his hearts kills before the next refill.
+   Every hit reaches the game through one function, InternalDamageCalculator::registerDamage (1.4.3 main+0x318f6c; the
+   1.4.3 address afiaka87/totk-mods self-recall hooks, MIT, RecallMovement.cpp RegisterInternalDamageHook, from its 1.2.1
+   0x9e4838): x0 the calculator (its actor at +0x8), x2 the damage packet (amount s32 +0x0, type u32 +0x14, mask u32
+   +0x20). It returns at once when the type or the mask is 0, otherwise ORs 1 << type into calculator +0x14 and adds the
+   amount to calculator +0x18, which the life update takes off later. Its callers in 1.4.3: 0x31408c (type 4, the fall:
+   the amount from a virtual call on the packet, registered when at least 1), 0x301024 (type 13) on the player
+   component's calculator at +0x1218 (the one noclip_guard resets the fall in: +0x8 is the actor there too), 0x1cd9480
+   (type 7, the same calculator's 0x1cd9380) and 0x441398 (type 14). Its first word, mov x8, x2, becomes a branch to a
+   veneer: while the data page +NOCLIP_DAMAGE_DATA (u64) holds an actor and the packet's calculator names that actor,
+   with a non-zero type and mask (anything else the original drops itself), the packet is not registered (amount and
+   type at +8 / +12, a count at +16 for the log); otherwise it runs mov x8, x2 and goes on at 0x318f70. x8, x9 and x10
+   are scratch: the original writes all three before reading them. Flags are not live at a function entry; no stack.
+   world_survey.c writes the player there while guarded and 0 when the guard ends. Enemies and every other actor take
+   damage as before. Mac only (the iOS export has no noclip and leaves the word alone). TOTK_NOCLIP_NODAMAGE=0: off. */
+#define NOCLIP_DAMAGE_DATA 0x200u
+enum { NOCLIP_DAMAGE_STUB_AT = 688 };
+_Atomic uint64_t *runtime_noclip_damage_block;
+#if !TARGET_OS_IPHONE
+static void patch_noclip_damage(Module *m){
+    if(getenv("TOTK_EXPORT_IOS"))return;   /* the Mac host also builds the phone's code */
+    const char *e=getenv("TOTK_NOCLIP_NODAMAGE");if(e&&!strcmp(e,"0"))return;
+    enum { SITE=0x318f6c, WORDS=20 };
+    uint64_t data=(m->file_size+0x3fff)&~0x3fffULL,stub=((m->text_end+15)&~15ULL)+NOCLIP_DAMAGE_STUB_AT;
+    if(stub+WORDS*4>((m->text_end+15)&~15ULL)+STUBS_END||stub+WORDS*4>((m->text_end+0xfff)&~0xfffULL)||
+       data+NOCLIP_DAMAGE_DATA+24>m->size||SITE+8>m->text_end)
+        runtime_fail("1.4.3 noclip damage veneer layout");
+    uint32_t got[2];memcpy(got,m->base+SITE,8);
+    if(got[0]!=0xaa0203e8||got[1]!=0xb8414d09)   /* mov x8, x2 / ldr w9, [x8, #0x14]! */
+        runtime_fail("1.4.3 noclip damage: registerDamage does not match");
+    for(unsigned i=0;i<WORDS*4;i++)if(m->base[stub+i])runtime_fail("1.4.3 noclip damage veneer padding not empty");
+    uint32_t code[WORDS]={
+        adrp(8,(uintptr_t)m->base+stub,(uintptr_t)m->base+data),
+        0xf9410109,   /* ldr x9, [x8, #0x200]: the guarded actor, 0 = off */
+        0xb4000209,   /* cbz x9, original */
+        0xb940144a,   /* ldr w10, [x2, #0x14]: type */
+        0x340001ca,   /* cbz w10, original */
+        0xb940204a,   /* ldr w10, [x2, #0x20]: mask */
+        0x3400018a,   /* cbz w10, original */
+        0xf940040a,   /* ldr x10, [x0, #8]: the calculator's actor */
+        0xeb09015f,   /* cmp x10, x9 */
+        0x54000121,   /* b.ne original */
+        0xb9400049,   /* ldr w9, [x2]: amount */
+        0xb940144a,   /* ldr w10, [x2, #0x14] */
+        0xb9020909,   /* str w9, [x8, #0x208] */
+        0xb9020d0a,   /* str w10, [x8, #0x20c] */
+        0xb9421109,   /* ldr w9, [x8, #0x210] */
+        0x11000529,   /* add w9, w9, #1 */
+        0xb9021109,   /* str w9, [x8, #0x210]: dropped */
+        0xd65f03c0,   /* ret */
+        0xaa0203e8,   /* original: mov x8, x2 */
+        branch(stub+19*4,SITE+4),
+    };
+    memset(m->base+data+NOCLIP_DAMAGE_DATA,0,24);
+    memcpy(m->base+stub,code,sizeof code);
+    uint32_t jump=branch(SITE,stub);memcpy(m->base+SITE,&jump,4);
+    runtime_noclip_damage_block=(_Atomic uint64_t *)(void *)(m->base+data+NOCLIP_DAMAGE_DATA);
+    fprintf(stderr,"[noclip] god mode patch in: no damage to Link while guarded (registerDamage main+%#x, veneer +%#llx)\n",
+            SITE,(unsigned long long)stub);
+}
+#endif
 /* Benchmark camera (survey sessions only, 2026-10-20). The look-at camera update stores the frame's eye (doubles +0x60,
    floats +0x38), target (doubles +0x78, floats +0x44) and normalised up (+0x50) into the camera in x20 at
    main+0x6287b4..0x628824, then builds the view matrix from d1,d2,d0 / d3,d4,d5 / s7,s16,s17. The adrp at main+0x628828
@@ -387,6 +451,7 @@ void runtime_game_patches(Module *m) {
     patch_slowmo_bounce(m);
 #if !TARGET_OS_IPHONE
     patch_preactor_fade(m);
+    patch_noclip_damage(m);
     diag_main=m;   /* frmwatch / xpoke */
 #endif
     { static const uint64_t sites[] = {0x628c74, 0xb43460, 0x1ff04f4, 0x253fbb0};   /* camera update and setup, viewport x2 */

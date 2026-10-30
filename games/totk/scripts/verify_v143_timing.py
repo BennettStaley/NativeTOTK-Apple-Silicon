@@ -21,7 +21,7 @@ def main():
  target=out/'main-timing-fixture.bin'
  # This fork writes the render-resolution words only when something asks (TOTK_RENDER_RES=0 leaves main alone), so the
  # fixture checks the timing patches by themselves.
- fixture_env=os.environ|{'TOTK_REALTIME':'1','TOTK_FPS60':'1','TOTK_OUTPUT_RES':'0','TOTK_ASPECT':'0','TOTK_CLOTH_REALTIME':'1','TOTK_HIGHFPS_FIX':'1','TOTK_RENDER_RES':'0','TOTK_PREACTOR_FADE_FIX':'1'}
+ fixture_env=os.environ|{'TOTK_REALTIME':'1','TOTK_FPS60':'1','TOTK_OUTPUT_RES':'0','TOTK_ASPECT':'0','TOTK_CLOTH_REALTIME':'1','TOTK_HIGHFPS_FIX':'1','TOTK_RENDER_RES':'0','TOTK_PREACTOR_FADE_FIX':'1','TOTK_NOCLIP_NODAMAGE':'1'}
  # Real-time frame step (runtime_frame_step_update): steady 120, 144, 160 and 240 fps, and short and long presents
  # alternating (around the 120 cap, and above it), must give game time = real time. A 1/120 s floor per interval made
  # 144 fps run 1.2x and 240 fps 2x fast, and alternating 1/240 + 1/80 s 1.33x fast. A hitch is cut at 1/15 s per
@@ -53,6 +53,10 @@ def main():
  allowed|={0xa7ac4,0x95dd24,0x6155e4,0x615660}|{stub+608+4*i for i in range(20)}
  assert stub+688<=layout['RO_OFF'],'fade veneers overlap read-only data'
  assert raw[stub+608:stub+688]==bytes(80),'fade veneer padding not empty in the rewritten image'
+ # Noclip god mode (patch_noclip_damage, Mac only): registerDamage's first word and one 80-byte veneer at +688.
+ allowed|={0x318f6c}|{stub+688+4*i for i in range(20)}
+ assert stub+768<=layout['RO_OFF'],'noclip damage veneer overlaps read-only data'
+ assert raw[stub+688:stub+768]==bytes(80),'noclip damage veneer padding not empty in the rewritten image'
  # The settings menu's always-installed stubs (verify_v143_output.py checks them): field of view (2 sites, stubs +288..+384),
  # time of day / render distance (3 sites, +416..+512), fog and shadow resolution (2 sites, +512..+600).
  allowed|={0x628c3c,0xb4342c,0x68c15c,0x628c30,0xb43420,0xd3050,0x683604}|{o for o in changes if stub+288<=o<stub+384 or stub+416<=o<stub+600}
@@ -201,12 +205,43 @@ def main():
    fade_cases.append(dict(site=hex(site),input=label,original=outputs[0][0],fixed=outputs[1][0]))
  assert any(c['input']=='120fps' and c['original']==0 and c['fixed']==1 for c in fade_cases),'negative control: 120 fps truncates to 0 originally'
  assert all(c['original']==c['fixed'] for c in fade_cases if c['input'] in ('15fps','30fps','40fps','50fps','60fps','0x0','0x80000000'))
+ # Noclip god mode (patch_noclip_damage): run registerDamage's entry with the emitted veneer. A packet is dropped (return to
+ # the caller, amount / type / count on the data page +0x200) only while the guard holds an actor, the calculator (x0+8)
+ # names that actor, and its type and mask are non-zero; otherwise the original first instruction runs (x8 = x2) and the
+ # function goes on at 0x318f70 with the data page untouched. x0-x7, x11-x28 and sp come through either way.
+ noclip_cases=[]
+ PLAYER,OTHER,CALC,PACKET=0x10004000,0x10005000,0x10006000,0x10007000
+ for guard in (0,PLAYER):
+  for owner in (PLAYER,OTHER):
+   for kind,mask in ((4,0x400),(13,0x400),(0,0x400),(4,0)):
+    for apply in (False,True):
+     mu=Uc(UC_ARCH_ARM64,UC_MODE_ARM);mu.mem_map(0,len(patched));mu.mem_write(0,patched if apply else raw)
+     mu.mem_map(0x10000000,0x10000);mu.mem_write(CALC+8,struct.pack('<Q',owner))
+     mu.mem_map(0x20000000,0x1000);mu.mem_write(0x20000000,struct.pack('<I',0x14000000))   # the caller: b . (the run ends on the count)
+     mu.mem_write(PACKET,struct.pack('<i16xI8xI',300,kind,mask))
+     mu.mem_write(data+0x200,struct.pack('<QIII',guard,0,0,7))
+     registers={getattr(r,f'UC_ARM64_REG_X{i}'):0x1122334400000000+i for i in range(29) if i not in (8,9,10)}
+     registers[UC_ARM64_REG_X0]=CALC;registers[getattr(r,'UC_ARM64_REG_X2')]=PACKET
+     for register,value in registers.items():mu.reg_write(register,value)
+     mu.reg_write(r.UC_ARM64_REG_SP,0x1000f000);mu.reg_write(r.UC_ARM64_REG_LR,0x20000000)
+     mu.emu_start(0x318f6c,0x318f70,count=32)
+     pc=mu.reg_read(UC_ARM64_REG_PC);block=struct.unpack('<QIII',mu.mem_read(data+0x200,20))
+     assert all(mu.reg_read(register)==value for register,value in registers.items()),('noclip damage: live GPR',guard,owner,kind,mask)
+     assert mu.reg_read(r.UC_ARM64_REG_SP)==0x1000f000,'noclip damage: stack'
+     drop=apply and guard and owner==guard and kind and mask
+     if drop:assert pc==0x20000000 and block==(guard,300,kind,8),('noclip damage: not dropped',hex(pc),block)
+     else:
+      assert pc==0x318f70 and mu.reg_read(UC_ARM64_REG_X8)==PACKET,('noclip damage: original path',apply,guard,owner,kind,mask,hex(pc))
+      assert block==(guard,0,0,7),('noclip damage: data page written on the original path',block)
+     noclip_cases.append(dict(guard=bool(guard),player=owner==PLAYER,type=kind,mask=mask,patched=apply,dropped=bool(drop)))
+ assert sum(c['dropped'] for c in noclip_cases)==2,'noclip damage: exactly the guarded player packets with a type and mask drop'
  # The Mac host also builds the phone's code: the iOS export must keep the four original words and empty padding.
  exported=out/'main-timing-export-fixture.bin'
  subprocess.run(['build/v143-timing-fixture',str(source),str(exported),str(layout['TEXT_END'])],capture_output=True,text=True,check=True,env=fixture_env|{'TOTK_EXPORT_IOS':'1'})
  export_image=exported.read_bytes();exported.unlink(missing_ok=True)
  for site in (0xa7ac4,0x95dd24,0x6155e4,0x615660):assert export_image[site:site+4]==raw[site:site+4],('Mac fade fix leaked into the iOS export',hex(site))
  assert export_image[stub+608:stub+688]==bytes(80),'fade veneers in the iOS export'
- report=dict(status='pass',version='v143',scope='production ARM64 timing and secondary cloth/hair clock veneers; original clock arithmetic, half-step selector, slow motion, zero factor, both inline/delegated actor paths, ordinary clock and ABI preservation',cases=cases,realtime_cases=realtime_cases,negative_control=negative,cloth_cases=cloth_cases,cloth_negative_control=cloth_negative,cloth_instruction_guard_negative_controls=4,bounce_cases=bounce_cases,fade_cases=fade_cases,veneer_offset=hex(stub),changed_original_words=len(changes),sources={p:hashlib.sha256((ROOT/p).read_bytes()).hexdigest() for p in ('runtime/game_patches_v143.c','scripts/v143_timing_fixture.c','scripts/verify_v143_timing.py')})
- (out/'realtime-validation.json').write_text(json.dumps(report,indent=2)+'\n');print(json.dumps(dict(status='pass',cases=len(cases),realtime_ratios=[round(c['ratio'],6) for c in realtime_cases],cloth_cases=len(cloth_cases),cloth_negative_control=cloth_negative,bounce_cases=len(bounce_cases),fade_cases=len(fade_cases),changed_original_words=len(changes))))
+ assert export_image[0x318f6c:0x318f70]==raw[0x318f6c:0x318f70] and export_image[stub+688:stub+768]==bytes(80),'noclip god mode in the iOS export'
+ report=dict(status='pass',version='v143',scope='production ARM64 timing and secondary cloth/hair clock veneers; original clock arithmetic, half-step selector, slow motion, zero factor, both inline/delegated actor paths, ordinary clock and ABI preservation',cases=cases,realtime_cases=realtime_cases,negative_control=negative,cloth_cases=cloth_cases,cloth_negative_control=cloth_negative,cloth_instruction_guard_negative_controls=4,bounce_cases=bounce_cases,fade_cases=fade_cases,noclip_damage_cases=noclip_cases,veneer_offset=hex(stub),changed_original_words=len(changes),sources={p:hashlib.sha256((ROOT/p).read_bytes()).hexdigest() for p in ('runtime/game_patches_v143.c','scripts/v143_timing_fixture.c','scripts/verify_v143_timing.py')})
+ (out/'realtime-validation.json').write_text(json.dumps(report,indent=2)+'\n');print(json.dumps(dict(status='pass',cases=len(cases),realtime_ratios=[round(c['ratio'],6) for c in realtime_cases],cloth_cases=len(cloth_cases),cloth_negative_control=cloth_negative,bounce_cases=len(bounce_cases),fade_cases=len(fade_cases),noclip_damage_cases=len(noclip_cases),changed_original_words=len(changes))))
 if __name__=='__main__':main()

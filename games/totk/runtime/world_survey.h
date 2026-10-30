@@ -32,6 +32,9 @@ int runtime_noclip_jump(const float xyz[3]);
 int runtime_player_pos(float xyz[3]);
 /* Set by the 1.4.3 patches in survey sessions: the benchmark camera block (world_survey.c). */
 extern uint8_t *runtime_bench_cam;
+/* Set by the 1.4.3 patches (Mac, game_patches_v143.c patch_noclip_damage): u64 [0] the actor whose damage is dropped
+   (0 = none), then u32 last amount (+8), last type (+12) and the count dropped (+16). NULL when the patch is not in. */
+extern _Atomic uint64_t *runtime_noclip_damage_block;
 /* Auto shrine (Tools › Shrines, TOTK; world_survey.c, shrine_auto.h): completes shrines one after another, the nearest
    first, by flying Link with noclip and pressing A where a player would; the game does the rest. */
 int runtime_autoshrine_available(void);

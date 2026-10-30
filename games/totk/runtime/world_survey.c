@@ -1759,7 +1759,8 @@ static uintptr_t ctl_component(uintptr_t actor, unsigned index) {
    the heat), with no health cheat on. While noclip is on, and for NOCLIP_GUARD_S seconds after it goes off (the landing),
    Link's life is set back to his maximum whenever it drops, as the cheat list's Inf. Health does (current +0x8 = max
    +0x18 of the life object, see ctl state's hp). A single blow larger than all his hearts can still kill between two
-   frames. Writes go through mach_vm_write, so a stale pointer fails instead of faulting.
+   frames: the god mode patch (noclip_godmode, below) drops such damage before the game counts it; the refill stays as a
+   second line. Writes go through mach_vm_write, so a stale pointer fails instead of faulting.
    Fall damage: a teleport's flight climbs, and touching the ground at the target counted as a fall from the top of it
    (a 260 m "fall" killed at once, 2026-10-28; high falls kill whatever the hearts). The game keeps where the fall began
    in the player's fall calculator: 1.4.3 0x1cd8500 (called as player component + 0x1218 from 0x301260) reads its actor at
@@ -1800,6 +1801,27 @@ static void noclip_no_fall(uintptr_t actor) {
     reset.start = y; reset.so_far = 0;
     mach_vm_write(mach_task_self(), fall + FALL_START, (vm_offset_t)&reset, sizeof reset);
 }
+/* God mode while guarded (game_patches_v143.c patch_noclip_damage, Mac): the player's actor on the data page makes the game
+   drop every damage packet registered for him, whatever its size (a fall from any height, a blow); 0 lets damage through
+   again. Kept through a frame without a player while the guard is on; cleared on the tick the guard ends (the tick keeps
+   running until then, runtime_survey_tick). The fall reset and the life refill below stay as a second line. */
+static void noclip_godmode(uintptr_t actor, int on, uint64_t now) {
+    _Atomic uint64_t *block = runtime_noclip_damage_block;
+    static uint32_t seen; static uint64_t said_ns;
+    if (!block || (on && !actor)) return;
+    uint64_t want = on ? actor : 0, was = atomic_load(block);
+    if (was != want) {
+        atomic_store(block, want);
+        if (!was || !want) fprintf(stderr, "[noclip] god mode %s\n", want ? "on: Link takes no damage until the guard ends" : "off: the guard is over");
+    }
+    const volatile uint32_t *drop = (const volatile uint32_t *)(const void *)((const uint8_t *)block + 8);   /* amount, type, count */
+    uint32_t count = drop[2];
+    if (count != seen && now - said_ns >= 1000000000ull) {
+        fprintf(stderr, "[noclip] damage dropped: type %u amount %d (guard %s; %u dropped so far)\n", drop[1], (int32_t)drop[0],
+                on ? "on" : "ending", count);
+        seen = count; said_ns = now;
+    }
+}
 static void noclip_guard(uintptr_t actor) {
     static unsigned refills; uint64_t now = runtime_now_ns();
     /* auto korok keeps Link guarded through each korok's steps (walking, a lift, the discovery event), not only in noclip */
@@ -1819,7 +1841,9 @@ static void noclip_guard(uintptr_t actor) {
         }
     }
     if (flying || atomic_load(&noclip_settle.on) || atomic_load(&ak_active)) atomic_store(&noclip_guard_until_ns, now + NOCLIP_GUARD_S * 1000000000ull);
-    if (now >= atomic_load(&noclip_guard_until_ns) || !actor) return;
+    int guarded = now < atomic_load(&noclip_guard_until_ns);
+    noclip_godmode(actor, guarded, now);
+    if (!guarded || !actor) return;
     if (!atomic_load(&ak_no_fall)) noclip_no_fall(actor);
     uintptr_t life_component = ctl_component(actor, COMPONENT_LIFE), life = life_component ? read_ptr(life_component + 0x1830) : 0;
     int32_t hp[2];
@@ -2704,6 +2728,10 @@ void runtime_survey_tick(uint64_t frame) {
        never lost */
     atomic_store(&runtime_survey_pending, survey_left);
     if (atomic_load(&runtime_spawn_waiting) || atomic_load(&noclip_wanted) || atomic_load(&as_active) || atomic_load(&ak_active)) atomic_store(&runtime_survey_pending, 1);
+    /* noclip let go: the tick goes on until the guard is over (noclip_guard: Link stopped + NOCLIP_GUARD_S), or the fall
+       reset, the life refill and the god mode stopped the frame after noclip went off (2026-10-30: died landing from 2103 m
+       with no "Link stopped" line) and the god mode was never cleared */
+    if (noclip.holding || atomic_load(&noclip_settle.on) || runtime_now_ns() < atomic_load(&noclip_guard_until_ns)) atomic_store(&runtime_survey_pending, 1);
 #if defined(TOTK_GAME_V143)
     if (atomic_load(&event_waiting)) atomic_store(&runtime_survey_pending, 1);   /* queued while this tick ran */
 #endif
