@@ -151,6 +151,20 @@ static _Atomic int cameraX=100,cameraY=100;
 void runtime_camera_speed_set(int axis,int percent){if(percent<25)percent=25;if(percent>300)percent=300;atomic_store(axis?&cameraY:&cameraX,percent);}
 static int32_t camera_scale(int32_t v,int percent){if(percent==100)return v;int64_t s=(int64_t)v*percent/100;return (int32_t)(s>32767?32767:s<-32767?-32767:s);}
 static int pad_states(NpadState *out,int max,const uint32_t *id,uint32_t want_style);
+/* D-pad diagnosis (2026-10-29; the user, Xbox controller over Bluetooth: at times the d-pad opens neither the weapon nor the
+   bow wheel). When a d-pad direction goes down on the controller, one line with what the game gets in that read and what
+   else holds buttons: the keys held (Mac key codes; a key whose keyUp never came stays held), scripted ctl buttons, leased
+   keys, the settings menu's hold, noclip's buttons, text capture. A press only, at most one line a second. inputLock held. */
+static void dpad_diagnose_locked(uint64_t controller,uint64_t sent,int menu_held){
+ static uint64_t before,last;uint64_t down=controller&0xf000&~before;before=controller&0xf000;if(!down)return;
+ uint64_t now=runtime_now_ns();if(last&&now-last<1000000000ull)return;last=now;
+ static const char *const dir[4]={"left","up","right","down"};int d=0;while(!(down>>(12+d)&1))d++;
+ char held_keys[48]="";size_t o=0;int leased=0;
+ for(unsigned i=0;i<128;i++){if(lease_until[i])leased++;if(keys[i]&&o+6<sizeof held_keys)o+=(size_t)snprintf(held_keys+o,sizeof held_keys-o," %u",i);}
+ fprintf(stderr,"[input] d-pad %s pressed: controller %#llx, game sent %#llx; keyboard %#llx (keys held:%s), scripted %#llx, leased keys %d, settings menu %s, noclip took %#llx, controller to the game %s\n",
+  dir[d],(unsigned long long)controller,(unsigned long long)sent,(unsigned long long)atomic_load(&heldButtons),o?held_keys:" none",(unsigned long long)ctl_held,leased,
+  menu_held?"holding input":"closed",(unsigned long long)runtime_noclip_taken(),runtime_gamepad_game_input()?"yes":"no (text capture)");
+}
 static int full_states(NpadState *out,int max,const uint32_t *id){return pad_states(out,max,id,1);}
 static int handheld_states(NpadState *out,int max,const uint32_t *id){return pad_states(out,max,id,2);}
 static int pad_states(NpadState *out,int max,const uint32_t *id,uint32_t want_style){if(max<=0)return 0;if(id)input_log(want_style==2?"handheld state":"full-key state",*id);if(!out||!id)runtime_fail("controller output pointer");pthread_mutex_lock(&inputLock);NpadState state={.sampling=++sample};lease_expire_locked();if(enabled&&allowed&&*id==pad_id()&&want_style==pad_style()&&(styles&want_style)){
@@ -158,7 +172,7 @@ static int pad_states(NpadState *out,int max,const uint32_t *id,uint32_t want_st
  state.lx=32767*((int)keys[2]-(int)keys[0]);state.ly=32767*((int)keys[13]-(int)keys[1]);state.rx=32767*((int)keys[124]-(int)keys[123]);state.ry=32767*((int)keys[126]-(int)keys[125]);
  if(heldOut.lx)state.lx=heldOut.lx;if(heldOut.ly)state.ly=heldOut.ly;if(heldOut.rx)state.rx=heldOut.rx;if(heldOut.ry)state.ry=heldOut.ry;
  if(ctl_stick[0].on){state.lx=ctl_stick[0].x;state.ly=ctl_stick[0].y;}int ctl_camera=ctl_stick[1].on;if(ctl_camera){state.rx=ctl_stick[1].x;state.ry=ctl_stick[1].y;}
- RuntimeGamepadState pad;runtime_gamepad_read(&pad);if(atomic_load(&inputHeld)){pad.buttons=0;state.buttons=0;state.lx=state.ly=state.rx=state.ry=0;}state.buttons|=pad.buttons;state.buttons&=~runtime_noclip_taken();
+ RuntimeGamepadState pad;runtime_gamepad_read(&pad);if(atomic_load(&inputHeld)){pad.buttons=0;state.buttons=0;state.lx=state.ly=state.rx=state.ry=0;}state.buttons|=pad.buttons;state.buttons&=~runtime_noclip_taken();dpad_diagnose_locked(runtime_gamepad_held(),state.buttons,atomic_load(&inputHeld));
  if(pad.buttons&~padSeen||abs(pad.lx)>16384||abs(pad.ly)>16384||abs(pad.rx)>16384||abs(pad.ry)>16384)user_input("controller");padSeen=pad.buttons;
  if(abs(pad.lx)>abs(state.lx))state.lx=pad.lx;if(abs(pad.ly)>abs(state.ly))state.ly=pad.ly;
  if(abs(pad.rx)>abs(state.rx))state.rx=pad.rx;if(abs(pad.ry)>abs(state.ry))state.ry=pad.ry;

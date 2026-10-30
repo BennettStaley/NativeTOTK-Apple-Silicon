@@ -186,8 +186,14 @@ static int front_modifier_down(NSEvent *e){
 @end
 @implementation TOTKInputView
 -(BOOL)acceptsFirstResponder{return YES;}
+/* Command-key presses are shortcuts, never game input (2026-10-29): AppKit sends no keyUp for a key let go while Command is
+   down (GLFW and SDL work around the same), so Command-H, -F, -G or -T (no menu item takes them) held d-pad right / left /
+   down / up for the game until the next focus change, and the controller's d-pad then opened no wheel. A key held before
+   Command is let go by the keyUp monitor in runtime_front_run. */
 -(void)keyDown:(NSEvent *)e{if(e.keyCode==122&&!e.isARepeat){[TOTKSettingsPanel toggle];return;}
- if(e.keyCode==120){if(!e.isARepeat)settings_set("interface.hide_hud",!settings_get("interface.hide_hud"));return;}runtime_input_key(e.keyCode,1);}   /* F1: settings; F2: hide the HUD (the setting follows) */
+ if(e.keyCode==120){if(!e.isARepeat)settings_set("interface.hide_hud",!settings_get("interface.hide_hud"));return;}   /* F1: settings; F2: hide the HUD (the setting follows) */
+ if(e.modifierFlags&NSEventModifierFlagCommand)return;
+ runtime_input_key(e.keyCode,1);}
 -(void)keyUp:(NSEvent *)e{runtime_input_key(e.keyCode,0);}
 /* Shift, Control and Option, left and right apart, are keys of the layout (keyboard_map.h); they come as flag changes. */
 -(void)flagsChanged:(NSEvent *)e{int down=front_modifier_down(e);if(down>=0)runtime_input_key(e.keyCode,down);}
@@ -539,6 +545,9 @@ void runtime_front_run(void(*callback)(void)){
   window.title=owner&&*owner&&strcmp(owner,"user")?[NSString stringWithFormat:@"Test session (%s) Ver. %s: %s — save copy, progress is not saved to your save, the script closes it",owner,TOTK_GAME_VERSION,purpose&&*purpose?purpose:"agent test"]:[NSString stringWithFormat:@GAME_NAME "  Mac — Ver. %s",TOTK_GAME_VERSION];
   windowDelegate=[TOTKWindowDelegate new];window.delegate=windowDelegate;
   front_install_menu();
+  /* 2026-10-29: a keyUp AppKit drops while Command is down (TOTKInputView keyDown) still lets the key go. */
+  [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskKeyUp handler:^NSEvent *(NSEvent *e){
+   if((e.modifierFlags&NSEventModifierFlagCommand)&&e.keyCode<128)runtime_input_key(e.keyCode,0);return e;}];
   window.collectionBehavior|=NSWindowCollectionBehaviorFullScreenPrimary;
   window.contentView=[[TOTKInputView alloc] initWithFrame:NSMakeRect(0,0,ww,wh)];
   metalLayer=[CAMetalLayer layer];metalLayer.device=MTLCreateSystemDefaultDevice();metalLayer.pixelFormat=MTLPixelFormatBGRA8Unorm;metalLayer.drawableSize=CGSizeMake(ww,wh);runtime_aspect_view(ww,wh);
