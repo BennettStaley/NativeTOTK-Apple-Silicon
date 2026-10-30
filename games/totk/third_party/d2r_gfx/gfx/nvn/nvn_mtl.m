@@ -2859,7 +2859,7 @@ static int ser_unaffected(uint64_t from, uint64_t to, uint64_t serial) {
    when its memory pool is finalised. TOTK_TEX_SHARE=0 restores one texture per serial. */
 int nvn_fmt_bpb(int format, int *bw, int *bh);
 typedef struct { uint64_t mem, size; uint32_t w, h, d, levels, target, samples, bpb, depth_fmt; } stor_key;   // 48 bytes, no padding
-typedef struct { stor_key k; void *tex; uint64_t idle_fence; uint64_t *ser; int nser, cser; uint64_t rt_frame, rt_frames; } stor_ent;      // tex: CFBridgingRetain'ed base texture; ser: serials holding it or a view on it; rt_*: last frame / frames it was a render target (stor_note_attach)
+typedef struct { stor_key k; void *tex; uint64_t idle_fence; uint64_t *ser; int nser, cser; uint64_t rt_frame, rt_frames, carry_frame; } stor_ent;      // tex: CFBridgingRetain'ed base texture; ser: serials holding it or a view on it; rt_*: last frame / frames it was a render target (stor_note_attach); carry_frame: frame of its last stor_carry
 static nvn_hmap g_by_storage = {.klen = sizeof(stor_key)};   // stor_key -> stor_ent *
 static nvn_hmap g_stor_of_obj = {.klen = 8};                  // base texture / view pointer -> stor_ent *
 static uint64_t g_stor_entries, g_stor_shared, g_stor_viewed, g_stor_recreated, g_stor_swept, g_stor_dropped;
@@ -3778,6 +3778,24 @@ static void stor_det_sweep(int (^pick)(const stor_ent *), uint64_t *counter) {
     }
     pthread_mutex_unlock(&g_smu);
 }
+/* TOTK (2026-10-29), shrines: ambient occlusion and reflections flashed in and out. The game's dynamic resolution steps
+   the scene between 2560x1600 and 2296x1432 (the user's log: 83 steps in one session, each low episode exactly 62 frames,
+   "[render] frame N: the game renders the scene at ...") and re-initialises its scene targets at the new size. A storage
+   entry is keyed by (storage, layout), so the same guest memory at the new size is another Metal texture: one the game
+   last drew into when it was last at that size (62 to 900 frames earlier, another view of the room), or a new, empty one.
+   On hardware the bytes at that memory are what the previous frame drew there. A target the game reads before drawing it
+   in the frame (the history its temporal filters blend with) therefore came out stale or empty for the first frame at the
+   new size and took the filter's settling time to recover: the flash, at every step in and out of the lower size. The
+   storage's last render target (stor_note_attach) is now carried over: when a texture is handed out at a storage whose
+   last render target, drawn in the previous frame or the one before, had the same format and the same fraction of the
+   previous scene size (the scene sizes seen by scene_size_note, current one first), its picture is drawn scaled into the
+   new size's texture (stor_carry_run) - what the memory held, at the new size (on hardware it would even be laid out for
+   the old size). Same-size transients that share memory within a frame, sizes of the same scene and depth / stencil, array,
+   mipmapped or multisampled targets are left alone. TOTK_DYNRES_CARRY=0 turns it off (A/B); the "Dynamic resolution"
+   setting Off (TOTK_FIXED_RES=1) avoids the steps altogether. */
+static int stor_carry_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("TOTK_DYNRES_CARRY"); on = !e || atoi(e); if (!on) MLOG("TOTK_DYNRES_CARRY=0: render targets keep their own picture across the game's resolution steps"); } return on; }
+static int stor_carry_want_locked(const stor_key *k, uint64_t rt_frame, uint64_t carry_frame, stor_key *from);
+static void stor_carry_run(const stor_key *k, const stor_key *from, id<MTLTexture> dst);
 /* The object a serial should hold for texture t when another serial already has the same storage and layout:
    the shared base, or a format view on it. nil: the caller creates a texture of its own and publishes it. */
 static id<MTLTexture> stor_acquire(const tex_t *t, MTLTextureDescriptor *d) {
@@ -3785,7 +3803,11 @@ static id<MTLTexture> stor_acquire(const tex_t *t, MTLTextureDescriptor *d) {
     MTLPixelFormat pf = d.pixelFormat;
     pthread_mutex_lock(&g_smu);
     stor_ent *e = nvn_hm_get(&g_by_storage, &k); id<MTLTexture> base = e ? (__bridge id<MTLTexture>)e->tex : nil;
-    if (!base) { pthread_mutex_unlock(&g_smu); return nil; }
+    stor_key cfrom; int carry;
+    if (!base) {   /* the new texture is filled after stor_publish (stor_carry_new); that copy needs the open pass ended first */
+        carry = stor_carry_want_locked(&k, 0, 0, &cfrom); pthread_mutex_unlock(&g_smu);
+        if (carry && g_tex_preparing && rp_active()) g_tex_prepare_split = 1;
+        return nil; }
     int pfv = pf != base.pixelFormat && tex_need_pfv(base.pixelFormat, pf);
     if (pfv && stor_compressed(t) && !compressed_alias_on()) {   /* another format of compressed storage: it changes hands (see stor_compressed) */
         MTLPixelFormat bf = base.pixelFormat;
@@ -3798,10 +3820,13 @@ static id<MTLTexture> stor_acquire(const tex_t *t, MTLTextureDescriptor *d) {
                          back ? ", back on its earlier texture" : ", with a new texture", (unsigned long long)n);
         if (!back) { pthread_mutex_unlock(&g_smu); return nil; }   /* the caller creates the texture and publishes it as the storage's owner */
     }
+    carry = stor_carry_want_locked(&k, e->rt_frame, e->carry_frame, &cfrom);   /* stale against what the memory holds (stor_carry_on) */
+    if (carry && g_tex_preparing && rp_active()) { g_tex_prepare_split = 1; pthread_mutex_unlock(&g_smu); return nil; }
     MTLTextureUsage want = base.usage | d.usage | (pfv ? MTLTextureUsagePixelFormatView : 0);
-    if (want == base.usage && pf == base.pixelFormat) { g_stor_shared++; pthread_mutex_unlock(&g_smu); goto logged; }
+    if (want == base.usage && pf == base.pixelFormat) { g_stor_shared++; pthread_mutex_unlock(&g_smu); if (carry) stor_carry_run(&k, &cfrom, base); goto logged; }
     pthread_mutex_unlock(&g_smu);
     if (want != base.usage) { base = stor_recreate(&k, want); if (!base) return nil; }
+    if (carry) stor_carry_run(&k, &cfrom, base);
     if (pf != base.pixelFormat) {
         id<MTLTexture> v = [base newTextureViewWithPixelFormat:pf];
         if (!v) { RED_ONCE(121, "storage-shared format view %lu on %lu failed", (unsigned long)pf, (unsigned long)base.pixelFormat); return nil; }
@@ -3831,6 +3856,14 @@ static void stor_publish(const tex_t *t, id<MTLTexture> mt) {
         nvn_hm_put(&g_by_storage, &e->k, e); uint64_t ok = obj_key(mt); nvn_hm_put(&g_stor_of_obj, &ok, e); g_stor_entries++;
     }
     pthread_mutex_unlock(&g_smu);
+}
+/* A texture just published as its storage's owner: filled from the storage's last render target (stor_carry_on). */
+static void stor_carry_new(const tex_t *t, id<MTLTexture> mt) {
+    stor_key k, from; if (!stor_on() || !stor_carry_on() || !stor_key_of(t, &k)) return;
+    pthread_mutex_lock(&g_smu); stor_ent *e = nvn_hm_get(&g_by_storage, &k);
+    int carry = e && e->tex == (__bridge void *)mt && stor_carry_want_locked(&k, e->rt_frame, e->carry_frame, &from);
+    pthread_mutex_unlock(&g_smu);
+    if (carry) stor_carry_run(&k, &from, mt);
 }
 /* Submission end: entries nobody has held for STOR_IDLE_SUBMITS submissions are dropped. */
 static void stor_collect_drop(int (^pick)(const stor_ent *), uint64_t *counter) {
@@ -3906,13 +3939,50 @@ static int rt_of_earlier_scene(uint32_t w, uint32_t h) {
     return 0;
 }
 static int stor_rt_evict_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("TOTK_RT_EVICT"); on = !e || atoi(e); } return on; }
-/* A pass renders into mt (a base texture or a view on one): stamp its storage entry. */
+/* stor_carry: k when w x h is scene / k (k = 1, 2, 4, 8, 16), else 0. */
+static int rt_scene_div(uint32_t w, uint32_t h, uint64_t scene) {
+    uint32_t sw = (uint32_t)scene, sh = (uint32_t)(scene >> 32); if (!sw || !sh) return 0;
+    for (uint32_t k = 1; k <= 16; k *= 2)
+        if ((w == sw / k || w == (sw + k - 1) / k) && (h == sh / k || h == (sh + k - 1) / k)) return (int)k;
+    return 0;
+}
+/* ow x oh is a fraction of the current scene (the one before this frame's compose draw, scene_size_note) and nw x nh the
+   same fraction of another scene size seen: the same target at the game's next resolution step. */
+static int rt_rescaled(uint32_t ow, uint32_t oh, uint32_t nw, uint32_t nh) {
+    uint64_t cur = atomic_load(&g_scene_cur); int a = cur ? rt_scene_div(ow, oh, cur) : 0; if (!a) return 0;
+    for (int i = 0; i < 8; i++) { uint64_t v = atomic_load(&g_scene_sizes[i]); if (v && v != cur && rt_scene_div(nw, nh, v) == a) return a; }
+    return 0;
+}
+/* The last render target drawn at each storage address (stor_note_attach): its layout key and game frame (g_smu). */
+typedef struct { stor_key k; uint64_t frame; } stor_last;
+static nvn_hmap g_stor_last = {.klen = 8};   // storage address -> stor_last *
+/* g_smu held: 1 when the texture of layout k should first take the picture its memory holds (*from: the layout it was
+   drawn in), see stor_carry_on. rt_frame / carry_frame: k's entry's last draw and last carry (0 for a new texture). */
+static int stor_carry_want_locked(const stor_key *k, uint64_t rt_frame, uint64_t carry_frame, stor_key *from) {
+    if (!stor_carry_on() || k->levels != 1 || k->d != 1 || k->samples != 1 || k->target != 1 || k->depth_fmt) return 0;
+    const stor_last *r = nvn_hm_get(&g_stor_last, &k->mem); if (!r) return 0;
+    uint64_t f = atomic_load_explicit(&g_cur_frame, memory_order_relaxed);
+    /* drawn in one of the two frames before this one (same-frame aliases are written before they are read), after this
+       texture was last drawn or filled */
+    if (r->frame >= f || r->frame + 2 < f || r->frame <= rt_frame || r->frame < carry_frame) return 0;
+    const stor_key *o = &r->k;
+    if ((o->w == k->w && o->h == k->h) || o->bpb != k->bpb || o->target != k->target || o->levels != 1 || o->d != 1 || o->samples != 1 || o->depth_fmt) return 0;
+    if (!rt_rescaled(o->w, o->h, k->w, k->h) || !nvn_hm_get(&g_by_storage, o)) return 0;
+    *from = *o; return 1;
+}
+/* A pass renders into mt (a base texture or a view on one): stamp its storage entry, and note it as its storage's last
+   render target (stor_carry). */
 static void stor_note_attach(id<MTLTexture> mt) {
-    if (!mt || !stor_rt_evict_on()) return;
+    if (!mt || (!stor_rt_evict_on() && !stor_carry_on())) return;
     uint64_t frame = atomic_load_explicit(&g_cur_frame, memory_order_relaxed), ok = obj_key(mt), pk = mt.parentTexture ? obj_key(mt.parentTexture) : 0;
     pthread_mutex_lock(&g_smu);
     stor_ent *e = nvn_hm_get(&g_stor_of_obj, &ok); if (!e && pk) e = nvn_hm_get(&g_stor_of_obj, &pk);
     if (e && e->rt_frame != frame) { e->rt_frame = frame; e->rt_frames++; }
+    if (e && stor_carry_on()) {
+        stor_last *r = nvn_hm_get(&g_stor_last, &e->k.mem);
+        if (!r) { r = malloc(sizeof *r); if (!r) MDIE("storage last render target"); nvn_hm_put(&g_stor_last, &e->k.mem, r); }
+        r->k = e->k; r->frame = frame;
+    }
     pthread_mutex_unlock(&g_smu);
 }
 static void stor_sweep(uint64_t fence) {
@@ -4836,6 +4906,7 @@ static void *tex_mtl_p(const tex_t *ct) {
         if (!mt) { RED_ONCE(2, "failed to create MTLTexture %ux%u format %#x target %d", t->d.width, t->d.height, t->d.format, t->d.target); return NULL; }
         res_add(mt);
         stor_publish(t, mt);
+        stor_carry_new(t, mt);   // TOTK: a dynamic-resolution step: the picture the memory held, at this size
         rt_usage_note_create(t, mt);
         lost_rt_note(t, mt);   // TOTK_LOST_RT_LOG
     }
@@ -12837,6 +12908,68 @@ static int bloomq_capture(void) {
     [en setViewport:(MTLViewport){0,0,dst.width,dst.height,0,1}]; [en setRenderPipelineState:g_bloomq_pso]; [en drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3]; m4_end(en);
     g_bloomq_i = (g_bloomq_i + 1) % 3; args_dirty_all(); (PSO_DIRTY(), g_dss_dirty = 1); return 1;
 }
+/* stor_carry (see stor_carry_on): the storage's last render target src drawn scaled into dst, a texture of the same
+   storage at the game's next resolution step, in a pass of its own before dst is used. Nearest sampling: every format
+   reads and writes as itself (sRGB decoded and encoded again). Counted per step for scene_size_note's [dynres] line. */
+static uint64_t g_carry_n, g_carry_bytes, g_carry_refused, g_carry_step_n, g_carry_step_refused, g_carry_step_bytes, g_carry_frame_at; static int g_carry_frame_n;
+#define CARRY_FRAME_MAX 64   /* carries in one game frame at most (a step re-initialises a few dozen scene targets) */
+static int carry_fmt_ok(MTLPixelFormat f) {
+    switch (f) {
+    case MTLPixelFormatR8Unorm: case MTLPixelFormatRG8Unorm: case MTLPixelFormatR16Unorm: case MTLPixelFormatR16Float: case MTLPixelFormatRG16Unorm:
+    case MTLPixelFormatRG16Float: case MTLPixelFormatR32Float: case MTLPixelFormatRGBA8Unorm: case MTLPixelFormatRGBA8Unorm_sRGB: case MTLPixelFormatBGRA8Unorm:
+    case MTLPixelFormatBGRA8Unorm_sRGB: case MTLPixelFormatRGB10A2Unorm: case MTLPixelFormatRG11B10Float: case MTLPixelFormatRG32Float: case MTLPixelFormatRGBA16Unorm:
+    case MTLPixelFormatRGBA16Float: case MTLPixelFormatRGBA32Float: return 1;
+    default: return 0;
+    }
+}
+static void stor_carry_run(const stor_key *k, const stor_key *from, id<MTLTexture> dst) {
+    if (!on_sub_thread()) { static uint64_t n; if (++n <= 2) MLOG("[dynres] render target carry refused: not on the submit thread"); return; }
+    uint64_t f = atomic_load_explicit(&g_cur_frame, memory_order_relaxed), drawn = 0;
+    pthread_mutex_lock(&g_smu);
+    stor_ent *e = nvn_hm_get(&g_by_storage, k), *o = nvn_hm_get(&g_by_storage, from);
+    id<MTLTexture> src = o ? (__bridge id<MTLTexture>)o->tex : nil;   /* strong: the source stays alive while the pass is encoded */
+    int ok = e && e->tex == (__bridge void *)dst && src && e->carry_frame != f; if (ok) { e->carry_frame = f; drawn = o->rt_frame; }
+    pthread_mutex_unlock(&g_smu);
+    if (!ok) return;
+    if (g_carry_frame_at != f) { g_carry_frame_at = f; g_carry_frame_n = 0; }
+    const char *why = rp_active() ? "inside a render pass" : !g_cb ? "no command buffer" : g_carry_frame_n >= CARRY_FRAME_MAX ? "too many in this frame"
+                    : src.pixelFormat != dst.pixelFormat || !carry_fmt_ok(dst.pixelFormat) ? "format" : !(dst.usage & MTLTextureUsageRenderTarget) || !(src.usage & MTLTextureUsageShaderRead) ? "usage"
+                    : src.textureType != MTLTextureType2D || dst.textureType != MTLTextureType2D ? "texture type" : NULL;
+    static MTLPixelFormat pfs[16]; static id<MTLRenderPipelineState> pss[16]; static int nps; static id<MTLSamplerState> samp; static id<MTL4ArgumentTable> at; static int failed;
+    id<MTLRenderPipelineState> ps = nil;
+    if (!why) {
+        for (int i = 0; i < nps; i++) if (pfs[i] == dst.pixelFormat) ps = pss[i];
+        if (!ps && !failed && nps < 16) {
+            static id<MTLLibrary> lib; NSError *err = nil;
+            if (!lib) lib = [g_dev newLibraryWithSource:@"#include <metal_stdlib>\nusing namespace metal;\n"
+                "struct V { float4 p [[position]]; float2 uv; };\n"
+                "vertex V vs(uint id [[vertex_id]]) { float2 uv=float2((id<<1)&2,id&2); V o; o.p=float4(uv*float2(2,-2)+float2(-1,1),0,1); o.uv=uv; return o; }\n"
+                "fragment float4 fs(V in [[stage_in]], texture2d<float> t [[texture(0)]], sampler s [[sampler(0)]]) { return t.sample(s, in.uv); }\n" options:nil error:&err];
+            if (lib && !samp) { MTLSamplerDescriptor *sd = [MTLSamplerDescriptor new]; sd.minFilter = sd.magFilter = MTLSamplerMinMagFilterNearest; sd.sAddressMode = sd.tAddressMode = MTLSamplerAddressModeClampToEdge; sd.supportArgumentBuffers = YES; samp = [g_dev newSamplerStateWithDescriptor:sd]; }
+            if (lib && !at) { MTL4ArgumentTableDescriptor *ad = [MTL4ArgumentTableDescriptor new]; ad.maxTextureBindCount = 1; ad.maxSamplerStateBindCount = 1; at = [g_dev newArgumentTableWithDescriptor:ad error:&err]; }
+            if (lib && samp && at) { MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new]; pd.vertexFunction = [lib newFunctionWithName:@"vs"]; pd.fragmentFunction = [lib newFunctionWithName:@"fs"];
+                pd.colorAttachments[0].pixelFormat = dst.pixelFormat; ps = [g_dev newRenderPipelineStateWithDescriptor:pd error:&err]; }
+            if (ps) { pfs[nps] = dst.pixelFormat; pss[nps++] = ps; }
+            else { failed = 1; MLOG("[red] [dynres] render target carry pipeline failed (format %lu): %s", (unsigned long)dst.pixelFormat, err ? err.localizedDescription.UTF8String : "no library"); }
+        }
+        if (!ps) why = "no pipeline";
+    }
+    if (why) { g_carry_refused++; g_carry_step_refused++;
+        if (g_carry_refused <= 8) MLOG("[dynres] frame %llu: %lux%lu (format %lu) at storage %p not filled from the %ux%u one (%s)", (unsigned long long)f, (unsigned long)dst.width, (unsigned long)dst.height,
+                                       (unsigned long)dst.pixelFormat, (void *)(uintptr_t)k->mem, from->w, from->h, why);
+        return; }
+    MTL4RenderPassDescriptor *rp = [MTL4RenderPassDescriptor new]; rp.colorAttachments[0].texture = dst; rp.colorAttachments[0].loadAction = MTLLoadActionDontCare; rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+    blit_close(); rs_sync(); pt_mark(g_cb, 'R', rp); id<MTL4RenderCommandEncoder> en = [g_cb renderCommandEncoderWithDescriptor:rp]; es_reset();
+    if (!en) { g_carry_refused++; g_carry_step_refused++; return; }
+    [en barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:MTL4VisibilityOptionDevice]; [en setArgumentTable:at atStages:MTLRenderStageFragment];
+    [at setTexture:src.gpuResourceID atIndex:0]; [at setSamplerState:samp.gpuResourceID atIndex:0];
+    [en setViewport:(MTLViewport){0, 0, dst.width, dst.height, 0, 1}]; [en setRenderPipelineState:ps]; [en drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3]; m4_end(en);
+    args_dirty_all(); (PSO_DIRTY(), g_dss_dirty = 1);
+    uint64_t b = (uint64_t)dst.allocatedSize; g_carry_n++; g_carry_step_n++; g_carry_bytes += b; g_carry_step_bytes += b; g_carry_frame_n++;
+    if (g_carry_n <= 12) MLOG("[dynres] frame %llu: %lux%lu (format %lu) at storage %p filled with the %lux%lu picture drawn there in frame %llu (scaled; %llu so far)", (unsigned long long)f,
+                              (unsigned long)dst.width, (unsigned long)dst.height, (unsigned long)dst.pixelFormat, (void *)(uintptr_t)k->mem, (unsigned long)src.width, (unsigned long)src.height,
+                              (unsigned long long)drawn, (unsigned long long)g_carry_n);
+}
 // ---------- Drag-follow image for shop items: items on a vendor's shelf have no "picked up" state, so during a drag the replay layer takes "the draw that draws this item's icon", translates it to the finger at the end of the same pass and draws it once more ----------
 // In the UI pass each rectangle is one 4-vertex draw (20-byte vertices: position 3 floats + texture coordinates 2 floats; the position goes to clip coordinates through the matrix in vertex constant 0).
 // The front end (front_ios.m) gives the point where the finger pressed, the shelf grid and the center of the drag-follow image (normalized, top-left origin); here, in the UI pass, find the rectangle that "covers this point, has all four edges on grid lines, and has the smallest area" = that item
@@ -13903,7 +14036,14 @@ static void scene_size_note(__unsafe_unretained NvShader *fs) {   // the compose
     id<MTLTexture> src = (__bridge id<MTLTexture>)tex_fast(tid); if (!src) return;
     uint32_t w = (uint32_t)src.width, h = (uint32_t)src.height;
     uint32_t ow = atomic_exchange(&g_scene_w, w), oh = atomic_exchange(&g_scene_h, h);
-    if (ow != w || oh != h) { MLOG("internal resolution (the scene the compose draw samples): %ux%u", w, h); rt_scene_size_seen(w, h); if (ow) atomic_store(&g_rt_scene_frame, atomic_load(&g_cur_frame)); }
+    if (ow != w || oh != h) { MLOG("internal resolution (the scene the compose draw samples): %ux%u", w, h); rt_scene_size_seen(w, h); if (ow) atomic_store(&g_rt_scene_frame, atomic_load(&g_cur_frame));
+        /* stor_carry (2026-10-29): one line per step, the carries of this frame and the ones since the previous step (scene
+           targets read before they are drawn get the picture of the previous size instead of a stale or empty one) */
+        static unsigned lines; if (ow && stor_carry_on() && lines < 300) { lines++;
+            MLOG("[dynres] frame %llu: scene %ux%u -> %ux%u: %llu render targets (%.1f MB) carried over from the previous size, %llu refused (%llu so far, %.0f MB; TOTK_DYNRES_CARRY=0 turns it off)",
+                 (unsigned long long)atomic_load(&g_cur_frame), ow, oh, w, h, (unsigned long long)g_carry_step_n, g_carry_step_bytes / 1048576.0, (unsigned long long)g_carry_step_refused,
+                 (unsigned long long)g_carry_n, g_carry_bytes / 1048576.0); }
+        g_carry_step_n = g_carry_step_refused = g_carry_step_bytes = 0; }
 }
 static int mfxup_draw(NvProg *pr) {
     render_note_observed(pr);
