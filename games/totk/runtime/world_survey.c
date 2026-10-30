@@ -9,6 +9,7 @@
 #include "shrine_auto.h"
 #include "korok_auto.h"
 #include <ctype.h>
+#include <errno.h>
 #include <limits.h>
 #include <mach/mach.h>
 #include "mach_vm_compat.h"
@@ -202,6 +203,7 @@ void runtime_autoshrine_stop(void) { }
 void runtime_autoshrine_set_chests(int on) { (void)on; }
 int runtime_autoshrine_chests(void) { return 0; }
 int runtime_autoshrine_status(char *text, size_t size) { if (size) snprintf(text, size, "Not available in this game"); return 0; }
+int runtime_autoshrine_given_up_reset(void) { return 0; }
 int runtime_autoshrine_command(const char *line) {   /* "ctl state | peek | ...": TOTK only; the scripted pad (input.c) works here */
     if (strncmp(line, "ctl ", 4)) return 0;
     fprintf(stderr, "[ctl] rejected: game state and movement commands are TOTK only: %s", line); return 1;
@@ -788,16 +790,17 @@ static int force_at(uintptr_t actor, const float xyz[3]) {
 }
 
 /* ---- Auto shrine (Tools › Shrines; shrine_auto.h has what the game's files say): one shrine after another, the nearest
-   first, in the player's eight steps (below, before AS_OFF). Noclip only flies Link to the shrine's travel point and, inside,
-   to 2.5 m in front of the altar; every prompt is reached by walking (the left stick) and pressed with A, as a player
+   first, in the player's eight steps (below, before AS_OFF). Noclip only puts Link at the shrine's travel point (a direct
+   move, 2026-10-29: there in one frame and held while the ground streams in, never the 120 m/s flight) and, inside, moves
+   him to 2.5 m in front of the altar; every prompt is reached by walking (the left stick) and pressed with A, as a player
    does: the gate's activation, the doorway (walked through), the altar. Cutscenes are skipped where the game allows it
    (X shows "Skip +", then +; B for messages). Every press is a leased synthetic key (input.c) that lets go by itself and
    never counts as the player's own input. Readiness: the shrine's and the surface's map files and the goal's event file
    opening (romfs.c calls runtime_autoshrine_romfs), Link's position, and whether he answers the stick (a short push that
    moves him: he is in control; none: a cutscene, a message or a load holds him). A shrine is done only when the autosave
    says Clear or the altar's event was seen and took him out; only then is the next one chosen. Each step has a time
-   limit; any miss stops the run ("Stopped at step N, <name>: <why>"), every key let go, noclip off with Link set down where
-   he last stood, a sound played. A press of the player's own (input.c user_input) stops it at once. Frame-end thread. ---- */
+   limit; a miss the recoveries below do not fix gives that shrine up ("giving up on <name>: step N, ...") and the run
+   goes on; when the run ends every key is let go, noclip goes off with Link set down on loaded ground, a sound plays. A press of the player's own (input.c user_input) stops it at once. Frame-end thread. ---- */
 size_t runtime_romfs_file_count(void);
 const char *runtime_romfs_file_name(size_t i);
 uint8_t *runtime_romfs_host_read(const char *path, size_t *n);
@@ -827,12 +830,18 @@ static char as_status[1600] = "Not started";
    time limit; when the outcome does not come it hands over to AS_DIAGNOSE (never straight to a failure), which reads the
    live signals (does Link move under a short push of the stick, did an event file or a map file open lately, did the
    game-over event open, where is he against where the state put him, is he at a prompt or on a lift) and picks a
-   recovery: AS_R_MENU (B, up to 3), a re-flight with a longer hold on the ground (RETURNED, 4 s then 8 s, up to 2),
-   AS_R_PROMPT (back off 2 m, from straight on then 30 degrees to either side, walk up, face, A; up to 3), the lift's A
-   again (ON_LIFT_NO_LOAD, up to 3), AS_GAMEOVER (A on "Continue", the reload), AS_R_UNKNOWN (keys let go, B twice,
-   noclip off, look again once). A recovery returns to the state that called it; when its count is used up the shrine
-   is abandoned: before the entrance the next shrine is chosen, inside Link first walks out by the start lift (STUCK_INSIDE).
-   Three shrines abandoned in a row stop the run with a summary; nothing recoverable stops it. */
+   recovery: AS_R_MENU (B, up to 3), a move back with a longer hold (RETURNED, 4 s, once), AS_R_PROMPT (back off 2 m,
+   from straight on then 30 degrees to either side, walk up, face, A; up to 3 inside, once outside), the lift's A again
+   (ON_LIFT_NO_LOAD, up to 3 inside, once outside), AS_GAMEOVER (A on "Continue", the reload), AS_R_UNKNOWN (keys let go,
+   B twice, noclip off, look again once). A recovery returns to the state that called it; when its count is used up the
+   shrine is abandoned: before the entrance the next shrine is chosen, inside Link first walks out by the start lift
+   (STUCK_INSIDE).
+   Giving up fast and remembering it (2026-10-29, user: "give up on those that are closed or inaccessible"; some have
+   sludge on them): outside, a blocked entrance gets one retry, a landing the game takes Link back from (it fades out
+   and puts him where he stood) none; every shrine given up is written to autoshrine-given-up.txt (shrine_auto.h) and
+   later runs leave it out until its DungeonState changes or the list is reset (Places › Shrines). The run goes on to
+   the next nearest until none is left; only AS_FAILS_ALIKE give-ups in a row with the same reason (something wrong
+   in general, not with one shrine), no player, or a game over that does not go away stop it. */
 enum { AS_OFF, AS_PICK, AS_MOVE, AS_GATE, AS_SCENE, AS_WALK, AS_LIFT, AS_LOADING, AS_INSIDE, AS_CHEST, AS_GOAL, AS_LEAVE, AS_BACK,
        AS_SURFACE, AS_SAVED, AS_DIAGNOSE, AS_R_MENU, AS_R_PROMPT, AS_R_UNKNOWN, AS_GAMEOVER, AS_STOPPING, AS_STATES };
 static const char *const AS_STEP_TEXT[AS_STATES] = {"OFF", "PICK", "MOVE", "GATE", "SCENE", "WALK", "LIFT", "LOADING", "INSIDE", "CHEST", "GOAL",
@@ -841,21 +850,30 @@ static const char *const AS_STAGE_TEXT[] = {"", "go to location", "activate loca
                                             "wait for the location exit to complete, or skip it", "exit the location by walking", "go to the next location"};
 enum { REC_MENU, REC_RETURNED, REC_PROMPT, REC_LIFT, REC_UNKNOWN, RECS };
 static const char *const AS_REC_TEXT[RECS] = {"MENU_OPEN", "RETURNED", "PROMPT_NO_RESPONSE", "ON_LIFT_NO_LOAD", "UNKNOWN"};
-static const int AS_REC_MAX[RECS] = {3, 2, 3, 3, 1};
+static const int AS_REC_MAX[RECS] = {3, 1, 3, 3, 1};
+enum { AS_FAILS_ALIKE = 10 };   /* give-ups in a row with the same reason that stop a run */
+#define AS_STREAM_MIN_S 2.0     /* a direct move: held at least this long, then until the map is stable */
+#define AS_STREAM_MAX_S 20.0    /* and set down after this whatever the map says */
 static struct {
     int step, stage, one, target, k, chest, done, after, tries, event, back, flight, phase, have_last, have_safe, inside;   /* inside: in the shrine's own map */
-    int walk, until_field, skips, approached, wd_have, goal_ok, moving, held;   /* held: the last stick probe found Link held by a scene */   /* walk: the WASD keys held (SHRINE_STICK_...); until_field / skips /
+    int walk, until_field, skips, approached, wd_have, goal_ok, moving, held, listed;   /* held: the last stick probe found Link held by a scene; listed: the given-up shrines logged */   /* walk: the WASD keys held (SHRINE_STICK_...); until_field / skips /
         moving: AS_SCENE's; approached: walked up to the prompt (a recovery did it); goal_ok: the altar's event was seen to start */
-    int ret, rec[RECS], rec_kind, menu_fixing, unknown_seen, recovering, resume, abandoned_row, skipped, verify_k, gate_needed;
+    int ret, rec[RECS], rec_kind, menu_fixing, unknown_seen, recovering, resume, fails_alike, skipped, verify_k, gate_needed, settle;
         /* ret: the state a recovery returns to; rec: each recovery's count for this shrine; recovering: walking out of an
-           abandoned shrine; resume: AS_STOPPING goes on to the next shrine; gate_needed: the shrine was not activated */
+           abandoned shrine; resume: AS_STOPPING goes on to the next shrine; gate_needed: the shrine was not activated;
+           fails_alike: give-ups in a row with fail_sig's reason; settle: AS_PICK first waits for Link to stand still
+           (after a give-up: the game may still be fading him back) */
+    char fail_sig[80];
     double started, t0, phase_t, last_tick, save_time, wd_lost, stall_t, hold;
     float stand[3], face[3], last[3], safe[3], probe[3], wd_pos[3], stall_pos[3], a_pos[3], expect[3];   /* expect: where the state put him */
     float p_floor[3], p_face[3];   /* the prompt AS_R_PROMPT works on: where to stand, what to face */
     uint32_t seq_inside, seq_field, seq_goal, event_seq, seq_gameover;   /* the RomFS counters when the state began */
     uint8_t state[SHRINES], run[SHRINES];
-    char left_out[200], why[300], skipped_list[900];
+    char left_out[320], why[300], skipped_list[900];
 } as;
+static ShrineGivenUp as_given;   /* autoshrine-given-up.txt as AS_PICK last read it (frame-end thread) */
+static int as_sludge_gone = -1;  /* the newest save: the Zora region's sludge is gone (shrine_sludge_gone) */
+static int ak_stable(void);      /* QueryBancLoadMgrIsStable (auto korok's, below): 1, 0, -1 not known */
 static _Atomic uint32_t as_seq_gameover;           /* DmF_SY_GameOver's flow opened */
 static _Atomic uint64_t as_event_ns, as_map_ns;    /* when an event file, a map file last opened (runtime_now_ns) */
 /* input.c: a press that lets go by itself (ms 0: at once), and letting go of all of them. Every key the run presses is one:
@@ -876,11 +894,14 @@ static void as_shot(const char *what) {
     dm_gfx_shot_at(2, path);
 }
 static double as_ago(_Atomic uint64_t *ns) { uint64_t v = atomic_load(ns); return v ? (double)(runtime_now_ns() - v) * 1e-9 : 1e9; }
+/* A recovery's count before the shrine is given up: outside, a prompt or the lift that does not answer gets one more try
+   (a closed, blocked or sludge-covered entrance answers no more on the third; 2026-10-29) */
+static int as_rec_max(int kind) { return !as.inside && (kind == REC_PROMPT || kind == REC_LIFT) ? 1 : AS_REC_MAX[kind]; }
 static void as_say(void) {
     char line[1600]; const char *name = as.k >= 0 ? as_mark[LANDMARK_FIRST_SHRINE + as.k].name : "";
     char skipped[960] = "", retry[64] = "";
     if (as.skipped) snprintf(skipped, sizeof skipped, " · %d skipped (%s)", as.skipped, as.skipped_list);
-    if (as.step >= AS_DIAGNOSE && as.step <= AS_GAMEOVER && as.rec_kind >= 0) snprintf(retry, sizeof retry, " (%s, try %d of %d)", AS_REC_TEXT[as.rec_kind], as.rec[as.rec_kind], AS_REC_MAX[as.rec_kind]);
+    if (as.step >= AS_DIAGNOSE && as.step <= AS_GAMEOVER && as.rec_kind >= 0) snprintf(retry, sizeof retry, " (%s, try %d of %d)", AS_REC_TEXT[as.rec_kind], as.rec[as.rec_kind], as_rec_max(as.rec_kind));
     if (as.step != AS_OFF) snprintf(line, sizeof line, "Running: %s%sstep %d, %s · state %s%s · %d done%s", name, *name ? " · " : "", as.stage, AS_STAGE_TEXT[as.stage],
                                     AS_STEP_TEXT[as.step], retry, as.done, skipped);
     else snprintf(line, sizeof line, "%s · %d done%s%s%s", as.why[0] ? as.why : "Stopped", as.done, skipped, as.left_out[0] ? " · left out: " : "", as.left_out);
@@ -953,10 +974,11 @@ static double as_save_time(void) {
     map_pins_newest_save(profile, path, sizeof path);
     return path[0] && !stat(path, &st) ? st.st_mtimespec.tv_sec + st.st_mtimespec.tv_nsec * 1e-9 : 0;
 }
-/* Each shrine's DungeonState from the newest save, and the story lock into lm; 0 when there is no save. */
+/* Each shrine's DungeonState from the newest save, whether the Zora region's sludge is gone, and the story lock into lm;
+   0 when there is no save. */
 static int as_read_save(Landmark *lm) {
     const char *profile = getenv("TOTK_PROFILE_DIR"); char path[1800]; int got = 0;
-    memset(as.state, SHRINE_STATE_UNKNOWN, sizeof as.state);
+    memset(as.state, SHRINE_STATE_UNKNOWN, sizeof as.state); as_sludge_gone = -1;
     memcpy(lm, as_mark, sizeof as_mark);
     LandmarkProgress progress = {0, 0, 0};
     if (profile && landmarks_state_read(profile, lm, &progress) >= 0) {
@@ -965,6 +987,7 @@ static int as_read_save(Landmark *lm) {
         uint8_t *b = f ? malloc(4 << 20) : NULL; size_t n = b ? fread(b, 1, 4 << 20, f) : 0;
         if (f) fclose(f);
         got = b ? shrine_states_parse(b, n, as.state) : 0;
+        as_sludge_gone = b ? shrine_sludge_gone(b, n) : -1;
         free(b);
     }
     int lock = settings_get("teleport.story_lock");
@@ -1002,20 +1025,47 @@ static void as_end(int ok, const char *why, double now, int by_player) {
     runtime_front_run_sound(ok);
     if (atomic_load(&noclip_wanted) && (noclip_flight.on || !as.have_safe)) {   /* in the air (a flight; stopped by the player too):
         the flight's own end is on the ground; down there first, then noclip off (2026-10-28: a stop mid-flight dropped Link 60 m) */
-        float at[3]; pthread_mutex_lock(&noclip_goto_lock); int pending = noclip_goto.pending; pthread_mutex_unlock(&noclip_goto_lock);
-        if (noclip_flight.on || pending) { memcpy(at, noclip_flight.on ? noclip_flight.to : noclip_goto.xyz, 12); memcpy(as.stand, at, 12); as_go(AS_STOPPING, now, "setting Link down where the flight lands"); return; }
+        float at[3]; pthread_mutex_lock(&noclip_goto_lock); int pending = noclip_goto.pending, direct = noclip_goto.direct; pthread_mutex_unlock(&noclip_goto_lock);
+        if (noclip_flight.on || pending) {
+            memcpy(at, noclip_flight.on ? noclip_flight.to : noclip_goto.xyz, 12); memcpy(as.stand, at, 12); as.flight = pending && direct;
+            as_go(AS_STOPPING, now, "setting Link down where the move lands"); return;
+        }
     }
-    if (atomic_load(&noclip_wanted) && as.have_safe) {
+    if (atomic_load(&noclip_wanted) && as.step == AS_MOVE && as.flight && noclip.holding) {   /* held after a direct move: down there once the ground has streamed in */
+        memcpy(as.stand, noclip.xyz, 12); as_go(AS_STOPPING, now, "setting Link down where he is held, once the ground has streamed in"); return;
+    }
+    if (atomic_load(&noclip_wanted) && as.have_safe) {   /* far: a direct move back, held there until the ground has streamed in */
         float at[3] = {as.safe[0], as.safe[1] + 0.5f, as.safe[2]};
-        if (!as.inside && noclip.holding && landmark_distance(noclip.xyz, at) > 40) runtime_noclip_goto(at);
+        as.flight = !as.inside && noclip.holding && landmark_distance(noclip.xyz, at) > 40;
+        if (as.flight) runtime_noclip_jump(at);
         memcpy(as.stand, at, 12); as_go(AS_STOPPING, now, "setting Link down"); return;
     }
     if (atomic_load(&noclip_wanted)) runtime_noclip_set(0);   /* stopped by the player too: never left flying */
     if (!atomic_load(&noclip_wanted)) dm_gfx_camera_want(0);
     as_go(AS_OFF, now, why); atomic_store(&as_active, 0); as_say();
 }
-/* A shrine given up: recorded with the step and the reason; inside, Link first walks out by the start lift; then the next
-   shrine. In a run of one shrine the run ends here; three given up in a row end a long run. */
+/* Shrine k given up for reason: added to autoshrine-given-up.txt (read again first: the menu may have reset it) with the
+   save's DungeonState now, so later runs leave it out until that changes. */
+static void as_given_up_record(int k, const char *reason) {
+    if (k < 0 || k >= SHRINES) return;
+    shrine_given_up_load(&as_given);
+    shrine_given_up_add(&as_given, k, reason, as.state[k], time(NULL));
+    char path[1024]; shrine_given_up_path(path, sizeof path);
+    if (shrine_given_up_save(&as_given)) fprintf(stderr, "[autoshrine] [red] could not write %s\n", path[0] ? path : "autoshrine-given-up.txt (no profile folder)");
+    else fprintf(stderr, "[autoshrine] given up for later runs too: Dungeon%03d in %s\n", k, path);
+}
+/* What a reason says without its numbers (places, distances, times): give-ups in a row with the same one look like one
+   problem in general. */
+static void as_fail_sig(const char *what, char *out, size_t n) {
+    size_t o = 0;
+    for (const char *c = what; *c && o + 1 < n; c++) if (!isdigit((unsigned char)*c) && *c != '.' && *c != ',' && *c != '-') out[o++] = *c;
+    if (n) out[o] = 0;
+}
+/* A shrine given up (2026-10-29: at once, no long retries): recorded with the step and the reason, in this run and in
+   autoshrine-given-up.txt; inside, Link first walks out by the start lift; then the next nearest shrine, from where he
+   is (still held by noclip: the next direct move starts from there; let go: once he stands still, since the game may
+   be taking him back). In a run of one shrine the run ends here; a long run ends only after AS_FAILS_ALIKE give-ups in
+   a row with the same reason. */
 static void as_abandon(const char *what, double now) {
     char why[400]; const char *name = as.k >= 0 ? as_mark[LANDMARK_FIRST_SHRINE + as.k].name : "";
     snprintf(why, sizeof why, "Stopped at step %d, %s: %s%s%s%s", as.stage, AS_STAGE_TEXT[as.stage], what, *name ? " (" : "", name, *name ? ")" : "");
@@ -1023,23 +1073,22 @@ static void as_abandon(const char *what, double now) {
     if (as.recovering) {   /* the walk out failed: nothing left to try */
         char w2[460]; snprintf(w2, sizeof w2, "%s, while leaving a shrine given up", why); as_end(0, w2, now, 0); return;
     }
-    as.skipped++; as.abandoned_row++; as.run[as.k] = SHRINE_SKIP_FAILED;
+    as.skipped++; as.run[as.k] = SHRINE_SKIP_FAILED;
     size_t o = strlen(as.skipped_list);
     snprintf(as.skipped_list + o, sizeof as.skipped_list - o, "%s%s: step %d, %s", o ? "; " : "", name, as.stage, what);
-    fprintf(stderr, "[autoshrine] abandoning %s: step %d, %s: %s\n", name, as.stage, AS_STAGE_TEXT[as.stage], what);
+    fprintf(stderr, "[autoshrine] giving up on %s (Dungeon%03d): step %d, %s: %s\n", name, as.k, as.stage, AS_STAGE_TEXT[as.stage], what);
+    char reason[300]; snprintf(reason, sizeof reason, "step %d, %s: %s", as.stage, AS_STAGE_TEXT[as.stage], what);
+    as_given_up_record(as.k, reason);
+    char sig[80]; as_fail_sig(reason, sig, sizeof sig);
+    as.fails_alike = strcmp(sig, as.fail_sig) ? 1 : as.fails_alike + 1; snprintf(as.fail_sig, sizeof as.fail_sig, "%s", sig);
     if (as.inside) {   /* STUCK_INSIDE: out by the start lift first */
         float stand[3], face[3]; shrine_stand(&as_shrine[as.k], SHRINE_AT_BACK_APPROACH, 0, stand, face);
         as.recovering = 1; as_stage(7); as_move(stand, face, AS_BACK, 0.6, now, "STUCK_INSIDE: walking out by the start lift"); return;
     }
     if (as.one || as.target >= 0) { as_end(0, why, now, 0); return; }
-    if (as.abandoned_row >= 3) { char w2[460]; snprintf(w2, sizeof w2, "%s; three shrines given up in a row", why); as_end(0, w2, now, 0); return; }
-    if (atomic_load(&noclip_wanted) && as.have_safe) {   /* set down where he last stood, then the next one */
-        float at[3] = {as.safe[0], as.safe[1] + 0.5f, as.safe[2]};
-        if (noclip.holding && landmark_distance(noclip.xyz, at) > 40) runtime_noclip_goto(at);
-        memcpy(as.stand, at, 12); as.resume = 1; as_go(AS_STOPPING, now, "setting Link down before the next shrine"); return;
-    }
-    if (atomic_load(&noclip_wanted)) runtime_noclip_set(0);
-    as_stage(8); as_go(AS_PICK, now, "the next shrine");
+    if (as.fails_alike >= AS_FAILS_ALIKE) { char w2[460]; snprintf(w2, sizeof w2, "%s; %d shrines in a row given up for the same reason", why, as.fails_alike); as_end(0, w2, now, 0); return; }
+    as.settle = !(atomic_load(&noclip_wanted) && noclip.holding);
+    as_stage(8); as_go(AS_PICK, now, as.settle ? "the next shrine, once Link stands still" : "the next shrine, from where noclip holds Link");
 }
 /* A state's outcome did not come: AS_DIAGNOSE looks at what is going on and picks a recovery that returns to ret. */
 static void as_diagnose(int ret, double now, const char *why) {
@@ -1049,8 +1098,8 @@ static void as_diagnose(int ret, double now, const char *why) {
 /* Starts recovery kind (counted); 0 when its count is used up (the shrine is then given up). */
 static int as_recover(int kind, double now) {
     as.rec_kind = kind;
-    if (++as.rec[kind] > AS_REC_MAX[kind]) {
-        char why[160]; snprintf(why, sizeof why, "%s after %d recoveries (state %s)", AS_REC_TEXT[kind], AS_REC_MAX[kind], AS_STEP_TEXT[as.ret]);
+    if (++as.rec[kind] > as_rec_max(kind)) {
+        char why[160]; snprintf(why, sizeof why, "%s after %d recover%s (state %s)", AS_REC_TEXT[kind], as_rec_max(kind), as_rec_max(kind) == 1 ? "y" : "ies", AS_STEP_TEXT[as.ret]);
         as_abandon(why, now); return 0;
     }
     (void)now; return 1;
@@ -1064,17 +1113,44 @@ static int as_prompt_of(int st) {
     if (st == AS_BACK) { memcpy(as.p_floor, s->back_floor, 12); memcpy(as.p_face, s->back, 12); return AS_BACK; }
     return 0;
 }
+/* The next shrine: the nearest one left from where Link is now (re-read at every choice, after a shrine done or given up;
+   with direct moves the way there costs about the same near or far, so nearest-first is kept as it is). */
 static void as_pick(uintptr_t actor, double now) {
     float at[3];
     /* While a save loads the player reads back as the origin (0, -0.15, 0): wait for his real place, as for no player */
     if (!as_pos(actor, at) || (fabsf(at[0]) < 1 && fabsf(at[2]) < 1)) { if (now - as.t0 > 120) as_end(0, "Stopped: no player to start from (120 s)", now, 0); return; }
+    if (as.settle) {   /* after a give-up with noclip off: where the game leaves him (a return fades him back) once he stands still for 1 s (8 s at most) */
+        if (!as.have_last || landmark_distance(at, as.last) > 0.3f) { memcpy(as.last, at, 12); as.have_last = 1; as.phase_t = now; }
+        if (now - as.phase_t < 1.0 && now - as.t0 < 8) return;
+        as.settle = 0; as.have_last = 0;
+    }
     static Landmark lm[LANDMARKS]; int skip[SHRINES], count[SHRINE_SKIPS] = {0};
     int found = as_read_save(lm);
     if (as.verify_k >= 0 && as.verify_k < SHRINES) {   /* the shrine done last: what the save says now (read here, not waited for) */
         fprintf(stderr, "[autoshrine] the save now says DungeonState.Dungeon%03d = %s\n", as.verify_k, as.state[as.verify_k] ? SHRINE_STATE_NAMES[as.state[as.verify_k]] : "(not in it)");
         as.verify_k = -1;
     }
-    for (int k = 0; k < SHRINES; k++) count[skip[k] = shrine_skip(&as_shrine[k], as.state[k], lm[LANDMARK_FIRST_SHRINE + k].lock, as.run[k])]++;
+    /* Given up earlier: kept out while the save still says what it said then; a change (opened, done) drops the line */
+    int given = shrine_given_up_load(&as_given), dropped = 0;
+    for (int k = 0; k < SHRINES; k++)
+        if (as_given.on[k] && found && !shrine_given_up_holds(&as_given, k, as.state[k])) {
+            fprintf(stderr, "[autoshrine] Dungeon%03d (%s) is tried again: the save says %s now, %s when it was given up\n", k, as_mark[LANDMARK_FIRST_SHRINE + k].name,
+                    as.state[k] ? SHRINE_STATE_NAMES[as.state[k]] : "nothing", SHRINE_STATE_NAMES[as_given.state[k]]);
+            as_given.on[k] = 0; dropped++;
+        }
+    if (dropped && shrine_given_up_save(&as_given)) fprintf(stderr, "[autoshrine] [red] could not rewrite autoshrine-given-up.txt\n");
+    if (!as.listed) {   /* once a run */
+        as.listed = 1;
+        fprintf(stderr, "[autoshrine] the Zora region's sludge (Step_SageOfZora): %s; %d shrine%s given up earlier (autoshrine-given-up.txt)\n",
+                as_sludge_gone > 0 ? "gone" : as_sludge_gone == 0 ? "still there (a shrine it covers is left out)" : "the save does not say", given, given == 1 ? "" : "s");
+        for (int k = 0; k < SHRINES; k++)
+            if (as_given.on[k]) fprintf(stderr, "[autoshrine] given up earlier: %s (Dungeon%03d), %s: %s\n", as_mark[LANDMARK_FIRST_SHRINE + k].name, k, as_given.date[k], as_given.reason[k]);
+    }
+    int sludge_on = as_sludge_gone == 0;   /* not known: tried, and given up fast if the sludge is there */
+    for (int k = 0; k < SHRINES; k++) {
+        int flags = k == as.target ? 0 : (as_given.on[k] ? SHRINE_GIVEN_UP : 0) | (sludge_on ? SHRINE_SLUDGE_ON : 0);   /* a shrine chosen on the tab is tried anyway (the sludge may be washed off) */
+        count[skip[k] = shrine_skip(&as_shrine[k], as.state[k], lm[LANDMARK_FIRST_SHRINE + k].lock, as.run[k], flags)]++;
+    }
     size_t o = 0; as.left_out[0] = 0;
     for (int r = 1; r < SHRINE_SKIPS && o < sizeof as.left_out - 1; r++)
         if (count[r]) o += (size_t)snprintf(as.left_out + o, sizeof as.left_out - o, "%s%d %s", o ? ", " : "", count[r], SHRINE_SKIP_TEXT[r]);
@@ -1122,19 +1198,35 @@ static void as_return(double now, const char *why) {
     as_go(st, now, why);
     as.approached = appr;
 }
+/* After a direct move: 1 once the ground around Link has streamed in, so that he lands on it (2026-10-29: set down where
+   the map is still loading he falls through it and the game fades him back to where he last stood, "the game returned
+   Link"; the flight's fixed 2 s on the ground did that to three shrines in a row). held: seconds held there, min_hold at
+   least. Ready: the map loader's stable bit (QueryBancLoadMgrIsStable, as auto korok waits for it; 1.4.3) and no map file
+   opened for 1 s; without the bit (1.0.0) 3 s more and the quiet; AS_STREAM_MAX_S at most. */
+static int as_streamed(double held, double min_hold) {
+    if (held < min_hold) return 0;
+    int stable = ak_stable(); double quiet = as_ago(&as_map_ns);
+    int ready = (stable == 1 || (stable < 0 && held >= min_hold + 3)) && quiet >= 1.0;
+    if (!ready && held < AS_STREAM_MAX_S) return 0;
+    fprintf(stderr, "[autoshrine] %s after %.1f s held there (map stable=%d, last map file %.1f s ago)\n", ready ? "the ground has streamed in" : "[red] still streaming in; set down anyway",
+            held, stable, quiet < 1e8 ? quiet : -1.0);
+    return 1;
+}
 static void as_tick_move(uintptr_t actor, double now, double dt) {
     float at[3] = {0, 0, 0}; int have = as_pos(actor, at);
-    if (as.phase == 0) {   /* noclip on: on the surface a flight (up, across, down) when far, else (and inside a shrine) a straight line */
+    if (as.phase == 0) {   /* noclip on: on the surface a direct move when far (there at once, held while the ground streams in;
+                              2026-10-29, no flight), else (and inside a shrine) a straight line at 30 m/s */
         if (!have) { if (now - as.t0 > 20) as_diagnose(AS_MOVE, now, "no player to move (20 s)"); return; }
         runtime_input_lease_release_all();   /* no key of ours held: noclip reads WASD and ZL as the player steering */
-        float d = landmark_distance(at, as.stand); as.flight = d > 40 && !as.inside;
-        if (as.flight) runtime_noclip_goto(as.stand); else runtime_noclip_set(1);
-        as.phase_t = now + d / 100 + 30; as.phase = 1;   /* phase_t: the flight's time limit */
-        fprintf(stderr, "[autoshrine] %s to %.1f,%.1f,%.1f (%.0f m), then %.1f s held there\n", as.flight ? "flight" : "straight", as.stand[0], as.stand[1], as.stand[2], d, as.hold);
+        float d = landmark_distance(at, as.stand); as.flight = d > 40 && !as.inside;   /* flight: a direct move */
+        if (as.flight) runtime_noclip_jump(as.stand); else runtime_noclip_set(1);
+        as.phase_t = now + (as.flight ? 0 : d / 30) + 15; as.phase = 1;   /* phase_t: the move's time limit */
+        fprintf(stderr, "[autoshrine] %s to %.1f,%.1f,%.1f (%.0f m), then held there %s\n", as.flight ? "direct move" : "straight", as.stand[0], as.stand[1], as.stand[2], d,
+                as.flight ? "until the ground has streamed in" : "a moment");
         return;
     }
     if (as.phase == 1) {
-        if (now > as.phase_t) { as_diagnose(AS_MOVE, now, "the flight did not arrive in time"); return; }
+        if (now > as.phase_t) { as_diagnose(AS_MOVE, now, "the move did not arrive in time"); return; }
         if (!noclip.holding) return;
         if (as.flight) {
             pthread_mutex_lock(&noclip_goto_lock); int pending = noclip_goto.pending; pthread_mutex_unlock(&noclip_goto_lock);
@@ -1146,17 +1238,20 @@ static void as_tick_move(uintptr_t actor, double now, double dt) {
         memcpy(noclip.xyz, as.stand, 12); as.phase = 2; as.phase_t = now;
         return;
     }
-    if (as.phase == 2) {   /* held there while the place loads around him, turned to face the prompt, then set down */
+    if (as.phase == 2) {   /* held there while the place loads around him (a direct move: until it has streamed in), turned to
+                              face the prompt, then set down; noclip_guard keeps him alive and resets the fall until he stands */
         memcpy(noclip.xyz, as.stand, 12); as_force_facing(actor, as.stand, as.face);
-        if (now - as.phase_t >= as.hold) { runtime_noclip_set(0); dm_gfx_camera_want(1); as.phase = 3; as.phase_t = now; }
+        double held = now - as.phase_t;
+        if (as.flight ? as_streamed(held, fmax(as.hold, AS_STREAM_MIN_S)) : held >= as.hold) { runtime_noclip_set(0); dm_gfx_camera_want(1); as.phase = 3; as.phase_t = now; }
         return;
     }
     if (as.phase == 3) {   /* landed: on his feet near the place, and still there (the game returns a player it finds stuck) */
         { static double last; if (now - last >= 1) { last = now; as_shot("landing"); } }
         memcpy(as.expect, as.stand, 12);
-        if (have && as_xz(at, as.stand) > 8) {
-            char why[200]; snprintf(why, sizeof why, "the game moved Link from the landing spot to %.1f,%.1f,%.1f", at[0], at[1], at[2]);
-            as_diagnose(AS_MOVE, now, why); return;
+        if (have && as_xz(at, as.stand) > 8) {   /* RETURNED (2026-10-29): given up at once, no second landing */
+            char why[260]; snprintf(why, sizeof why, "the game returned Link from the landing spot %.1f,%.1f,%.1f (it faded out and put him back at %.1f,%.1f,%.1f)",
+                                    as.stand[0], as.stand[1], as.stand[2], at[0], at[1], at[2]);
+            as_abandon(why, now); return;
         }
         if (now - as.phase_t < (as.inside ? 1.0 : 2.5)) return;
         if (!have || as_xz(at, as.stand) > 4 || at[1] < as.stand[1] - 6) { as_diagnose(AS_MOVE, now, "Link did not stay where he was set down"); return; }
@@ -1200,10 +1295,10 @@ static void as_tick_diagnose(uintptr_t actor, double now, double t) {
         return;
     }
     if (as.menu_fixing) { as.menu_fixing = 0; as_return(now, "the menu is closed"); return; }
-    if (as.ret == AS_MOVE || (have && as_xz(at, as.expect) > 15 && as.ret != AS_SCENE)) {   /* RETURNED: fly again, hold longer */
+    if (as.ret == AS_MOVE || (have && as_xz(at, as.expect) > 15 && as.ret != AS_SCENE)) {   /* RETURNED: moved there again, held longer (once) */
         if (!as_recover(REC_RETURNED, now)) return;
         double hold = as.rec[REC_RETURNED] == 1 ? 4 : 8;
-        as_move(as.stand, as.face, as.ret == AS_MOVE ? as.after : as.ret, hold, now, "RETURNED: the game put him back; flying again, held longer"); return;
+        as_move(as.stand, as.face, as.ret == AS_MOVE ? as.after : as.ret, hold, now, "RETURNED: the game put him back; moving him there again, held longer"); return;
     }
     int on_lift = have && ((!as.inside && as_xz(at, s->lift_floor) < 2.5f) || (as.inside && as_xz(at, s->back_floor) < 2.5f));
     if (as.ret == AS_LIFT || (on_lift && (as.ret == AS_WALK || as.ret == AS_BACK))) {
@@ -1326,6 +1421,12 @@ static void autoshrine_tick(uintptr_t actor, double now) {
         float d = have ? as_xz(at, s->lift_floor) : 99;
         if (atomic_load(&as_seq_inside) != seen || (have && landmark_distance(at, s->start) < 60)) { as_go(AS_LOADING, now, "the shrine's map opened while walking in"); as.seq_inside = seen; return; }
         if (d < 1.2f) { as_go(AS_LIFT, now, "on the entrance lift"); return; }
+        /* Blocked (2026-10-29): walking on the spot for 1.5 s after the first 2 s is a closed door, sludge or rubble: diagnosed
+           then, not after the full 8 s */
+        if (have && (now - as.stall_t >= 1.5 || t < 0.05)) {
+            int stuck = t > 2 && landmark_distance(at, as.stall_pos) < 0.2f; memcpy(as.stall_pos, at, 12); as.stall_t = now;
+            if (stuck) { char why[160]; snprintf(why, sizeof why, "stopped %.1f m short of the entrance lift: the way in is blocked (closed, sludge or rubble?)", d); as_diagnose(AS_WALK, now, why); return; }
+        }
         if (t > 8) { char why[120]; snprintf(why, sizeof why, "did not reach the entrance lift in 8 s (%.1f m from it)", d); as_diagnose(AS_WALK, now, why); return; }
         as_walk(actor, s->lift_floor);
         return;
@@ -1418,7 +1519,7 @@ static void autoshrine_tick(uintptr_t actor, double now) {
         if (as.recovering) {   /* out of a shrine given up: on to the next */
             as.recovering = 0; as.inside = 0;
             if (as.one || as.target >= 0) { as_end(0, as.skipped_list, now, 0); return; }
-            if (as.abandoned_row >= 3) { as_end(0, "Stopped: three shrines given up in a row", now, 0); return; }
+            if (as.fails_alike >= AS_FAILS_ALIKE) { as_end(0, "Stopped: shrines given up in a row for the same reason", now, 0); return; }
             as_stage(8); as_go(AS_PICK, now, "out of the shrine given up; the next one"); return;
         }
         if (!as.goal_ok || as.back) {
@@ -1431,7 +1532,7 @@ static void autoshrine_tick(uintptr_t actor, double now) {
             }
             fprintf(stderr, "[autoshrine] done: %s (Dungeon%03d): the save says Clear\n", name, as.k);
         } else fprintf(stderr, "[autoshrine] done: %s (Dungeon%03d): the altar's event took Link out\n", name, as.k);
-        as.run[as.k] = SHRINE_SKIP_DONE; as.done++; as.abandoned_row = 0; as.verify_k = as.k;
+        as.run[as.k] = SHRINE_SKIP_DONE; as.done++; as.fails_alike = 0; as.fail_sig[0] = 0; as.verify_k = as.k;
         as_stage(8);
         as_go(AS_PICK, now, "done; the next shrine");
         return;
@@ -1487,12 +1588,18 @@ static void autoshrine_tick(uintptr_t actor, double now) {
         if (fmod(t, 2.0) < dt) { as_key(AS_KEY_A, 0.15); fprintf(stderr, "[autoshrine] A (Continue)\n"); }
         if (t > 60) as_end(0, "Stopped: the game over screen did not go away (60 s)", now, 0);
         return;
-    case AS_STOPPING:   /* back to where he last stood, then down */
+    case AS_STOPPING:   /* back to where he last stood (a direct move when far: held there until the ground has streamed in), then down */
         if (t < 60 && atomic_load(&noclip_wanted)) {
             pthread_mutex_lock(&noclip_goto_lock); int pending = noclip_goto.pending; pthread_mutex_unlock(&noclip_goto_lock);
             if (pending || noclip_flight.on || !noclip.holding) return;
             float d = landmark_distance(noclip.xyz, as.stand), step = 30 * (float)dt;
             if (d > step) { for (int c = 0; c < 3; c++) noclip.xyz[c] += (as.stand[c] - noclip.xyz[c]) * step / d; return; }
+            memcpy(noclip.xyz, as.stand, 12);
+            if (as.flight) {
+                if (!as.phase) { as.phase = 1; as.phase_t = now; }
+                if (!as_streamed(now - as.phase_t, 1.0)) return;
+                as.flight = 0;
+            }
         }
         if (atomic_load(&noclip_wanted)) runtime_noclip_set(0);
         fprintf(stderr, "[autoshrine] set down\n");
@@ -1575,6 +1682,16 @@ int runtime_autoshrine_start(int one) {
 void runtime_autoshrine_stop(void) {
     if (!atomic_load(&as_active)) return;
     atomic_store(&as_request, 3); atomic_store_explicit(&runtime_survey_pending, 1, memory_order_release);
+}
+/* Places › Shrines' "Retry given-up shrines" (and "autoshrine givenup reset"): autoshrine-given-up.txt removed; a run on now
+   reads it again at its next choice. Returns how many shrines it named. */
+int runtime_autoshrine_given_up_reset(void) {
+    ShrineGivenUp *g = calloc(1, sizeof *g); if (!g) return 0;
+    int n = shrine_given_up_load(g); char path[1024]; int have = shrine_given_up_path(path, sizeof path);
+    int gone = have && (remove(path) == 0 || errno == ENOENT);
+    free(g);
+    fprintf(stderr, "[autoshrine] given-up shrines reset: %d shrine%s will be tried again%s%s\n", n, n == 1 ? "" : "s", gone ? "" : "; [red] could not remove ", gone ? "" : have ? path : "the file (no profile folder)");
+    return n;
 }
 void runtime_autoshrine_set_chests(int on) { atomic_store(&as_chests, !!on); fprintf(stderr, "[autoshrine] chests %s\n", on ? "on" : "off"); }
 int runtime_autoshrine_chests(void) { return atomic_load(&as_chests); }
@@ -1943,6 +2060,12 @@ int runtime_autoshrine_command(const char *line) {
         atomic_store(&as_skip_reveal, arg[0] == 'x' ? AS_KEY_X : arg[0] == 'b' ? AS_KEY_B : 0); fprintf(stderr, "[autoshrine] skip: %s\n", arg[0] == 'n' ? "off" : arg[0] == 'x' ? "X" : "B");
     }
     else if (!strcmp(word, "status")) { char s[600]; runtime_autoshrine_status(s, sizeof s); fprintf(stderr, "[autoshrine] status: %s\n", s); }
+    else if (!strcmp(word, "givenup") && !strcmp(arg, "reset")) runtime_autoshrine_given_up_reset();   /* "autoshrine givenup reset | list" */
+    else if (!strcmp(word, "givenup")) {
+        static ShrineGivenUp g; int n = shrine_given_up_load(&g); char path[1024]; shrine_given_up_path(path, sizeof path);
+        fprintf(stderr, "[autoshrine] %d shrine%s given up (%s)\n", n, n == 1 ? "" : "s", path);
+        for (int k = 0; k < SHRINES; k++) if (g.on[k]) fprintf(stderr, "[autoshrine]   Dungeon%03d, %s, save said %s: %s\n", k, g.date[k], g.state[k] ? SHRINE_STATE_NAMES[g.state[k]] : "nothing", g.reason[k]);
+    }
     else if (!strcmp(word, "pose")) {   /* Link's place and facing (his local +z, level) and the camera's place and right vector */
         dm_gfx_camera_want(1); pthread_mutex_lock(&as_cmd_lock); as_cmd.kind = 3; pthread_mutex_unlock(&as_cmd_lock);
         atomic_store_explicit(&runtime_survey_pending, 1, memory_order_release);

@@ -41,6 +41,7 @@ void runtime_autoshrine_stop(void);
 void runtime_autoshrine_set_chests(int on);         /* open each shrine's chests on the way (off at every start) */
 int runtime_autoshrine_chests(void);
 int runtime_autoshrine_status(char *text, size_t size);   /* the status line; 1 while a run is on */
+int runtime_autoshrine_given_up_reset(void);        /* autoshrine-given-up.txt removed (shrine_auto.h): every shrine given up is tried again; how many it named */
 int runtime_autoshrine_command(const char *line);   /* the input file's "autoshrine start | one | finish N | stop | status | chests on|off | skip x|b|none" */
 void runtime_autoshrine_romfs(const char *path);    /* romfs.c: each file the game opens, relative to the RomFS */
 /* Auto korok (Places › Koroks, TOTK 1.4.3; world_survey.c, korok_auto.h): finds koroks one after another, the nearest

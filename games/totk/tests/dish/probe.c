@@ -417,19 +417,19 @@ int main(void) {
     CHECK(shrine_kind_parse(buf, 4) == SHRINE_PUZZLE, "no file: a puzzle");
     /* which shrines a run does */
     ShrineInfo plain = *s7; plain.crystal = 0; plain.cave = 0;
-    CHECK(shrine_skip(s7, SHRINE_STATE_UNKNOWN, LANDMARK_OPEN, 0) == SHRINE_SKIP_CRYSTAL, "a crystal shrine the save does not mention starts Hidden");
-    CHECK(shrine_skip(s7, SHRINE_STATE_OPEN, LANDMARK_OPEN, 0) == SHRINE_SKIP_CAVE, "its crystal brought, but in a cave");
-    CHECK(shrine_skip(&plain, SHRINE_STATE_APPEAR, LANDMARK_OPEN, 0) == SHRINE_GO, "a shrine found or not: done");
-    CHECK(shrine_skip(&plain, SHRINE_STATE_HIDDEN, LANDMARK_OPEN, 0) == SHRINE_SKIP_HIDDEN, "Hidden: not raised yet");
-    CHECK(shrine_skip(&plain, SHRINE_STATE_CLEAR, LANDMARK_OPEN, 0) == SHRINE_SKIP_CLEAR, "completed");
-    CHECK(shrine_skip(&plain, SHRINE_STATE_APPEAR, LANDMARK_LOCK_ISLAND, 0) == SHRINE_SKIP_LOCKED, "the story lock");
-    CHECK(shrine_skip(&plain, SHRINE_STATE_ENTER, LANDMARK_OPEN, SHRINE_SKIP_FAILED) == SHRINE_SKIP_FAILED, "failed in this run");
+    CHECK(shrine_skip(s7, SHRINE_STATE_UNKNOWN, LANDMARK_OPEN, 0, 0) == SHRINE_SKIP_CRYSTAL, "a crystal shrine the save does not mention starts Hidden");
+    CHECK(shrine_skip(s7, SHRINE_STATE_OPEN, LANDMARK_OPEN, 0, 0) == SHRINE_SKIP_CAVE, "its crystal brought, but in a cave");
+    CHECK(shrine_skip(&plain, SHRINE_STATE_APPEAR, LANDMARK_OPEN, 0, 0) == SHRINE_GO, "a shrine found or not: done");
+    CHECK(shrine_skip(&plain, SHRINE_STATE_HIDDEN, LANDMARK_OPEN, 0, 0) == SHRINE_SKIP_HIDDEN, "Hidden: not raised yet");
+    CHECK(shrine_skip(&plain, SHRINE_STATE_CLEAR, LANDMARK_OPEN, 0, 0) == SHRINE_SKIP_CLEAR, "completed");
+    CHECK(shrine_skip(&plain, SHRINE_STATE_APPEAR, LANDMARK_LOCK_ISLAND, 0, 0) == SHRINE_SKIP_LOCKED, "the story lock");
+    CHECK(shrine_skip(&plain, SHRINE_STATE_ENTER, LANDMARK_OPEN, SHRINE_SKIP_FAILED, 0) == SHRINE_SKIP_FAILED, "failed in this run");
     ShrineInfo none = {0};
-    CHECK(shrine_skip(&none, SHRINE_STATE_APPEAR, LANDMARK_OPEN, 0) == SHRINE_SKIP_NO_DATA, "no map data");
+    CHECK(shrine_skip(&none, SHRINE_STATE_APPEAR, LANDMARK_OPEN, 0, 0) == SHRINE_SKIP_NO_DATA, "no map data");
     ShrineInfo fight = plain; fight.kind = SHRINE_COMBAT;
-    CHECK(shrine_skip(&fight, SHRINE_STATE_APPEAR, LANDMARK_OPEN, 0) == SHRINE_SKIP_FIGHT, "a fight: left out");
+    CHECK(shrine_skip(&fight, SHRINE_STATE_APPEAR, LANDMARK_OPEN, 0, 0) == SHRINE_SKIP_FIGHT, "a fight: left out");
     fight.kind = SHRINE_PROVING;
-    CHECK(shrine_skip(&fight, SHRINE_STATE_OPEN, LANDMARK_OPEN, 0) == SHRINE_SKIP_PROVING, "Proving Grounds: left out");
+    CHECK(shrine_skip(&fight, SHRINE_STATE_OPEN, LANDMARK_OPEN, 0, 0) == SHRINE_SKIP_PROVING, "Proving Grounds: left out");
     /* nearest first, from where Link is, then from each shrine done */
     static ShrineInfo row[SHRINES]; int skip[SHRINES];
     for (int k = 0; k < SHRINES; k++) { row[k] = plain; skip[k] = SHRINE_SKIP_LOCKED; row[k].entrance[0] = 1000.0f * k; row[k].entrance[1] = 0; row[k].entrance[2] = 0; }
@@ -444,6 +444,35 @@ int main(void) {
     memcpy(save4 + ds, &end, 4);
     CHECK(shrine_states_parse(save4, sizeof save4, state) == 4 && state[0] == SHRINE_STATE_CLEAR && state[7] == SHRINE_STATE_HIDDEN && state[60] == SHRINE_STATE_APPEAR
           && state[151] == SHRINE_STATE_ENTER && state[1] == SHRINE_STATE_UNKNOWN, "DungeonState from the save");
+    /* the Zora region's sludge: Step_SageOfZora past TouchSecretStone (Finish, Complete) is gone; a shrine under it waits */
+    CHECK(shrine_sludge_gone(save4, sizeof save4) == -1, "no Step_SageOfZora: the save does not say");
+    { static uint8_t sz[0x40]; memcpy(sz, w, 4); uint32_t h = dish_murmur3("Step_SageOfZora"), v = dish_murmur3("TouchSecretStone");
+      memcpy(sz + 0x28, &h, 4); memcpy(sz + 0x2c, &v, 4); memcpy(sz + 0x30, &end, 4);
+      CHECK(shrine_sludge_gone(sz, sizeof sz) == 0, "TouchSecretStone: the sludge is still there");
+      v = dish_murmur3("Finish"); memcpy(sz + 0x2c, &v, 4);
+      CHECK(shrine_sludge_gone(sz, sizeof sz) == 1, "Finish: the sludge is gone"); }
+    ShrineInfo mud = plain; mud.sludge = 1;
+    CHECK(shrine_skip(&mud, SHRINE_STATE_APPEAR, LANDMARK_OPEN, 0, SHRINE_SLUDGE_ON) == SHRINE_SKIP_SLUDGE, "under sludge: left out");
+    CHECK(shrine_skip(&mud, SHRINE_STATE_OPEN, LANDMARK_OPEN, 0, SHRINE_SLUDGE_ON) == SHRINE_GO, "under sludge but opened already: done");
+    CHECK(shrine_skip(&mud, SHRINE_STATE_APPEAR, LANDMARK_OPEN, 0, 0) == SHRINE_GO, "the sludge gone: done");
+    CHECK(shrine_skip(&plain, SHRINE_STATE_APPEAR, LANDMARK_OPEN, 0, SHRINE_GIVEN_UP) == SHRINE_SKIP_GIVEN_UP, "given up earlier: left out");
+    CHECK(shrine_skip(&plain, SHRINE_STATE_APPEAR, LANDMARK_LOCK_ISLAND, 0, SHRINE_GIVEN_UP) == SHRINE_SKIP_LOCKED, "given up and locked: the lock says more");
+    /* autoshrine-given-up.txt: read, written, kept while the save says the same */
+    { static ShrineGivenUp g, g2; char text[512];
+      int n = shrine_given_up_parse(&g, "Dungeon041\tstep 2, activate location: blocked\t2026-10-29 10:00\tAppear\r\n# a note\nDungeon140\tthe game returned Link\t2026-10-29 10:05\n"
+                                         "Dungeon999\tnot a shrine\t\tOpen\nDungeon009\tx\t\tOpen");
+      CHECK(n == 3 && g.on[41] && g.on[140] && g.on[9] && !strcmp(g.reason[41], "step 2, activate location: blocked") && !strcmp(g.date[140], "2026-10-29 10:05"),
+            "given-up lines: %d", n);
+      CHECK(g.state[41] == SHRINE_STATE_APPEAR && g.state[140] == SHRINE_STATE_UNKNOWN && g.state[9] == SHRINE_STATE_OPEN, "given-up states");
+      CHECK(shrine_given_up_holds(&g, 41, SHRINE_STATE_APPEAR) && !shrine_given_up_holds(&g, 41, SHRINE_STATE_OPEN) && shrine_given_up_holds(&g, 140, SHRINE_STATE_CLEAR)
+            && !shrine_given_up_holds(&g, 42, SHRINE_STATE_APPEAR), "kept while the save says the same");
+      shrine_given_up_add(&g, 12, "a\ttab\nand a line", SHRINE_STATE_APPEAR, 0);
+      int len = shrine_given_up_format(&g, text, sizeof text);
+      CHECK(len == (int)strlen(text) && shrine_given_up_format(&g, NULL, 0) == len && shrine_given_up_parse(&g2, text) == 4 && !strcmp(g2.reason[12], "a tab and a line")
+            && g2.state[12] == SHRINE_STATE_APPEAR && g2.date[12][0], "given-up file round trip: %s", text);
+      CHECK(!strncmp(text, "Dungeon009\tx\t\tOpen\nDungeon012\t", 29), "one line per shrine, by number");
+      setenv("TOTK_PROFILE_DIR", "/x/data/profile/", 1); unsetenv("TOTK_AUTOSHRINE_GIVEN_UP"); char path[256];
+      CHECK(shrine_given_up_path(path, sizeof path) && !strcmp(path, "/x/data/autoshrine-given-up.txt"), "beside the profile: %s", path); }
 
     /* korok_auto.h: a map file with four koroks' puzzles (AiGroups) and a group without a korok: a plain rock, a race
        (its goal and start Areas in sub-groups, the goal's TimeLimit), a rock in ice, and a ceiling whose Upper Area takes

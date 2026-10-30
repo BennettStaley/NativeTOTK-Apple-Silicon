@@ -34,6 +34,7 @@
 #include "map_pins.h"
 #include "landmarks.h"
 #include "korok_auto.h"
+#include "shrine_auto.h"   /* autoshrine-given-up.txt: the Shrines tab marks those shrines and can reset the list */
 /* runtime/romfs.c: the game's files, read on the side (as the shader list does) */
 size_t runtime_romfs_file_count(void);
 const char *runtime_romfs_file_name(size_t i);
@@ -79,7 +80,7 @@ static Landmark landmark_places[LANDMARKS];
 static int landmarks_read;   /* 0 not yet, 1 reading, 2 read, 3 none in this game; main thread */
 enum { PANEL_WIDTH = 480, PANEL_MARGIN = 16, PAGE_STEP = 8 /* rows per LT / RT on a pane without row frames */,
        SAVES_ROW = -1, CHEATS_FOLDER_ROW = -2, CHEATS_OFF_ROW = -3, CHEATS_RESTART_ROW = -4, CHEATS_DB_ROW = -5, CHEATS_UNAVAILABLE_ROW = -6,
-       CHEATS_NOCLIP_ROW = -7, CHEATS_NOCLIP_SPEED_ROW = -8, CHEATS_AUTOSHRINE_ROW = -9, CHEATS_AUTOSHRINE_CHESTS_ROW = -10, CHEATS_AUTOKOROK_ROW = -11, CHEATS_GROUP_ROW = -20 /* the places while the game's map is read */,
+       CHEATS_NOCLIP_ROW = -7, CHEATS_NOCLIP_SPEED_ROW = -8, CHEATS_AUTOSHRINE_ROW = -9, CHEATS_AUTOSHRINE_CHESTS_ROW = -10, CHEATS_AUTOKOROK_ROW = -11, CHEATS_AUTOSHRINE_RETRY_ROW = -12, CHEATS_GROUP_ROW = -20 /* the places while the game's map is read */,
        CHEATS_KOROK_TYPE_ROW = -40 /* - t: KOROK_TYPES t's switch */,
        CHEATS_PIN_ROW = -100 /* - k: map pin k */, CHEATS_LANDMARK_ROW = -200 /* - k: place k (landmarks.h) */,
        CHEAT_ROW = -1000 /* - k: cheat k, or the choice whose first variant is k */ };
@@ -669,7 +670,8 @@ static int cheat_choice_members(int leader, int *all, int *usable, int max, int 
     if (landmark_is_shrine(LANDMARK_GROUPS[g].first) && runtime_autoshrine_available()) [self addAutoShrineRows];
     [self buildLandmarks:getenv("TOTK_PROFILE_DIR") lock:lockOn group:g];
 }
-/* Auto shrine (world_survey.c, shrine_auto.h): Start / Stop, the chests switch, and the run's status under them. */
+/* Auto shrine (world_survey.c, shrine_auto.h): Start / Stop, the chests switch, the run's status under them, and the
+   shrines earlier runs gave up (autoshrine-given-up.txt) with Retry, which clears that list (2026-10-29). */
 - (void)addAutoShrineRows {
     char line[600]; int running = runtime_autoshrine_status(line, sizeof line);
     autoShrineShown = @(line);
@@ -677,13 +679,19 @@ static int cheat_choice_members(int leader, int *all, int *usable, int max, int 
     NSButton *go = [self cheatsButton:running ? @"Stop" : @"Start" action:@selector(autoShrineStartStop)];
     if (running) go.bezelColor = NSColor.systemOrangeColor;
     [self addCheatsRow:[self cheatsRow:@"Complete shrines automatically"
-                                 about:@"Flies Link with noclip to the nearest shrine not completed yet, opens its gate (A) and walks him in, skips the cutscenes the game lets you skip, takes him to the altar for the Light of Blessing (the game completes the shrine and takes him out, as if you had walked there), then on to the next. Leaves out shrines the story lock greys, hidden and crystal shrines not open yet, and shrines in caves. Any key, button or stick of yours stops it. Save first."
+                                 about:@"Moves Link with noclip straight to the nearest shrine not completed yet (held there until the ground has loaded), opens its gate (A) and walks him in, skips the cutscenes the game lets you skip, takes him to the altar for the Light of Blessing (the game completes the shrine and takes him out, as if you had walked there), then on to the next nearest. Leaves out shrines the story lock greys, hidden and crystal shrines not open yet, shrines in caves and the one under the Zora region's sludge until the Water Temple is done. A shrine it cannot get into (closed, blocked, or the game takes Link back) is given up at once and left out of later runs too. Any key, button or stick of yours stops it. Save first."
                                 detail:autoShrineShown color:running ? NSColor.systemGreenColor : nil control:go] id:CHEATS_AUTOSHRINE_ROW];
     NSSwitch *chests = [NSSwitch new]; chests.state = runtime_autoshrine_chests() ? NSControlStateValueOn : NSControlStateValueOff;
     chests.target = self; chests.action = @selector(autoShrineChestsSwitched:); chests.refusesFirstResponder = YES;
     [self addCheatsRow:[self cheatsRow:@"Open chests too" detail:@"Stops at each chest in the shrine on the way to the altar and presses A in front of it (best effort: some chests sit behind walls or under water)."
                                  color:nil control:chests] id:CHEATS_AUTOSHRINE_CHESTS_ROW];
+    static ShrineGivenUp given; int n = shrine_given_up_load(&given);
+    NSButton *retry = [self cheatsButton:@"Retry" action:@selector(autoShrineRetryGivenUp)]; retry.enabled = n > 0;
+    NSString *detail = n ? [NSString stringWithFormat:@"%d shrine%s given up by earlier runs (marked in the list below): left out until the save says something new of them (opened, completed). Retry clears the list.", n, n == 1 ? "" : "s"]
+                         : @"No shrine given up: a shrine a run cannot get into (closed, blocked, sludge, or the game takes Link back) is listed here and left out of later runs.";
+    [self addCheatsRow:[self cheatsRow:@"Retry given-up shrines" detail:detail color:nil control:retry] id:CHEATS_AUTOSHRINE_RETRY_ROW];
 }
+- (void)autoShrineRetryGivenUp { runtime_autoshrine_given_up_reset(); [self rebuildKeepingPlace]; }
 - (void)autoShrineStartStop {
     char line[600];
     if (runtime_autoshrine_status(line, sizeof line)) { runtime_autoshrine_stop(); [self rebuildKeepingPlace]; return; }
@@ -779,6 +787,7 @@ static int cheat_choice_members(int leader, int *all, int *usable, int max, int 
         }];
         BOOL towers = group->first == 0, story = landmark_is_story(group->first), shrines = landmark_is_shrine(group->first), roots = landmark_is_lightroot(group->first), tears = landmark_is_tear(group->first);
         char autoLine[600]; BOOL running = shrines && runtime_autoshrine_status(autoLine, sizeof autoLine);
+        static ShrineGivenUp given; if (shrines) shrine_given_up_load(&given); else memset(given.on, 0, sizeof given.on);   /* auto shrine gave these up */
         NSString *count = !known ? (saved < 0 ? @"No save yet: shown by name." : @"The last save does not say which are done: shown by name.")
                         : [NSString stringWithFormat:story ? @"%d of %lu completed in the last save." : towers ? @"%d of %lu activated in the last save; the rest first."
                                                      : roots ? @"%d of %lu lit in the last save; the rest first." : tears ? @"%d of %lu seen in the last save; the rest first."
@@ -809,6 +818,9 @@ static int cheat_choice_members(int leader, int *all, int *usable, int max, int 
             NSString *detail = [NSString stringWithFormat:@"%s%s%.0f, %.0f, %.0f%s", state, *state ? " · " : "", l->at[0], l->at[1], l->at[2], l->depths && !roots ? " · in the Depths" : ""];
             if (near && group->fold) { float d = away(k); detail = [detail stringByAppendingFormat:d < 1000 ? @" · %.0f m away" : @" · %.1f km away", d < 1000 ? d : d / 1000]; }
             if (l->lock != LANDMARK_OPEN) detail = [NSString stringWithFormat:@"%s · %@", LANDMARK_LOCK_TEXT[l->lock], detail];
+            int dk = k - LANDMARK_FIRST_SHRINE;   /* given up by auto shrine (left out of its runs; Retry given-up shrines above) */
+            if (shrines && dk >= 0 && dk < SHRINES && given.on[dk] && l->state != LANDMARK_DONE)
+                detail = [NSString stringWithFormat:@"Auto shrine gave up (%s): %s · %@", given.date[dk], given.reason[dk], detail];
             [self addCheatsRow:[self cheatsRow:@(l->name) detail:detail color:l->lock != LANDMARK_OPEN ? NSColor.tertiaryLabelColor : l->state == LANDMARK_DONE ? NSColor.systemGreenColor : nil
                                        control:control] id:CHEATS_LANDMARK_ROW - k];
             if (l->lock != LANDMARK_OPEN) rows.lastObject.alphaValue = 0.55;
@@ -1123,6 +1135,7 @@ static NSTextField *settings_help_label(NSView *v) {   /* a setting row's help t
     if (i == CHEATS_NOCLIP_SPEED_ROW) { if (dir) [self stepNoclipSpeed:dir]; return; }
     if (i == CHEATS_AUTOSHRINE_ROW) { if (!dir) [self autoShrineStartStop]; return; }
     if (i == CHEATS_AUTOSHRINE_CHESTS_ROW) { runtime_autoshrine_set_chests(dir ? dir > 0 : !runtime_autoshrine_chests()); [self rebuildKeepingPlace]; return; }
+    if (i == CHEATS_AUTOSHRINE_RETRY_ROW) { if (!dir) [self autoShrineRetryGivenUp]; return; }
     if (i == CHEATS_AUTOKOROK_ROW) { if (!dir) [self autoKorokStartStop]; return; }
     if (i <= CHEATS_KOROK_TYPE_ROW && i > CHEATS_KOROK_TYPE_ROW - KOROK_NTYPES) {
         int t = CHEATS_KOROK_TYPE_ROW - i; runtime_autokorok_set_type(t, dir ? dir > 0 : !runtime_autokorok_type_on(t)); [self rebuildKeepingPlace]; return;

@@ -41,6 +41,7 @@
    (tests/dish/probe.c checks it). */
 #pragma once
 #include "landmarks.h"
+#include <time.h>
 
 enum { SHRINES = LANDMARK_SHRINES, SHRINE_CHESTS = 6 };
 enum { SHRINE_PUZZLE, SHRINE_COMBAT, SHRINE_PROVING, SHRINE_BLESSING };
@@ -56,6 +57,7 @@ enum { SHRINE_GOT_START = 1, SHRINE_GOT_GOAL = 2, SHRINE_GOT_GOAL_EXIT = 4, SHRI
        SHRINE_GOT_NEEDED = 15 };
 typedef struct {
     int outside, inside, has_warp, has_lift, has_auth, cave, hidden, crystal, kind, nchests, got;   /* got: SHRINE_GOT_... found inside */
+    int sludge;   /* sludge (FldObj_Tar_*) lies over its entrance until the Water Temple's quest is past TouchSecretStone */
     float entrance[3], warp[3], lift[3], lift_floor[3], auth[3];   /* auth: AuthenticationPos, where 1Open stands Link to activate it */
     float start[3], goal[3], goal_exit[3], goal_floor[3], back[3], back_floor[3];
     float chest[SHRINE_CHESTS][3], chest_front[SHRINE_CHESTS][2];
@@ -78,10 +80,11 @@ static inline int shrine_byml_bool(const LandmarkByml *b, uint32_t node, const c
 
 /* What the passes over the map files collect before the shrines are placed: the entrances and their lifts by shrine, and
    the lift floors and travel points by position. */
-enum { SHRINE_FLOORS = 256, SHRINE_WARPS = 512 };
+enum { SHRINE_FLOORS = 256, SHRINE_WARPS = 512, SHRINE_TARS = 64 };
 typedef struct {
     ShrineInfo s[SHRINES];
     float floor[SHRINE_FLOORS][3], warp[SHRINE_WARPS][3], auth[SHRINE_FLOORS][3]; int nfloors, nwarps, nauths;
+    float tar[SHRINE_TARS][3]; int ntars;   /* the Zora region's sludge (FldObj_Tar_*) */
 } ShrineScan;
 /* One decompressed map file (.bcett.byml); cave: it is under Banc/MainField/Cave/. Returns the actors it took, -1 when it
    is not a map file. */
@@ -109,6 +112,7 @@ static inline int shrine_scan_field(const uint8_t *d, size_t n, int cave, Shrine
             if (name && !strcmp(name, "EnterSmallDungeonPos")) { memcpy(sc->floor[sc->nfloors++], xyz, 12); took++; }
             else if (name && !strcmp(name, "AuthenticationPos") && sc->nauths < SHRINE_FLOORS) { memcpy(sc->auth[sc->nauths++], xyz, 12); took++; }
         } else if (!strcmp(gyaml, "DgnObj_WarpPoint_Zonau_A_01") && sc->nwarps < SHRINE_WARPS) { memcpy(sc->warp[sc->nwarps++], xyz, 12); took++; }
+        else if (!strncmp(gyaml, "FldObj_Tar_", 11) && sc->ntars < SHRINE_TARS) { memcpy(sc->tar[sc->ntars++], xyz, 12); took++; }
     }
     return took;
 }
@@ -123,6 +127,7 @@ static inline int shrine_place_field(ShrineScan *sc) {
         if ((s->has_warp = w >= 0)) memcpy(s->warp, sc->warp[w], 12);
         int a = landmark_nearest((const float (*)[3])sc->auth, sc->nauths, s->entrance, 3);
         if ((s->has_auth = a >= 0)) memcpy(s->auth, sc->auth[a], 12);
+        s->sludge = landmark_nearest((const float (*)[3])sc->tar, sc->ntars, s->entrance, 10) >= 0;
         if (!s->has_lift) continue;
         int f = landmark_nearest((const float (*)[3])sc->floor, sc->nfloors, s->lift, 4);
         if (f >= 0) memcpy(s->lift_floor, sc->floor[f], 12);
@@ -174,15 +179,21 @@ static inline int shrine_kind_parse(const uint8_t *d, size_t n) {
 
 /* Why the run leaves a shrine out (SHRINE_GO: it does it). Text in SHRINE_SKIP_TEXT. */
 enum { SHRINE_GO, SHRINE_SKIP_NO_DATA, SHRINE_SKIP_CLEAR, SHRINE_SKIP_LOCKED, SHRINE_SKIP_HIDDEN, SHRINE_SKIP_CRYSTAL, SHRINE_SKIP_CAVE,
-       SHRINE_SKIP_DONE, SHRINE_SKIP_FAILED, SHRINE_SKIP_FIGHT, SHRINE_SKIP_PROVING, SHRINE_SKIPS };
+       SHRINE_SKIP_DONE, SHRINE_SKIP_FAILED, SHRINE_SKIP_FIGHT, SHRINE_SKIP_PROVING, SHRINE_SKIP_SLUDGE, SHRINE_SKIP_GIVEN_UP, SHRINE_SKIPS };
 static const char *const SHRINE_SKIP_TEXT[SHRINE_SKIPS] = {
     "", "its entrance or goal is not in the game's map files", "completed", "locked by the story lock",
     "not revealed yet (its quest raises it)", "its crystal has not been brought yet", "in a cave: the flight down would pass through rock",
     "done in this run", "failed in this run", "needs a fight: the altar's gate opens only after the construct is beaten",
-    "Proving Grounds: the altar's gate opens only after the fight"};
-/* state: SHRINE_STATE_...; lock: landmarks.h LANDMARK_LOCK_... of the shrine; run: 0, SHRINE_SKIP_DONE or _FAILED. A shrine
-   the save does not mention is taken to be in its starting state (hidden and crystal shrines start Hidden). */
-static inline int shrine_skip(const ShrineInfo *s, int state, int lock, int run) {
+    "Proving Grounds: the altar's gate opens only after the fight",
+    "covered in sludge until the Water Temple is done (or wash it off: Splash Fruit, Chuchu Jelly)", "given up earlier"};
+/* shrine_skip's flags: SHRINE_GIVEN_UP an earlier run gave it up and the save still says what it said then
+   (shrine_given_up_*, below); SHRINE_SLUDGE_ON the save says the Zora region's sludge is still there
+   (shrine_sludge_gone). */
+enum { SHRINE_GIVEN_UP = 1, SHRINE_SLUDGE_ON = 2 };
+/* state: SHRINE_STATE_...; lock: landmarks.h LANDMARK_LOCK_... of the shrine; run: 0, SHRINE_SKIP_DONE or _FAILED; flags:
+   SHRINE_GIVEN_UP, SHRINE_SLUDGE_ON. A shrine the save does not mention is taken to be in its starting state (hidden and
+   crystal shrines start Hidden). Sludge over the entrance matters only before the gate is opened (Appear or not known). */
+static inline int shrine_skip(const ShrineInfo *s, int state, int lock, int run, int flags) {
     if (!s->outside || !s->has_lift || !s->inside) return SHRINE_SKIP_NO_DATA;
     if (state == SHRINE_STATE_CLEAR) return SHRINE_SKIP_CLEAR;
     if (run) return run;
@@ -194,6 +205,8 @@ static inline int shrine_skip(const ShrineInfo *s, int state, int lock, int run)
        five times, no event) */
     if (s->kind == SHRINE_COMBAT) return SHRINE_SKIP_FIGHT;
     if (s->kind == SHRINE_PROVING) return SHRINE_SKIP_PROVING;
+    if (s->sludge && (flags & SHRINE_SLUDGE_ON) && (state == SHRINE_STATE_APPEAR || state == SHRINE_STATE_UNKNOWN)) return SHRINE_SKIP_SLUDGE;
+    if (flags & SHRINE_GIVEN_UP) return SHRINE_SKIP_GIVEN_UP;   /* last: a reason above says more */
     return SHRINE_GO;
 }
 /* The shrine to do next: the nearest entrance to from among those with skip[k] == SHRINE_GO; -1 when none. */
@@ -205,6 +218,110 @@ static inline int shrine_next(const ShrineInfo *s, const int *skip, const float 
         if (best < 0 || d < bd) { best = k; bd = d; }
     }
     return best;
+}
+/* Shrines given up in earlier runs (2026-10-29): autoshrine-given-up.txt beside the profile (the folder that holds
+   TOTK_PROFILE_DIR, as spawn-picks.txt and cheats-enabled.txt; TOTK_AUTOSHRINE_GIVEN_UP overrides), one line per shrine:
+   "DungeonNNN<TAB>reason<TAB>date<TAB>state", state the DungeonState the save had when it was given up. Later runs leave
+   it out (SHRINE_SKIP_GIVEN_UP) while the save still says that state; once it changes (the gate opened, the shrine done
+   by hand) the line is dropped and the shrine tried again. Places › Shrines' "Retry given-up shrines" removes the file. */
+enum { SHRINE_GIVEN_UP_REASON = 200, SHRINE_GIVEN_UP_DATE = 24 };
+typedef struct {
+    uint8_t on[SHRINES], state[SHRINES];   /* state: SHRINE_STATE_... then */
+    char reason[SHRINES][SHRINE_GIVEN_UP_REASON], date[SHRINES][SHRINE_GIVEN_UP_DATE];
+} ShrineGivenUp;
+static inline int shrine_given_up_path(char *out, size_t n) {
+    const char *e = getenv("TOTK_AUTOSHRINE_GIVEN_UP"), *p = getenv("TOTK_PROFILE_DIR");
+    if (e && *e) return snprintf(out, n, "%s", e) < (int)n;
+    if (!p || !*p) return 0;
+    size_t len = strlen(p);
+    while (len > 1 && p[len - 1] == '/') len--;
+    while (len > 0 && p[len - 1] != '/') len--;   /* the folder that holds the profile */
+    if (!len) return snprintf(out, n, "autoshrine-given-up.txt") < (int)n;
+    return snprintf(out, n, "%.*sautoshrine-given-up.txt", (int)len, p) < (int)n;
+}
+/* One field of a line (len bytes of from): tabs and line ends become spaces. */
+static inline void shrine_given_up_field(char *out, size_t n, const char *from, size_t len) {
+    size_t o = 0;
+    for (size_t i = 0; i < len && from[i] && o + 1 < n; i++) out[o++] = from[i] == '\t' || from[i] == '\n' || from[i] == '\r' ? ' ' : from[i];
+    if (n) out[o] = 0;
+}
+/* The file's text (NULL: none) into g; returns how many shrines it names. Lines that do not start with DungeonNNN are skipped. */
+static inline int shrine_given_up_parse(ShrineGivenUp *g, const char *text) {
+    memset(g, 0, sizeof *g);
+    int count = 0;
+    for (const char *line = text; line && *line;) {
+        const char *end = strchr(line, '\n'), *stop = end ? end : line + strlen(line);
+        const char *tab = memchr(line, '\t', (size_t)(stop - line)); char name[16];
+        shrine_given_up_field(name, sizeof name, line, (size_t)((tab ? tab : stop) - line));
+        int k = shrine_index(name);
+        if (k >= 0) {
+            const char *f[3] = {"", "", ""}; size_t fl[3] = {0, 0, 0}; const char *at = tab;
+            for (int i = 0; i < 3 && at; i++) {
+                f[i] = at + 1; const char *next = memchr(f[i], '\t', (size_t)(stop - f[i]));
+                fl[i] = (size_t)((next ? next : stop) - f[i]); at = next;
+            }
+            while (fl[2] && (f[2][fl[2] - 1] == '\r' || f[2][fl[2] - 1] == ' ')) fl[2]--;
+            count += !g->on[k];
+            g->on[k] = 1; g->state[k] = SHRINE_STATE_UNKNOWN;
+            shrine_given_up_field(g->reason[k], sizeof g->reason[k], f[0], fl[0]);
+            shrine_given_up_field(g->date[k], sizeof g->date[k], f[1], fl[1]);
+            for (int v = SHRINE_STATE_HIDDEN; v <= SHRINE_STATE_CLEAR; v++)
+                if (fl[2] == strlen(SHRINE_STATE_NAMES[v]) && !strncmp(f[2], SHRINE_STATE_NAMES[v], fl[2])) g->state[k] = (uint8_t)v;
+        }
+        line = end ? end + 1 : NULL;
+    }
+    return count;
+}
+/* g as the file's text into out (n bytes; NULL to measure); returns the length it needs, without the final 0. */
+static inline int shrine_given_up_format(const ShrineGivenUp *g, char *out, size_t n) {
+    int len = 0;
+    for (int k = 0; k < SHRINES; k++) {
+        if (!g->on[k]) continue;
+        int room = out && (size_t)len < n;
+        int w = snprintf(room ? out + len : NULL, room ? n - (size_t)len : 0, "Dungeon%03d\t%s\t%s\t%s\n", k, g->reason[k], g->date[k],
+                         g->state[k] <= SHRINE_STATE_CLEAR ? SHRINE_STATE_NAMES[g->state[k]] : "");
+        if (w > 0) len += w;
+    }
+    return len;
+}
+/* Whether shrine k stays left out: given up, and the save says now what it said then (not known then: whatever it says). */
+static inline int shrine_given_up_holds(const ShrineGivenUp *g, int k, int state_now) {
+    return k >= 0 && k < SHRINES && g->on[k] && (g->state[k] == SHRINE_STATE_UNKNOWN || g->state[k] == state_now);
+}
+/* Records shrine k: the reason, the date (local, YYYY-MM-DD HH:MM) and the save's state now. */
+static inline void shrine_given_up_add(ShrineGivenUp *g, int k, const char *reason, int state_now, time_t when) {
+    if (k < 0 || k >= SHRINES) return;
+    struct tm tm; char date[SHRINE_GIVEN_UP_DATE] = "";
+    if (localtime_r(&when, &tm)) strftime(date, sizeof date, "%Y-%m-%d %H:%M", &tm);
+    if (!reason) reason = "";
+    g->on[k] = 1; g->state[k] = (uint8_t)(state_now >= 0 && state_now <= SHRINE_STATE_CLEAR ? state_now : SHRINE_STATE_UNKNOWN);
+    shrine_given_up_field(g->reason[k], sizeof g->reason[k], reason, strlen(reason));
+    snprintf(g->date[k], sizeof g->date[k], "%s", date);
+}
+/* The file into g (none: empty); returns how many shrines it names. */
+static inline int shrine_given_up_load(ShrineGivenUp *g) {
+    char path[1024]; FILE *f = shrine_given_up_path(path, sizeof path) ? fopen(path, "rb") : NULL;
+    char *text = f ? malloc(64 << 10) : NULL; size_t n = text ? fread(text, 1, (64 << 10) - 1, f) : 0;
+    if (f) fclose(f);
+    if (text) text[n] = 0;
+    int count = shrine_given_up_parse(g, text);
+    free(text);
+    return count;
+}
+/* g into the file through a temporary one (a crash leaves the old one); none left: the file removed. 0 on success. */
+static inline int shrine_given_up_save(const ShrineGivenUp *g) {
+    char path[1024], tmp[1040];
+    if (!shrine_given_up_path(path, sizeof path)) return -1;
+    int len = shrine_given_up_format(g, NULL, 0);
+    if (!len) { remove(path); return 0; }
+    char *text = malloc((size_t)len + 1); if (!text) return -1;
+    shrine_given_up_format(g, text, (size_t)len + 1);
+    snprintf(tmp, sizeof tmp, "%s.tmp", path);
+    FILE *f = fopen(tmp, "wb"); int ok = f && fwrite(text, 1, (size_t)len, f) == (size_t)len;
+    if (f && fclose(f)) ok = 0;
+    free(text);
+    if (!ok || rename(tmp, path)) { remove(tmp); return -1; }
+    return 0;
 }
 /* Each shrine's DungeonState in a progress.sav image (map_pins.h has the layout); returns how many were found. */
 static inline int shrine_states_parse(const uint8_t *b, size_t n, uint8_t *state) {
@@ -224,6 +341,23 @@ static inline int shrine_states_parse(const uint8_t *b, size_t n, uint8_t *state
         }
     }
     return found;
+}
+/* The Zora region's sludge (researched 2026-10-29): the FldObj_Tar_* actors (the Mucktorok's sludge) are placed only while
+   SageOfZora_IsAfter_TouchSecretStone_Exp is false (their Presence flag with IsNegation; radar-totk.zeldamods.org,
+   object 0x47704d9ad4a6ef8c), which is Step_SageOfZora > TouchSecretStone (MrCheeze/totk-tools boolexp.c): the steps after
+   it are Finish and Complete (as the Wind Temple's, landmarks.h LANDMARK_WIND_DONE). In 1.4.3 one lies over a shrine's
+   entrance, 5 m from it: Ihen-a Shrine (Dungeon041, Upland Zorana); every other one is 55 m or more from a shrine. Before
+   the Water Temple a player washes it off (Splash Fruit, Chuchu Jelly, a hydrant). 1: gone, 0: still there, -1: the save
+   does not say. */
+static inline int shrine_sludge_gone(const uint8_t *b, size_t n) {
+    if (n < 0x30 || landmark_le32(b) != 0x01020304) return -1;
+    uint32_t want = dish_murmur3("Step_SageOfZora"), finish = dish_murmur3("Finish"), complete = dish_murmur3("Complete");
+    for (size_t i = 0x28; i + 8 <= n; i += 8) {
+        uint32_t h = landmark_le32(b + i), v = landmark_le32(b + i + 4);
+        if (h == 0xa3db7114u) break;
+        if (h == want) return v == finish || v == complete;
+    }
+    return -1;
 }
 
 /* Where Link lands for each step and what he faces (stand, 0.3 m above the floor; face: the A prompt's actor).
