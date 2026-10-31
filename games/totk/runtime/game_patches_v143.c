@@ -531,8 +531,10 @@ int runtime_output_res(unsigned *w,unsigned *h){
             const char *dir=getenv("TOTK_ROMFS_PATCHES_OUT");char path[4096];
             snprintf(path,sizeof path,"%s/2560x1440/manifest.tsv",dir?dir:"extracted/v143/romfs-patches-out");
             FILE *f=fopen(path,"r");if(f){fclose(f);on=1;cw=2560;ch=1440;}
-            /* Headroom (settings): a 4K output on a Mac with 16 GB or more when its overlay was built, with a 2560x1440 scene
-               reserve (a 4K scene too would need a 1.5 GiB texture heap, above the 1 GiB a zero-copy GPU buffer may take). */
+            /* Headroom (settings): a 4K output on a Mac with 16 GB or more when its overlay was built (build_app.py native 4K,
+               on by default there), with a 2560x1440 scene reserve; a larger scene (Maximum render resolution, its own
+               <canvas>-scene-<scene> overlay) needs a texture heap above 1 GiB, which one zero-copy GPU buffer now takes
+               (nvn_mtl.m pool_range_check: no size limit since upstream b3bb2c08). */
             uint64_t mem=0;size_t len=sizeof mem;sysctlbyname("hw.memsize",&mem,&len,NULL,0);
             snprintf(path,sizeof path,"%s/3840x2160-scene-2560x1440/manifest.tsv",dir?dir:"extracted/v143/romfs-patches-out");
             if(mem>=(16ULL<<30)&&(f=fopen(path,"r"))){fclose(f);on=1;cw=3840;ch=2160;}
@@ -914,30 +916,35 @@ static void output_size_set(uint64_t want){
     fprintf(stderr,"[totk] 1.4.3 output requested %ux%u (display config %s)\n",(unsigned)want,(unsigned)(want>>32),config?"ready":"not published yet");
 }
 int runtime_output_native(int mode,unsigned *w,unsigned *h){
-    if(!output_page||(mode!=OUTPUT_MODE_NATIVE&&mode!=OUTPUT_MODE_NATIVE_METALFX))return 0;
+    if(!output_page)return 0;
+    if(mode==OUTPUT_MODE_NATIVE_4K){if(output_w<3840||output_h<2160)return 0;*w=3840;*h=2160;return 1;}   /* a native 4K app */
+    if(mode!=OUTPUT_MODE_NATIVE&&mode!=OUTPUT_MODE_NATIVE_METALFX)return 0;
+    if(output_w>2560){*w=2560;*h=1440;return 1;}   /* a 4K app's 2K stays 2560x1440 */
     *w=output_w;*h=output_h;return 1;
 }
 int runtime_output_modes(void){
     if(!output_page)return 0;
-    return 1<<OUTPUT_MODE_OFF|1<<OUTPUT_MODE_METALFX|1<<OUTPUT_MODE_720P|1<<OUTPUT_MODE_NATIVE|1<<OUTPUT_MODE_NATIVE_METALFX;
+    return 1<<OUTPUT_MODE_OFF|1<<OUTPUT_MODE_METALFX|1<<OUTPUT_MODE_720P|1<<OUTPUT_MODE_NATIVE|1<<OUTPUT_MODE_NATIVE_METALFX|
+           (output_w>=3840&&output_h>=2160?1<<OUTPUT_MODE_NATIVE_4K:0);
 }
 int runtime_output_mode(void){
     extern int mfxup_output_enabled(void);
     if(!output_page)return OUTPUT_MODE_OFF;
     uint64_t now=atomic_load((_Atomic uint64_t *)(void *)(output_page+32));
     if(now==pack_size(1280,720))return OUTPUT_MODE_720P;
+    if(now==pack_size(3840,2160)&&!mfxup_output_enabled())return OUTPUT_MODE_NATIVE_4K;
     if((unsigned)now>1920)return mfxup_output_enabled()?OUTPUT_MODE_NATIVE_METALFX:OUTPUT_MODE_NATIVE;
     return mfxup_output_enabled()?OUTPUT_MODE_METALFX:OUTPUT_MODE_OFF;
 }
 int runtime_output_mode_set(int mode){
     extern void dm_gfx_set_flag(const char *,int);
-    if(!output_page||mode<OUTPUT_MODE_OFF||mode>OUTPUT_MODE_720P||!(runtime_output_modes()&1<<mode))return 0;
+    if(!output_page||mode<OUTPUT_MODE_OFF||mode>OUTPUT_MODE_NATIVE_4K||!(runtime_output_modes()&1<<mode))return 0;
     unsigned w=1920,h=1080;
-    if(mode==OUTPUT_MODE_720P){w=1280;h=720;}else if(mode==OUTPUT_MODE_NATIVE||mode==OUTPUT_MODE_NATIVE_METALFX)runtime_output_native(mode,&w,&h);
+    if(mode==OUTPUT_MODE_720P){w=1280;h=720;}else if(mode==OUTPUT_MODE_NATIVE||mode==OUTPUT_MODE_NATIVE_METALFX||mode==OUTPUT_MODE_NATIVE_4K)runtime_output_native(mode,&w,&h);
     output_size_set(pack_size(w,h));
     int mfx=mode==OUTPUT_MODE_METALFX||mode==OUTPUT_MODE_NATIVE_METALFX;
     dm_gfx_set_flag("mfx_output",mfx);dm_gfx_set_flag("mfx_upscale",mfx);
-    fprintf(stderr,"[totk] picture: %s\n",mode==OUTPUT_MODE_720P?"720p":mode==OUTPUT_MODE_NATIVE_METALFX?"native 2K, MetalFX to the window":
+    fprintf(stderr,"[totk] picture: %s\n",mode==OUTPUT_MODE_NATIVE_4K?"native 4K":mode==OUTPUT_MODE_720P?"720p":mode==OUTPUT_MODE_NATIVE_METALFX?"native 2K, MetalFX to the window":
             mode==OUTPUT_MODE_NATIVE?"native":mode==OUTPUT_MODE_METALFX?"MetalFX 2K":"off (1080p)");
     picture_mode_save(atomic_load((_Atomic uint64_t *)(void *)(output_page+32)));
     return 1;

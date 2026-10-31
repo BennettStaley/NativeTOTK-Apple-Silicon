@@ -185,7 +185,7 @@ void fps_overlay_text(const fps_overlay_info *info, char *text, size_t n) {
         if (info->low < 0) snprintf(low, sizeof low, "--"); else snprintf(low, sizeof low, "%d", info->low > 999 ? 999 : info->low);
         snprintf(detail, sizeof detail, "  avg %s  1%% low %s", avg, low);
     }
-    snprintf(text, n, "FPS %s%s%s  %s%s%s%s", fps, gen, detail, ss, sc, info->mfx ? "  MetalFX on" : "", info->big ? "  2K" : "");
+    snprintf(text, n, "FPS %s%s%s  %s%s%s%s", fps, gen, detail, ss, sc, info->mfx ? "  MetalFX on" : "", info->big == 2 ? "  4K" : info->big ? "  2K" : "");
 }
 
 void fps_overlay_raster(const fps_overlay_info *info, int scale, uint8_t *out, int *box_w, int *box_h) {

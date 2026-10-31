@@ -36,6 +36,20 @@ Tested on one Mac: Apple M5, 32 GB, macOS 27.0.1, game versions 1.0.0 and 2.2.1.
 - Rare, brief screen tearing or thin black lines while playing.
 - A shader seen for the first time is translated and compiled when it is first used. On the first run (of `make boot` or of the app, which keeps its own cache) a loading screen can wait for that, once for up to about a minute; later runs load the shaders from the cache.
 
+## What the game uses
+
+- **NVN:** SDK 12.3.9, the same in 1.0.0 and 2.2.1. The game asks `nvnDeviceGetProcAddress` for entry points 1,050 times at start. The graphics layer's table has 523 NVN names: 432 implemented, 7 intentional no-ops, and the other 84 abort with their name when called. None of those 84 was called in 15-minute runs of either version.
+- **Features Metal lacks, emulated here:**
+  - transform feedback;
+  - geometry shaders (point input; one triangle-strip program is skipped);
+  - BC7 encoding on the GPU;
+  - two texture and sampler pools switched every frame;
+  - skinning in vertex shaders under rasterizer discard;
+  - quads.
+  See [docs/reference/nvn-coverage.md](docs/reference/nvn-coverage.md).
+- **Sound and movies:** Wwise sound through `audren:u` / `audout:u`, and 238 WebM (VP9) movies through the SDK `movie` library and `runtime/movie_host.c` (libvpx).
+- **Online and DLC:** no online play. In 2.2.1 the game sees your own add-ons (Expansion Pass volumes 1–4) once they are extracted, and the eShop's "Purchase" returns at once.
+
 ## Inputs
 
 - Base game 1.0.0: `010074F013262000` (NSP; v0). It holds the code as well as the data; the scripts identify it by its ExeFS hashes and its Program NCA against `assets/expected-v1.0.0.json` (hashes only).
@@ -72,13 +86,19 @@ make prepare runtime shader-tools VERSION=v221 PY=$PY
 make boot VERSION=v221
 ```
 
+Add-on content (2.2.1 only): your own Expansion Pass NSPs, each checked against `assets/expected-aoc.json` (hashes only):
+
+```sh
+$PY scripts/extract_aoc.py "<wave 1>.nsp" "<wave 2>.nsp" "<wave 3>.nsp" "<wave 4>.nsp" --keys prod.keys --work XC3_build   # -> XC3_build/extracted/aoc/1..4
+```
+
 Both versions live in one work folder (`extracted/<version>`, `rewritten/<version>`, `build/<version>` and `build/xc3-native-<version>`); the shader cache and the tools are shared. `VERSION` defaults to the newest version extracted. `make app VERSION=v221 …` builds the app for 2.2.1.
 
 `make boot` opens the game window and writes its log to `XC3_build/logs/boot.log`. The first start translates the game's shaders as they are used; later starts warm them from the cache in a second or two. The system shared fonts can be extracted from your own firmware with `scripts/extract_shared_fonts.py`.
 
 Verification of the rewrite (each module): `third_party/d2r/structck.py XC3_build/rewritten/v100 <module> XC3_build/extracted/v100/exefs/<module>` and `third_party/d2r/equiv.py` with the same arguments plus `--min-eff 8`. Set `DM_ROOT` to the work folder so `structck.py` keeps its cache there. `make prepare` checks every rewritten module against `rewritten_sha256` in the manifest.
 
-Keys as in the other ports: WASD the left stick, arrow keys the right stick (camera), J is A, K or Space is B, I is X, U is Y, Q / E are L / R, Option / Shift are ZL / ZR, Return is +, Tab or Escape is −, T F G H the D-pad. A game controller works too. Key 1 shows or hides the overlays; the other TotK shortcut keys (2–4) do nothing in this port.
+Keys as in the other ports: WASD the left stick, arrow keys the right stick (camera), J is A, K or Space is B, I is X, U is Y, Q / E are L / R, Option / Shift are ZL / ZR, Return is +, Tab or Escape is −, T F G H the D-pad. A game controller works too. Key 1 opens the settings panel (from TotK): overlay and FPS graph, controller type, mouse, rumble, and key bindings for keyboard, mouse and controller, saved for the next start. Rows this game cannot use yet (frame lock above 30, frame interpolation, resolution, aspect ratio) show one fixed value. On a controller, L3 + R3 together open it.
 
 Run this way, saves, the profile and the pseudo device id are written to `XC3_build/user-data`.
 

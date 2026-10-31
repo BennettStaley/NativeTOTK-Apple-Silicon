@@ -12406,7 +12406,7 @@ static id<MTLTexture> output_upscale(id<MTL4CommandBuffer> cb, id<MTLTexture> sr
     int timed = g_outup_heap && slot >= 0 && slot < 3;
     if (timed) [cb writeTimestampIntoHeap:g_outup_heap atIndex:(NSUInteger)slot * 2];
     uint64_t t0 = now_ns();
-    id<MTLTexture> out = mfxup_encode_ex(MFXUP_OUTPUT, cb, src, cw, ch, nil, ow, oh, MFXUP_PERCEPTUAL);
+    id<MTLTexture> out = mfxup_encode_region(MFXUP_OUTPUT, cb, src, cw, ch, ow, oh, MFXUP_PERCEPTUAL);
     uint64_t t1 = now_ns();
     if (timed) [cb writeTimestampIntoHeap:g_outup_heap atIndex:(NSUInteger)slot * 2 + 1];
     if (t1 - t0 > 2000000) MLOG("[mfx-up] output: %lux%lu -> %lux%lu, encoding took %.1f ms on the present thread (scaler built)", (unsigned long)cw, (unsigned long)ch, (unsigned long)ow, (unsigned long)oh, (t1 - t0) / 1e6);
@@ -12428,6 +12428,12 @@ static void outup_note_gpu(int slot) {   // the present command buffer of this s
              (unsigned long long)atomic_load(&g_cur_frame), (unsigned long)g_outup_size[0], (unsigned long)g_outup_size[1], (unsigned long)g_outup_size[2], (unsigned long)g_outup_size[3],
              (unsigned long long)g_outup_n, a[256], a[486], (unsigned long long)g_outup_skip[0], (unsigned long long)g_outup_skip[1], (unsigned long long)g_outup_skip[2]);
     }
+}
+/* The FPS graph's reading (runtime/frontend.m, copied from games/totk): game frames per second, re-measured every half
+   second (fps_overlay_value). TotK also counts interpolated frames; XC3 makes none (stage 11), so generated is 0. */
+int dm_gfx_fps_now(int *generated) {
+    if (generated) *generated = 0;
+    return fps_overlay_value();
 }
 // TOTK_STRETCH=1, or the ultrawide ratio of key 4 / TOTK_ASPECT: fill the window whatever its shape, like an emulator's "Stretch to Window" (aspect-ratio mods such as
 // TOTK-Ultrawide draw a horizontally squeezed picture for it). Off: the game picture keeps its shape, centred.
@@ -13035,6 +13041,19 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
     }];
     pthread_mutex_lock(&g_pq_mu); g_present_alloc_busy[alloc_i] = 1; g_pq_inflight++; pthread_mutex_unlock(&g_pq_mu);
     q4_commit(cb, o);
+    /* TOTK_DRAWABLE_SHOT=n[,n...]:path (%d = game frame; diagnostic, added for Xenoblade Chronicles 3): the drawable as it
+       goes to the screen, read back after this present's GPU work (DM_NVN_SHOT saves the game's own picture before the
+       output stage; this one saves what the window shows, MetalFX output included). Stalls that frame. */
+    if (interp < 0) {
+        static int dn = -1; static long dshots[64]; static char dpath[1024];
+        if (dn < 0) { dn = 0; const char *e = getenv("TOTK_DRAWABLE_SHOT"), *c = e ? strchr(e, ':') : NULL;
+            if (c) { snprintf(dpath, sizeof dpath, "%s", c + 1); for (const char *q = e; q < c && dn < 64;) { dshots[dn++] = strtol(q, (char **)&q, 10); if (*q == ',') q++; else break; } } }
+        for (int i = 0; i < dn; i++) if (dshots[i] == (long)frame) {
+            while (1) { pthread_mutex_lock(&g_pq_mu); int busy = g_present_alloc_busy[alloc_i]; pthread_mutex_unlock(&g_pq_mu); if (!busy) break; usleep(500); }
+            char path[1100]; snprintf(path, sizeof path, dpath, (int)frame); shot(dr.texture, path, 0, NULL);
+            MLOG("[drawable-shot] frame %ld: %s (%lux%lu)", (long)frame, path, (unsigned long)dr.texture.width, (unsigned long)dr.texture.height);
+        }
+    }
     if (target_ts > 0) {
         static double leads[300], e2e[300];   // e2e：游戏入队 → 系统预定上屏（含在队列里等节拍回调的时间），输入延迟里我们这一侧能读到的全程 | e2e: game enqueue -> system-scheduled present (including the time waiting in the queue for the display-link callback), the full span of input latency that our side can read
         static uint64_t lead_n, e2e_n;

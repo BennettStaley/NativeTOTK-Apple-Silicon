@@ -47,6 +47,7 @@ int runtime_gamepad_type(int *detected){if(detected)*detected=-1;return 0;}
 #endif
 #ifndef FRONTEND_REAL_GAMEPAD
 int runtime_gamepad_battery_percent(void){return -1;}
+int runtime_gamepad_battery_left_percent(void){return -1;}
 #endif
 #ifndef FRONTEND_REAL_GAMEPAD
 int runtime_mouse_enabled(void){return 0;}

@@ -114,12 +114,14 @@ int runtime_output_mode_cycle(void);                    /* key 3: MetalFX 2K -> 
    (user 2026-10-25: "4K" as 2K + MetalFX, a 4K swapchain's heaps being too big for one GPU buffer); also 720p, a
    1280x720 canvas whose scene follows it (user 2026-10-25, in place of the Switch's own handheld / docked sizes: the game
    reads its docked scene size only at the start, so a switch to it never took effect).
+   Native 4K (1.4.3, an app built with native 4K: build_app.py's default on a Mac with 16 GB or more): a 3840x2160
+   canvas and scene (game_patches_v143.c runtime_output_res).
    runtime_output_modes: a bit (1 << mode) for each this game and start offer; 0 when the resolution cannot change. */
-enum { OUTPUT_MODE_OFF, OUTPUT_MODE_METALFX, OUTPUT_MODE_NATIVE, OUTPUT_MODE_NATIVE_METALFX, OUTPUT_MODE_720P };
+enum { OUTPUT_MODE_OFF, OUTPUT_MODE_METALFX, OUTPUT_MODE_NATIVE, OUTPUT_MODE_NATIVE_METALFX, OUTPUT_MODE_720P, OUTPUT_MODE_NATIVE_4K };
 int runtime_output_modes(void);
 int runtime_output_mode(void);
 int runtime_output_mode_set(int mode);                  /* returns 0 where that mode is not offered */
-int runtime_output_native(int mode, unsigned *w, unsigned *h);   /* the canvas of OUTPUT_MODE_NATIVE / _NATIVE_METALFX; 0 when not offered */
+int runtime_output_native(int mode, unsigned *w, unsigned *h);   /* the canvas of OUTPUT_MODE_NATIVE / _NATIVE_METALFX / _NATIVE_4K; 0 when not offered */
 uint64_t runtime_output_size_current(void);              /* configured canvas: width in low 32 bits, height in high 32 bits */
 void runtime_warm_progress(uint64_t done,uint64_t total,uint64_t shaders,uint64_t shader_total,uint64_t pipelines,uint64_t pipeline_total);
 void runtime_warm_done(void);
@@ -237,6 +239,8 @@ void runtime_gamepad_clear(void);
 int runtime_gamepad_type_set(int type);     /* runtime/gamepad.m: the settings panel's controller type (gamepad_layout.h GAMEPAD_TYPE_*), saved; returns the type in force */
 int runtime_gamepad_type(int *detected);    /* runtime/gamepad.m, main thread: the picked type; *detected = auto's guess for the connected controller, -1 none */
 int runtime_gamepad_battery_percent(void);  /* runtime/gamepad.m, main thread: the first controller's battery as a whole percent, -1 none or unknown */
+void runtime_gamepad_hid_battery(int left, int percent);   /* runtime/gamepad.m, any thread: a Switch controller's battery read from its HID reports (left: a paired set's left Joy-Con), -1 none */
+int runtime_gamepad_battery_left_percent(void);  /* runtime/gamepad.m: a paired Joy-Con set's left one, -1 none; the percent above is then the right one */
 int runtime_setting_word(const char *name, char *word, size_t size);   /* runtime/gamepad.m: a one-word setting file next to controls.txt; 1 read, 0 none */
 void runtime_setting_save(const char *name, const char *word, const char *what);   /* runtime/gamepad.m: saves one; what names it in a failure line */
 int runtime_shared_setting_word(const char *name, char *word, size_t size);   /* runtime/gamepad.m: the same, shared by both games (the folder above controls.txt's) */

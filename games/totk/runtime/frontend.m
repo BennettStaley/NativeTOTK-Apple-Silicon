@@ -7,7 +7,6 @@
 #include <math.h>
 #include "runtime.h"
 #include "game_version.h"
-#include "../app/update_check.h"
 #include "gamepad_layout.h"
 #import "playtime.h"
 #include "../third_party/d2r_gfx/gfx/nvn/totk_mfx_mode.h"
@@ -277,8 +276,8 @@ static NSString *shortcut_text(void){
  /* The foreground playtime (upstream PR #639, playtime.h) and the controller's battery (upstream 28df6bb). */
  if(full&&playtime)[a appendAttributedString:[[NSAttributedString alloc] initWithString:[playtime.text stringByAppendingString:@"\n"]
    attributes:@{NSFontAttributeName:mono,NSForegroundColorAttributeName:green}]];
- {int bpct=full?runtime_gamepad_battery_percent():-1;
-   if(bpct>=0)[a appendAttributedString:[[NSAttributedString alloc] initWithString:[NSString stringWithFormat:@"Controller %d%%\n",bpct]
+ {int bpct=full?runtime_gamepad_battery_percent():-1,bleft=runtime_gamepad_battery_left_percent();   // a paired Joy-Con set: left and right
+   if(bpct>=0)[a appendAttributedString:[[NSAttributedString alloc] initWithString:bleft>=0?[NSString stringWithFormat:@"Controller L %d%% R %d%%\n",bleft,bpct]:[NSString stringWithFormat:@"Controller %d%%\n",bpct]
     attributes:@{NSFontAttributeName:mono,NSForegroundColorAttributeName:green}]];}
  if(!full){if(a.length)[a deleteCharactersInRange:NSMakeRange(a.length-1,1)];   // no empty line under the single FPS line
   else [a appendAttributedString:[[NSAttributedString alloc] initWithString:@"FPS --" attributes:@{NSFontAttributeName:mono,NSForegroundColorAttributeName:green}]];}
@@ -520,7 +519,6 @@ static void front_install_menu(void){
 static void *guest_main(void *callback){@autoreleasepool{((void(*)(void))callback)();}return NULL;}
 void runtime_front_run(void(*callback)(void)){
  @autoreleasepool{
-  mng_update_background(); // cache for a later launch; never wait for GitHub or show UI during play
   bootStartNS=runtime_now_ns();
   {const char *commit=getenv("TOTK_SOURCE_COMMIT");fprintf(stderr,"[totk] built from commit %s\n",commit&&*commit?commit:"(not recorded)");}
 #ifdef GAME_BOTW

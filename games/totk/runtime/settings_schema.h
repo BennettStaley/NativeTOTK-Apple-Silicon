@@ -93,6 +93,10 @@ static const SettingChoice SET_HEADROOM[] = {{"Auto (4K on 16 GB)", "auto", NULL
    launcher lets a memory pool's GPU buffer grow to 2 GiB and raises the GPU memory budget. Needs the 4K maximum output. */
 static const SettingChoice SET_RENDER_MAX[] = {{"1440p (2560 x 1440)", "1440", NULL, 1440}, {"1800p (3200 x 1800)", "1800", "3200x1800", 1800},
                                                {"4K (3840 x 2160)", "2160", "3840x2160", 2160}};
+/* Stronger ambient occlusion (upstream a1c625f3 / 74473498, gfx/nvn/totk_ssao.h): the AO strength and radius in percent,
+   both scaled together; 0 = the game's own AO, bit for bit. Live: the AO shaders always carry the parameters on the Mac. */
+static const SettingChoice SET_AO[] = {{"Off (the game's own)", "off", NULL, 0}, {"1.5x", "1.5", NULL, 150}, {"2x", "2", NULL, 200},
+                                       {"3x", "3", NULL, 300}};
 static const SettingChoice SET_AA[] = {{"The game's own", "game", "0", 0}, {"Off", "off", "1", 1}, {"FXAA", "fxaa", "2", 2}, {"SMAA", "smaa", "3", 3}};
 static const SettingChoice SET_SHADOW[] = {{"0.25x", "0.25", "0.25", -4}, {"0.5x", "0.5", "0.5", -2}, {"The game's own", "game", NULL, 0},
                                            {"2x", "2", "2", 2}, {"4x", "4", "4", 4}};
@@ -145,6 +149,8 @@ static const SettingDef SETTINGS[] = {
      "TOTK_SHARPEN", SET_RANGE, SET_LIVE, SET_ALL, 0, 0, 0, 100, 5, "%", NULL, 0, NULL, NULL, 0},
     {"graphics.aniso", "Image", "Anisotropic filtering", "Sharper ground and walls seen at an angle.",
      "TOTK_ANISO", SET_CHOICE, SET_LIVE, SET_ALL, 0, 0, 0, 0, 0, NULL, SET_ANISO, SET_N(SET_ANISO), NULL, NULL, 0},
+    {"graphics.ao", "Effects", "Stronger ambient occlusion", "Deepens the soft shade the game puts in corners, crevices and where things meet the ground (its ambient occlusion: strength and radius both scaled; 1.5x is the tested level). Off is the game's own shading, unchanged. Acts at once (version 1.4.3; TOTK_SSAO_STRENGTH / TOTK_SSAO_RADIUS decide first, TOTK_SSAO=0 keeps the game's own shaders).",
+     NULL, SET_CHOICE, SET_LIVE, SET_MAC, 0, 0, 0, 0, 0, NULL, SET_AO, SET_N(SET_AO), "Not on iPhone and iPad: their shaders are built with the app.", NULL, 0},
     {"graphics.dof", "Effects", "Depth of field", "The game's blur of the distance. Off keeps far away sharp (version 1.4.3).",
      NULL, SET_BOOL, SET_LIVE, SET_ALL, 1, 1, 0, 1, 1, NULL, NULL, 0, NULL, NULL, 0},
     {"graphics.bloom", "Effects", "Bloom", "The glow around bright light, against the game's own (version 1.4.3).",

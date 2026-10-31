@@ -27,7 +27,6 @@
 #include "totk_shader_contrib.h"   // the shared shader list contribution and its reminder
 #import "save_package.h"           // .totksave: saves sent from another Mac or an iPhone / iPad
 #include "contrib_submit.h"        // its "Submit automatically" (gh): run_tool, gh_path, contrib_submit; shared with the settings panel
-#include "update_notice.h"
 
 static void show_error(NSString *detail) {
     NSAlert *alert = [NSAlert new];
@@ -385,7 +384,6 @@ int main(int argc, char **argv) {
         }
         for (NSString *package in packages)
             if (!import_package(package, profile, [data stringByAppendingPathComponent:@"save-backups"])) return 0;
-        mng_update_notice(data);
 #if defined(TOTK_GAME_V112) || defined(TOTK_GAME_V121) || defined(TOTK_GAME_V143)
         NSString *backup = [profile stringByAppendingFormat:@"-before-%s", TOTK_GAME_VERSION];
         NSFileManager *fm = NSFileManager.defaultManager;
@@ -489,13 +487,12 @@ int main(int argc, char **argv) {
           const char *out = getenv("TOTK_OUTPUT_RES");
           int big = out ? !strncmp(out, "3840", 4) : mem >= (16ULL << 30);
           unsigned budget = big ? 6500 : 5000, cap = (unsigned)((mem / 2) >> 20);
-          /* A 3D world above 1440p (settings: Maximum render resolution): its texture heap passes the 1 GiB a memory pool's
-             GPU buffer may otherwise take, and its targets need more room: the cap itself, at most 12000 MB (40% and 8000 MB
+          /* A 3D world above 1440p (settings: Maximum render resolution): its texture heap passes 1 GiB (one zero-copy GPU
+             buffer, which has no size limit since upstream b3bb2c08), and its targets need more room: the cap itself, at most 12000 MB (40% and 8000 MB
              until 2026-10-28: 7372 MB stopped a 2560x1600 world on the 18 GB M3 Pro twice, at 8.1 GB, after the game's
              own resolution change; the kernel panics happened at about 15 GB). */
           const char *world = getenv("TOTK_RENDER_RESERVE"); unsigned ww = 0, wh = 0;
           if (world && sscanf(world, "%ux%u", &ww, &wh) == 2 && (uint64_t)ww * wh > 2560u * 1440u) {
-              setenv("TOTK_POOL_BUFFER_MAX_MB", "2048", 0);
               budget = cap && cap < 12000 ? cap : 12000;
           }
           if (cap && budget > cap) budget = cap;

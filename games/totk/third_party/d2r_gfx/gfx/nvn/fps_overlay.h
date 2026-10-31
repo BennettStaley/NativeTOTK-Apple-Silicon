@@ -9,7 +9,7 @@ enum { FPS_OVERLAY_TEX_W = 768, FPS_OVERLAY_TEX_H = 64, FPS_OVERLAY_MAX_SCALE = 
 
 /* fps / screen size < 0 / 0: not known yet ("--"). mfx: MetalFX upscaled the picture in the last frames. gen > 0: MetalFX
    frame interpolation shows that many generated frames a second besides the game's fps frames -> "FPS 50+50" (key 2).
-   big: the game itself outputs more than 1920x1080 (true 2K) -> " 2K" at the end.
+   big: the game itself outputs more than 1920x1080 (true 2K) -> " 2K" at the end; 2: 3840x2160 or more -> " 4K".
    detail: "Readout detail" is Detailed -> "FPS 60  avg 59  1% low 48  2560x1440" (avg / low < 0: "--", not measured yet).
    scene_w / scene_h: the internal (scene) resolution, shown as " (WxH)" after the output size when known. */
 typedef struct { int fps, screen_w, screen_h, mfx, gen, big, detail, avg, low, scene_w, scene_h; } fps_overlay_info;   // screen: the output; scene: the internal size, 0 = not known

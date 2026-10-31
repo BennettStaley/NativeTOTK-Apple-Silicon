@@ -177,6 +177,17 @@ static void feedback_checks(void){
        "mouse stopped after late ticks: the direction holds for 3 s (no gravity pull)");
   need(near3(buf.s[0].acc,-buf.s[0].dir[2],-buf.s[0].dir[5],-buf.s[0].dir[8],1e-4),"mouse mode: the gravity reported is the direction's down");}
  runtime_motion_mouse(0);need(!sstates(&n,buf.s,16,&six)&&n==1&&buf.s[0].attr==0,"mouse mode off, no controller: no motion");
+ /* Gyro bias at rest (motion_fusion.c): a controller lying still that reads +10.28 +5.81 -0.70 deg/s. The still seconds
+    before (gravity pull) learned zero, so each still second moves the bias 30 % of the way: after 10 s it is within 3 %. */
+ {const double b[3]={10.28*M_PI/180,5.81*M_PI/180,-0.70*M_PI/180};
+  runtime_motion_live(1);sstart(&six);feed(2500,0,0,-1,b[0],b[1],b[2]);probe_now+=1000000;sstates(&n,buf.s,1,&six);
+  need(near3(buf.s[0].gyro,0,0,0,0.002),"a still controller's gyro bias is learned and taken off");
+  feed(250,0,0,-1,b[0],b[1],b[2]+M_PI/2);probe_now+=1000000;sstates(&n,buf.s,1,&six);
+  need(near(buf.s[0].gyro[2],0.25,0.002)&&near(buf.s[0].gyro[0],0,0.002)&&near(buf.s[0].gyro[1],0,0.002),"a turn of 90 degrees a second on top of the bias: 0.25 rev/s, the bias not learned from it");
+  /* Another controller (every source change sets its dead zone): the old one's bias is dropped, not taken off its samples. */
+  runtime_motion_deadzone_default(0);feed(50,0,0,-1,0,0,0);probe_now+=1000000;sstates(&n,buf.s,1,&six);
+  need(near3(buf.s[0].gyro,0,0,0,0.002),"another controller: the learned bias starts over");
+  runtime_motion_live(0);}
  probe_clock_fixed=0;
 }
 int main(void){

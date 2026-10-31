@@ -151,6 +151,9 @@ static NSDictionary<NSString *, NSArray<NSString *> *> *tsl_parse(NSData *data, 
         } else if ([kind isEqualToString:@"B"]) {   // a render pipeline's border recipes (vertex, fragment; "-" for none) and flags: warm-up only
             if (!(f.count == 5 && f[1].length % 2 == 0 && tsl_hex(f[1].UTF8String, f[1].length, 2, TSL_MAX_LINE) && f[2].length && f[3].length && tsl_flags(f[4])))
                 TSL_REJECT(@"line %zu is not a B row", line_no);
+        } else if ([kind isEqualToString:@"A"]) {   // the bind state behind a variant name's suffix (upstream ef10acff, shader_list.py resolve): packaging only
+            if (!(f.count == 3 && f[1].length == 12 && tsl_hex(f[1].UTF8String, f[1].length, 12, 12) && tsl_deps_text(f[2])))
+                TSL_REJECT(@"line %zu is not an A row (suffix, deps)", line_no);
         } else TSL_REJECT(@"line %zu is no shader list row", line_no);
     }
     NSMutableDictionary<NSString *, NSArray<NSString *> *> *out = [NSMutableDictionary dictionaryWithCapacity:rows.count];

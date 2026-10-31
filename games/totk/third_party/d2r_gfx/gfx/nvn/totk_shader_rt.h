@@ -44,6 +44,7 @@ void totk_shader_list_boot(void);
 void totk_shader_list_warm_done(int (*compile)(NSString *variant_b, int stage));
 // The variant totk_rt_variant would return when the cache index already names one; nil otherwise (never translates).
 NSString *totk_rt_variant_cached(NSString *shader, NSDictionary *answers);
+void totk_rt_variant_broken(NSString *key);   // shader_load found it unusable: translated again at its next use
 NSString *totk_rt_portable_variant(NSString *name);   // "<variant>_b" as another player's build names it (pipeline contributions)
 int totk_rt_contrib_on(void);                       // a contribution file is kept (TOTK_SHADER_CONTRIB set, seed on)
 void totk_rt_contrib_line(NSString *line);           // one row into the contribution file (totk_shader_contrib.h)

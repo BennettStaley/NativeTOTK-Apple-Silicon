@@ -158,6 +158,12 @@ static int apply_live(const SettingDef *d, int v) {
     else if (!strcmp(d->key, "interface.download_shaders")) { extern void totk_shader_list_set_enabled(int on); totk_shader_list_set_enabled(v); }
     else if (!strcmp(d->key, "interface.readout_detail")) fps_overlay_set_detail(v);
     else if (!strcmp(d->key, "interface.hide_hud")) dm_gfx_set_flag("hide_hud", v);
+    else if (!strcmp(d->key, "graphics.ao")) {   /* gfx/nvn/totk_ssao.h: strength and radius in percent, 0 = the game's own AO */
+        extern void dm_gfx_ssao_start(int pct); extern int dm_gfx_ssao_locked(void); extern void dm_gfx_ssao_set(int pct);
+        if (dm_gfx_ssao_locked()) return -1;   /* TOTK_SSAO / _STRENGTH / _RADIUS in the environment decide */
+        dm_gfx_ssao_start(v);   /* the level the AO shaders take when they load */
+        dm_gfx_ssao_set(v);     /* the ones already loaded, at once */
+    }
     else if (!strcmp(d->key, "graphics.dof")) dm_gfx_set_flag("dof", v);
     else if (!strcmp(d->key, "graphics.bloom")) dm_gfx_set_flag("bloom", v);
     else if (!strcmp(d->key, "graphics.lens_flare")) dm_gfx_set_flag("lens_flare", v);

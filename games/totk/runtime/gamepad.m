@@ -777,8 +777,18 @@ int runtime_gamepad_type(int *detected) {
     return atomic_load(&controllerType);
 }
 
+/* A Switch controller's battery from its own HID reports (gamepad_feedback.m): GameController reports a Joy-Con's
+   level as 0 while it is charged. */
+static _Atomic int hidBatteryPercent = -1, hidBatteryLeftPercent = -1;
+void runtime_gamepad_hid_battery(int left, int percent) { atomic_store(left ? &hidBatteryLeftPercent : &hidBatteryPercent, percent); }
+/* A paired Joy-Con set's left one, -1 none or unknown; runtime_gamepad_battery_percent is then the right one. */
+int runtime_gamepad_battery_left_percent(void) { return atomic_load(&hidBatteryPercent) >= 0 ? atomic_load(&hidBatteryLeftPercent) : -1; }
+
 /* For the HUD (main thread): the first controller's battery as a whole percent, -1 none or unknown. */
 int runtime_gamepad_battery_percent(void) {
+    int hid = atomic_load(&hidBatteryPercent);
+    if (hid >= 0) return hid;
+    if ((hid = atomic_load(&hidBatteryLeftPercent)) >= 0) return hid;   /* a left Joy-Con alone */
     for (GCController *controller in GCController.controllers)
         if (controller.battery && controller.battery.batteryState != GCDeviceBatteryStateUnknown)
             return (int)lroundf(controller.battery.batteryLevel * 100.0f);

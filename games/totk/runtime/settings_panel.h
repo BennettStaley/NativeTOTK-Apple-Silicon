@@ -20,6 +20,12 @@
                                                              (runtime_front_resize_aspect; user 2026-10-25: no fitting the
                                                              window any more); TOTK_ASPECT's ratio is offered too
      edge smoothing       switch                             taa_set (gfx/nvn/totk_taa.m)
+     ambient occlusion    off / 1.5x / 2x / 3x, default off  dm_gfx_ssao_* (gfx/nvn/totk_ssao.h, PR #1316), saved in ssao.txt
+                                                             (off or the strength and radius in percent); Tears of the
+                                                             Kingdom 1.4.3 and Breath of the Wild 1.9.0 only. Its shaders
+                                                             are always the patched ones on the Mac (off: the stock AO,
+                                                             bit for bit), so every choice acts at once (user 2026-10-30);
+                                                             TOTK_SSAO / _STRENGTH / _RADIUS decide first (greyed out)
    Input
      controller type      auto / Xbox / PlayStation / Switch runtime_gamepad_type_set (gamepad.m), saved
      DualSense bow trigger switch                            runtime_triggers_choose (gamepad_feedback.m), saved in
@@ -56,18 +62,20 @@
 #include "aspect_math.h"     /* aspect_near, ASPECT_GAME */
 #include "keyboard_map.h"    /* the keyboard and mouse layout */
 #include "controller_map.h"  /* the controller layout */
+#include "feedback_settings.h"   /* feedback_word: ssao.txt */
 
 void dm_gfx_set_flag(const char *name, int value);
+void dm_gfx_ssao_start(int pct); int dm_gfx_ssao_locked(void); int dm_gfx_ssao_live(void); void dm_gfx_ssao_set(int pct);   /* totk_ssao.h */
 void nvn_fps_lock_set(int fps);   /* gfx/nvn/hle_nvn.c: the shared totk_fps_limits choices */
 int nvn_fps_lock(void);
 
-/* Picking a resolution sizes the window to it at once (user 2026-10-25): 720p 1280x720, 1080p 1920x1080, MetalFX 2560x1440, native its own size (2K), 2K + MetalFX 3840x2160, in the window's points as the first window (frontend.m runtime_front_run), the picture's shape kept
+/* Picking a resolution sizes the window to it at once (user 2026-10-25): 720p 1280x720, 1080p 1920x1080, MetalFX 2560x1440, native its own size (2K), 2K + MetalFX and native 4K 3840x2160, in the window's points as the first window (frontend.m runtime_front_run), the picture's shape kept
    (the aspect ratio picked) and shrunk to fit the screen's visible area. Full screen stays as it is. */
 static void settings_window_for(int mode) {
  if(!window||(window.styleMask&NSWindowStyleMaskFullScreen))return;
  unsigned w=1920,h=1080;
  if(mode==OUTPUT_MODE_METALFX){w=2560;h=1440;}
- else if(mode==OUTPUT_MODE_NATIVE_METALFX){w=3840;h=2160;}
+ else if(mode==OUTPUT_MODE_NATIVE_METALFX||mode==OUTPUT_MODE_NATIVE_4K){w=3840;h=2160;}
  else if(mode==OUTPUT_MODE_720P){w=1280;h=720;}
  else if(mode==OUTPUT_MODE_NATIVE&&!runtime_output_native(mode,&w,&h)){w=1920;h=1080;}
  double ratio=runtime_aspect_ratio()>0?runtime_aspect_ratio():(double)w/h;
@@ -102,6 +110,21 @@ static void settings_save_frame(void) {
  else snprintf(word,sizeof word,"off");
  runtime_setting_save("graphics-frame.txt",word,"frame mode");
 }
+/* Ambient occlusion (PR #1316): ssao.txt holds off or the strength and radius in percent, read before the guest starts
+   because the shaders are patched as they load. The levels the row offers; a hand-written percent is kept too. */
+#if defined(TOTK_GAME_V143) || defined(GAME_BOTW190)
+#define SETTINGS_SSAO 1
+#endif
+static int settingsSsao;   /* the saved choice: 0 off, else percent */
+static void settings_ssao_restore(void) {
+ char word[32];if(!runtime_setting_word("ssao.txt",word,sizeof word))return;
+ const char *w;size_t n=feedback_word(word,&w);char *end;long pct=strtol(w,&end,10);
+ if(n==3&&!strncmp(w,"off",3))pct=0;
+ else if(end!=w+n||pct<25||pct>400){fprintf(stderr,"[totk] ssao.txt: not off or a percent in 25..400; off\n");return;}
+#ifdef SETTINGS_SSAO
+ settingsSsao=(int)pct;dm_gfx_ssao_start(settingsSsao);
+#endif
+}
 static void settings_restore_begin(void) {
  int v;char word[32];
  if(settings_read_int("graphics-overlay.txt",&v)&&v<=HUD_MODE_MINIMAL)fps_overlay_set_hud_mode(v);
@@ -112,9 +135,10 @@ static void settings_restore_begin(void) {
   else if(!strcmp(word,"off")||!strcmp(word,"off\n")){nvn_fps_lock_set(0);dm_gfx_set_flag("mfx_interp",MFX_OFF);}
  }
  if(!getenv("TOTK_TAA")&&settings_read_int("graphics-taa.txt",&v)&&(v==0||v==1))taa_set(v);
+ settings_ssao_restore();
  const char *output=getenv("TOTK_OUTPUT_RES");
  if((!output||!*output||!strcmp(output,"auto"))&&!getenv("TOTK_MFX_OUTPUT")&&!getenv("TOTK_MFX_UPSCALE")&&
-    settings_read_int("graphics-output.txt",&v)&&v<=OUTPUT_MODE_720P)settingsPendingOutput=v;
+    settings_read_int("graphics-output.txt",&v)&&v<=OUTPUT_MODE_NATIVE_4K)settingsPendingOutput=v;
  if(!getenv("TOTK_ASPECT")&&runtime_setting_word("graphics-aspect.txt",word,sizeof word)){
   char *end;float ratio=strtof(word,&end);while(*end==' '||*end=='\n'||*end=='\r'||*end=='\t')end++;
   if(end!=word&&!*end&&isfinite(ratio)&&ratio>=0.5f&&ratio<=8)settingsPendingAspect=ratio;
@@ -238,6 +262,24 @@ static NSString *settings_pad_auto_text(void) {
  return settings_text("自动（未接手柄）","Auto (no controller)");
 }
 
+/* Ambient occlusion: off, or the shadow pre-pass's AO with strength and radius both scaled (1.5x is the PR's tested
+   level), applied at once. A run whose shaders carry no parameters (TOTK_SSAO=0) shows its one value. */
+static TOTKSettingRow *settings_ssao_row(void) {
+ NSString *t=settings_text("环境光遮蔽增强","Stronger ambient occlusion");
+#ifndef SETTINGS_SSAO
+ return settings_fixed(t,settings_text("这个版本没有","Not in this version"));
+#else
+ if(dm_gfx_ssao_locked())return settings_fixed(t,settings_text("由 TOTK_SSAO 设置","Set by TOTK_SSAO"));
+ if(!dm_gfx_ssao_live())return settings_fixed(t,settings_text("关（游戏原样）","Off (as the game has it)"));
+ NSMutableArray<NSNumber *> *values=[@[@0,@150,@200,@300] mutableCopy];
+ if(![values containsObject:@(settingsSsao)]){[values addObject:@(settingsSsao)];[values sortUsingSelector:@selector(compare:)];}
+ NSMutableArray<NSString *> *choices=[NSMutableArray array];
+ for(NSNumber *v in values)[choices addObject:v.intValue?[NSString stringWithFormat:@"%g×",v.intValue/100.0]:settings_text("关（游戏原样）","Off (as the game has it)")];
+ return settings_row(t,choices,values,^int{return settingsSsao;},^(int v){
+  settingsSsao=v;dm_gfx_ssao_set(v);
+  if(v)settings_save_int("ssao.txt",v,"ambient occlusion");else runtime_setting_save("ssao.txt","off","ambient occlusion");});
+#endif
+}
 static NSArray<TOTKSettingRow *> *settings_rows(void) {
  NSMutableArray<TOTKSettingRow *> *rows=[NSMutableArray array];
  /* Display */
@@ -263,11 +305,12 @@ static NSArray<TOTKSettingRow *> *settings_rows(void) {
   ^int{return mfx_requested();},^(int v){dm_gfx_set_flag("mfx_interp",v);if(v!=MFX_OFF)nvn_fps_lock_set(0);settings_save_frame();})];
  int modes=runtime_output_modes();
  NSMutableArray<NSString *> *res=[NSMutableArray array];NSMutableArray<NSNumber *> *resModes=[NSMutableArray array];
- static const int order[]={OUTPUT_MODE_720P,OUTPUT_MODE_OFF,OUTPUT_MODE_METALFX,OUTPUT_MODE_NATIVE,OUTPUT_MODE_NATIVE_METALFX};
+ static const int order[]={OUTPUT_MODE_720P,OUTPUT_MODE_OFF,OUTPUT_MODE_METALFX,OUTPUT_MODE_NATIVE,OUTPUT_MODE_NATIVE_METALFX,OUTPUT_MODE_NATIVE_4K};
  for(unsigned i=0;i<sizeof order/sizeof *order;i++){
   int m=order[i];if(!(modes&1<<m))continue;unsigned nw=0,nh=0;runtime_output_native(m,&nw,&nh);
   [res addObject:m==OUTPUT_MODE_720P?@"720p":m==OUTPUT_MODE_OFF?@"1080p":m==OUTPUT_MODE_METALFX?settings_text("1080p + MetalFX 放大","1080p + MetalFX upscaling"):
    m==OUTPUT_MODE_NATIVE_METALFX?settings_text("2K + MetalFX 放大（4K 屏）","2K + MetalFX upscaling (4K screens)"):
+   m==OUTPUT_MODE_NATIVE_4K?settings_text("原生 4K（3840×2160）","Native 4K (3840×2160)"):
    nw==2560&&nh==1440?settings_text("2K（2560×1440）","2K (2560×1440)"):
    [NSString stringWithFormat:@(TOTK_UI("原生 %u×%u","Native %u×%u")),nw,nh]];
   [resModes addObject:@(m)];}
@@ -288,6 +331,7 @@ static NSArray<TOTKSettingRow *> *settings_rows(void) {
    ^(int v){float r=ratios[(NSUInteger)v].floatValue;settingsPendingAspect=0;if(runtime_aspect_set_ratio(r)){runtime_front_resize_aspect(r);char word[32];snprintf(word,sizeof word,"%.8g",r);runtime_setting_save("graphics-aspect.txt",word,"aspect ratio");}})];}
  [rows addObject:settings_row(settings_text("边缘平滑（MetalFX 时间性）","Edge smoothing (MetalFX Temporal)"),nil,nil,
   ^int{return taa_enabled();},^(int v){taa_set(v);settings_save_int("graphics-taa.txt",v,"edge smoothing");})];
+ [rows addObject:settings_ssao_row()];
  NSUInteger display=rows.count;
  /* Input */
  TOTKSettingRow *pad=settings_row(settings_text("手柄类型","Controller type"),@[settings_pad_auto_text(),@"Xbox",@"PlayStation",@"Switch"],
